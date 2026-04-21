@@ -1444,10 +1444,18 @@ def power_law_deepep_decode(num_tokens, num_experts, topk, ep, alpha):
 def _get_deepseek_model_path():
     """Get DeepSeek model path, downloading config files from HuggingFace if needed.
 
-    If DEEPSEEK_MODEL_PATH is set, use that path.
+    If a collector/local DeepSeek path is set, use that path.
     Otherwise, download only the necessary config files from HuggingFace.
     This allows running the collector without downloading the full model weights.
     """
+    collector_local_path = os.environ.get("COLLECTOR_LOCAL_MODEL_PATH")
+    if collector_local_path:
+        return collector_local_path
+
+    collector_model_path = os.environ.get("COLLECTOR_MODEL_PATH")
+    if collector_model_path and os.path.exists(collector_model_path):
+        return collector_model_path
+
     env_path = os.environ.get("DEEPSEEK_MODEL_PATH")
     if env_path:
         return env_path
@@ -1489,11 +1497,20 @@ def _get_moe_model_path():
     """Get MoE model path, supporting multiple MoE models (DeepSeek, Qwen3, etc.).
 
     Checks environment variables in priority order:
-    1. MOE_MODEL_PATH - generic, for any MoE model
-    2. DEEPSEEK_MODEL_PATH - backward compatibility for DeepSeek models
+    1. COLLECTOR_LOCAL_MODEL_PATH - local path passed via collect.py --model-path
+    2. MOE_MODEL_PATH - generic, for any MoE model
+    3. DEEPSEEK_MODEL_PATH - backward compatibility for DeepSeek models
     Otherwise, download only the necessary config files from HuggingFace.
     This allows running the collector without downloading the full model weights.
     """
+    collector_local_path = os.environ.get("COLLECTOR_LOCAL_MODEL_PATH")
+    if collector_local_path:
+        return collector_local_path
+
+    collector_model_path = os.environ.get("COLLECTOR_MODEL_PATH")
+    if collector_model_path and os.path.exists(collector_model_path):
+        return collector_model_path
+
     # Try MOE_MODEL_PATH first (generic)
     env_path = os.environ.get("MOE_MODEL_PATH")
     if env_path:

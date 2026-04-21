@@ -97,6 +97,14 @@ def _resolve_local_model_path(model_id: str) -> str:
 
     Falls back to the original HF model ID if local config is not found.
     """
+    if os.path.exists(model_id):
+        return os.path.abspath(model_id)
+
+    collector_local_path = os.environ.get("COLLECTOR_LOCAL_MODEL_PATH")
+    collector_model_name = os.environ.get("COLLECTOR_MODEL_PATH")
+    if collector_local_path and (not collector_model_name or collector_model_name == model_id):
+        return collector_local_path
+
     config_file = os.path.join(_MODEL_CONFIG_DIR, f"{model_id.replace('/', '--')}_config.json")
     if not os.path.exists(config_file):
         return model_id

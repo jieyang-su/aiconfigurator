@@ -1,12 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import shutil
 import subprocess
 from argparse import ArgumentParser
 
 import torch
 
 from helper import PowerMonitor, log_perf
+
+
+def _resolve_nccl_test_bin(nccl_test_bin: str) -> str:
+    """Resolve nccl-tests binary from NCCL_TEST_BIN_PATH or PATH."""
+    nccl_test_bin_path = os.environ.get("NCCL_TEST_BIN_PATH", "").strip()
+    if nccl_test_bin_path:
+        candidate = os.path.join(nccl_test_bin_path, nccl_test_bin)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
+    resolved = shutil.which(nccl_test_bin)
+    if resolved:
+        return resolved
+
+    raise FileNotFoundError(
+        f"Cannot find {nccl_test_bin}. Set NCCL_TEST_BIN_PATH to the nccl-tests build directory "
+        "or add that directory to PATH."
+    )
 
 
 def nccl_benchmark(
@@ -26,6 +46,7 @@ def nccl_benchmark(
     elif nccl_op == "all_reduce":
         nccl_test_bin = "all_reduce_perf"
     assert nccl_test_bin != ""
+    nccl_test_bin = _resolve_nccl_test_bin(nccl_test_bin)
 
     min_size, max_size, ratio = [int(i) for i in test_range.split(",")]
     size = min_size

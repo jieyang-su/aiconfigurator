@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import tempfile
 
 import numpy as np
 import torch
@@ -33,7 +34,70 @@ except ModuleNotFoundError:
     from helper import _get_moe_model_path, log_perf, power_law_deepep_decode, power_law_deepep_prefill
 from importlib.metadata import version as get_version
 
-MOE_MODEL_PATH = _get_moe_model_path()
+
+_MODEL_CONFIG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "src",
+    "aiconfigurator",
+    "model_configs",
+)
+
+
+def _resolve_moe_model_path() -> str:
+    """Resolve MoE model path lazily so subprocesses see the latest env."""
+    return _get_moe_model_path()
+
+
+def _load_model_config_dict(model_ref: str) -> dict | None:
+    """Load a model config from a local directory or built-in cached config."""
+    config_path = None
+    if os.path.isdir(model_ref):
+        candidate = os.path.join(model_ref, "config.json")
+        if os.path.exists(candidate):
+            config_path = candidate
+    else:
+        candidate = os.path.join(_MODEL_CONFIG_DIR, f"{model_ref.replace('/', '--')}_config.json")
+        if os.path.exists(candidate):
+            config_path = candidate
+
+    if not config_path:
+        return None
+
+    with open(config_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _resolve_sglang_model_path(model_ref: str) -> str:
+    """Build an SGLang-friendly local config directory for MoE collection.
+
+    For DeepSeek-V3.2 / GLM-5, SGLang's AutoConfig path is more reliable when we
+    normalize model_type to deepseek_v3 and strip auto_map so no remote code or
+    config fetch is attempted.
+    """
+    config = _load_model_config_dict(model_ref)
+    if config is None:
+        return model_ref
+
+    if config.get("model_type") in ("deepseek_v32", "glm_moe_dsa"):
+        config["architectures"] = ["DeepseekV3ForCausalLM"]
+        config["model_type"] = "deepseek_v3"
+
+    config.pop("auto_map", None)
+
+    safe_name = model_ref.replace("/", "_").replace("\\", "_").replace(":", "_")
+    tmp_dir = os.path.join(tempfile.gettempdir(), f"aic_sglang_moe_config_{safe_name}_{os.getpid()}")
+    os.makedirs(tmp_dir, exist_ok=True)
+    with open(os.path.join(tmp_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f)
+    return tmp_dir
+
+
+def _get_total_experts_for_selected_model(default: int = 256) -> int:
+    """Infer total experts for the selected model from local or cached config."""
+    config = _load_model_config_dict(_resolve_moe_model_path())
+    if config is None:
+        return default
+    return int(config.get("n_routed_experts") or config.get("num_experts") or default)
 
 
 def get_moe_prefill_test_cases(rank):
@@ -829,7 +893,7 @@ def run_moe(
 # ============================================================================
 
 
-def get_wideep_moe_test_cases(total_experts=256):
+def get_wideep_moe_test_cases(total_experts=None):
     """Returns list of [num_experts, perf_filename] for MOE collection.
 
     Each num_experts value simulates a different EP size based on model's total experts.
@@ -859,6 +923,9 @@ def get_wideep_moe_test_cases(total_experts=256):
     Args:
         total_experts: Total number of experts in the model (256 for DeepSeek-V3, 128 for Qwen3)
     """
+    if total_experts is None:
+        total_experts = _get_total_experts_for_selected_model()
+
     # Generate test cases based on total_experts
     # num_experts must be a power of 2 and <= total_experts
     # Start from EP=2 (total_experts // 2) to avoid single-GPU OOM and focus on wideep scenarios
@@ -881,9 +948,12 @@ def run_moe_benchmark(num_experts, gpu_id, output_path=None):
     # In subprocess, always use cuda:0 since CUDA_VISIBLE_DEVICES isolates the GPU
     torch.cuda.set_device("cuda:0")
 
+    original_model_path = _resolve_moe_model_path()
+    model_path = _resolve_sglang_model_path(original_model_path)
+
     server_port = 30000 + gpu_id * 100
     server_args = ServerArgs(
-        model_path=MOE_MODEL_PATH,
+        model_path=model_path,
         dtype="auto",
         device="cuda",
         load_format="dummy",
@@ -914,6 +984,8 @@ def run_moe_benchmark(num_experts, gpu_id, output_path=None):
 
     simulated_ep_size = total_experts // num_experts * server_args.ep_size
     print(f"\n{'=' * 60}")
+    print(f"Original model path: {original_model_path}")
+    print(f"Resolved model config path: {model_path}")
     print(
         f"MOE Benchmark: num_experts={num_experts}, EP_size={simulated_ep_size}, "
         f"total_experts={total_experts}, GPU={gpu_id}"
@@ -986,7 +1058,8 @@ if __name__ == "__main__":
     parser.add_argument("--output-path", default=None, help="Output directory for perf files")
     args = parser.parse_args()
 
-    print(f"Model path: {MOE_MODEL_PATH}")
+    print(f"Model path: {_resolve_moe_model_path()}")
+    print(f"Resolved config path: {_resolve_sglang_model_path(_resolve_moe_model_path())}")
 
     # Run all MOE test cases
     for test_case in get_wideep_moe_test_cases():

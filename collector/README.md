@@ -50,6 +50,14 @@ Today we only collect intra-node comm. This script will collect custom allreduce
 It will also collect nccl allreudce, all_gather, all2all, reduce_scatter using nccl.
 The generated file is comm_perf.txt and custom_all_reduce.txt.
 
+If you only want to generate `nccl_perf.txt`, use the dedicated sweep script:
+```bash
+export NCCL_TEST_BIN_PATH=/path/to/nccl-tests/build
+bash collect_nccl_sweep.sh --output-dir /path/to/output --clean
+```
+The script will automatically prepend `NCCL_TEST_BIN_PATH` to `PATH`.
+By default it sweeps 2/4/8 GPUs (capped by visible GPU count), the four NCCL ops, and both `half` and `int8`.
+
 # Version Management
 
 ## Overview
@@ -315,7 +323,7 @@ Running without `--resume` always starts fresh (overwrites old checkpoint).
 
 Suggest to start from lmsysorg docker image. Say, for 0.5.6.post2, we can use lmsysorg/sglang:v0.5.6.post2-cu126
 ```bash
-python3 collect.py --backend sglang
+python3 collect.py --backend sglang --model-path /opt/model/DeepSeek-V3.2
 ```
 This collects all SGLang ops in a single pass, including:
 - GEMM operations (FP8, FP16, INT8, INT4)

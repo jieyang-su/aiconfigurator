@@ -58,6 +58,7 @@ import io
 import json
 import multiprocessing as mp
 import pstats
+import re
 import signal
 import time
 import traceback
@@ -69,6 +70,49 @@ from helper import EXIT_CODE_RESTART, create_test_case_id, save_error_report, se
 logger = None
 RESUME_SCHEMA_VERSION = "collector-resume-v1"
 STALL_THRESHOLD = 30  # iterations (x 0.5 s sleep = 15 s) before stall bailout
+
+
+def _normalize_model_token(value: str) -> str:
+    """Normalize a model name or path component for loose matching."""
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _infer_model_name_from_local_path(model_path: str, all_models: list[str]) -> str | None:
+    """Infer the canonical collector model name from a local model directory."""
+    path = Path(model_path).expanduser().resolve()
+    if not path.exists():
+        return None
+
+    path_tokens = {
+        _normalize_model_token(path.name),
+        _normalize_model_token(str(path)),
+    }
+    for model_name in all_models:
+        model_leaf = model_name.split("/")[-1]
+        if _normalize_model_token(model_leaf) in path_tokens:
+            return model_name
+
+    config_path = path / "config.json"
+    if not config_path.exists():
+        return None
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception:
+        return None
+
+    model_type = str(config.get("model_type", "")).lower()
+    architectures = [str(arch).lower() for arch in config.get("architectures", [])]
+
+    if model_type == "deepseek_v32" or "deepseekv32forcausallm" in architectures:
+        return "deepseek-ai/DeepSeek-V3.2"
+    if model_type == "glm_moe_dsa" or "glmmoedsaforcausallm" in architectures:
+        return "zai-org/GLM-5"
+    if model_type == "deepseek_v3" or "deepseekv3forcausallm" in architectures:
+        return "deepseek-ai/DeepSeek-V3"
+
+    return None
 
 
 class ResumeCheckpoint:
@@ -986,10 +1030,11 @@ def main():
         "--model-path",
         type=str,
         default=None,
-        help="Filter collection to a single model (e.g. 'MiniMaxAI/MiniMax-M2.5'). "
-        "Must match a model name in the test case config lists exactly. "
-        "Best used together with --ops to target a specific op, since a model "
-        "may only appear in one op's config list (e.g. MoE but not MLA). "
+        help="Collect a single model, using either a canonical model ID "
+        "(e.g. 'MiniMaxAI/MiniMax-M2.5') or a local model directory "
+        "(e.g. '/opt/model/DeepSeek-V3.2'). When a local directory is given, "
+        "the collector infers the matching canonical model name and passes the "
+        "local path to runtime modules so they do not fetch configs from Hugging Face. "
         "Default: collect all models.",
     )
     parser.add_argument(
@@ -1004,13 +1049,35 @@ def main():
         from collector.common_test_cases import get_all_model_names
 
         all_models = get_all_model_names()
-        if args.model_path not in all_models:
+        local_model_path = None
+        canonical_model_name = None
+        candidate_path = Path(args.model_path).expanduser()
+
+        if candidate_path.exists():
+            local_model_path = str(candidate_path.resolve())
+            canonical_model_name = _infer_model_name_from_local_path(local_model_path, all_models)
+            if canonical_model_name is None:
+                parser.error(
+                    f"Local model path '{args.model_path}' does not map to a known collector model. "
+                    "Please use a supported canonical model ID or a local directory whose name/config.json "
+                    "matches one of them:\n"
+                    + "\n".join(f"  - {m}" for m in all_models)
+                )
+        elif args.model_path in all_models:
+            canonical_model_name = args.model_path
+        else:
             parser.error(
                 f"Model '{args.model_path}' not found. Available models:\n" + "\n".join(f"  - {m}" for m in all_models)
             )
-        os.environ["COLLECTOR_MODEL_PATH"] = args.model_path
+
+        os.environ["COLLECTOR_MODEL_PATH"] = canonical_model_name
+        if local_model_path:
+            os.environ["COLLECTOR_LOCAL_MODEL_PATH"] = local_model_path
+        else:
+            os.environ.pop("COLLECTOR_LOCAL_MODEL_PATH", None)
     else:
         os.environ.pop("COLLECTOR_MODEL_PATH", None)
+        os.environ.pop("COLLECTOR_LOCAL_MODEL_PATH", None)
 
     # Setup logging - debug flag is handled inside setup_logging
     if logger is None:
@@ -1020,7 +1087,9 @@ def main():
         setup_logging(debug=args.debug)
 
     if args.model_path:
-        logger.info(f"Model filter active: collecting only for '{args.model_path}'")
+        logger.info(f"Model filter active: collecting only for '{os.environ['COLLECTOR_MODEL_PATH']}'")
+        if os.environ.get("COLLECTOR_LOCAL_MODEL_PATH"):
+            logger.info(f"Using local model directory: {os.environ['COLLECTOR_LOCAL_MODEL_PATH']}")
 
     num_processes = get_device_module().device_count()
     logger.info(f"Starting collection with {num_processes} GPU processes")

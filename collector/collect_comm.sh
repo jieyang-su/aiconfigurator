@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Default backend
-all_reduce_backend="trtllm"
+all_reduce_backend="sglang"
 device="cuda"
 measure_power=false
 power_test_duration=1.0

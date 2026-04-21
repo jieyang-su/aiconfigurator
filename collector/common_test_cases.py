@@ -30,8 +30,10 @@ def _filter_model_config_list(model_config_list: list[list]) -> list[list]:
 _WIDEEP_MOE_MODEL_NAMES: set[str] = {
     "deepseek-ai/DeepSeek-V3",
     "deepseek-ai/DeepSeek-V3.2",
+    "/opt/model/DeepSeek-V3.2",
     "zai-org/GLM-5",
     "MiniMaxAI/MiniMax-M2.5",
+    "nvidia/MiniMax-M2.5-NVFP4",
     "moonshotai/Kimi-K2-Instruct",
 }
 
@@ -54,7 +56,8 @@ _MOE_MODEL_CONFIGS: list[list] = [
     [4096, 1536, 8, 128, "Qwen/Qwen3-235B-A22B"],  # qwen3-moe, 235b-a22b
     [6144, 2560, 8, 160, "Qwen/Qwen3-Coder-480B-A35B-Instruct"],  # qwen3-moe, 480b-a35b
     [7168, 2048, 8, 384, "moonshotai/Kimi-K2-Instruct"],  # kimi k2, k2.5
-    [3072, 1536, 8, 256, "MiniMaxAI/MiniMax-M2.5"],  # minimax m2.5 (also covers nvidia/MiniMax-M2.5-NVFP4)
+    [3072, 1536, 8, 256, "MiniMaxAI/MiniMax-M2.5"],  # minimax m2.5
+    [3072, 1536, 8, 256, "nvidia/MiniMax-M2.5-NVFP4"],  # minimax m2.5 nvfp4
     [2880, 2880, 4, 128, "openai/gpt-oss-120b"],
     [2880, 2880, 4, 32, "openai/gpt-oss-20b"],
     [2688, 1856, 6, 128, "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"],  # nemotron-3 nano (uses relu2, non-gated)
@@ -77,6 +80,7 @@ _MLA_MODEL_CONFIGS: list[list] = [
 # already covered by _MLA_MODEL_CONFIGS above.
 _MLA_MODULE_MODEL_NAMES: list[str] = [
     "deepseek-ai/DeepSeek-V3.2",
+    "/opt/model/DeepSeek-V3.2",
     "zai-org/GLM-5",
 ]
 

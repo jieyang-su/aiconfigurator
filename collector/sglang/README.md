@@ -58,6 +58,8 @@ cd /path/to/collector/
 
 # Run ALL sglang operators (13 total: 8 non-wideep + 5 wideep)
 python collect.py --backend sglang
+python3 collect.py --backend sglang  --model-path /opt/model/DeepSeek-V3.2
+nohup python3 collect.py --backend sglang --model-path /opt/model/DeepSeek-V3.2 > collect.log 2>&1 &
 
 # Run wideep collectors only
 python collect.py --backend sglang --ops wideep_mlp_context wideep_mlp_generation
@@ -68,6 +70,8 @@ python collect.py --backend sglang --ops wideep_mla_context wideep_mla_generatio
 
 # Mixed: kernel-level + module-level (all run in parallel across GPUs)
 python collect.py --backend sglang --ops mla_bmm_gen_pre dsa_context_module
+python collect.py --backend sglang --ops dsa_generation_module dsa_context_module wideep_moe --model-path /opt/model/DeepSeek-V3.2
+python collect.py --backend sglang --ops wideep_moe --model-path /opt/model/DeepSeek-V3.2
 ```
 
 **All available operators (when no `--ops` specified):**
