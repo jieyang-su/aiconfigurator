@@ -280,6 +280,8 @@ DefaultHFModels = {
     "meta-llama/Meta-Llama-3.1-70B",
     "meta-llama/Meta-Llama-3.1-405B",
     "nvidia/Llama-3.1-70B-Instruct-FP8",
+    # DeepSeek R1
+    "deepseek-ai/DeepSeek-R1",
     # DeepSeek V3/V3.1 Models
     "deepseek-ai/DeepSeek-V3",
     "nvidia/DeepSeek-V3.1-NVFP4",
@@ -329,7 +331,6 @@ SupportedSystems = {
     "h100_sxm",
     "h200_sxm",
     "b200_sxm",
-    "b300_sxm",
     "gb200",
     "gb300",
     "a100_sxm",

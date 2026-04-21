@@ -6763,7 +6763,7 @@ class PerfDatabase:
             emp_latency = get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
             return PerformanceResult(emp_latency, energy=0.0)
         else:
-            try:
+            def get_silicon() -> PerformanceResult:
                 dsa_module_data = getattr(self, "_context_dsa_module_data", None)
                 if dsa_module_data is None:
                     raise PerfDataNotAvailableError(
@@ -6772,7 +6772,15 @@ class PerfDatabase:
                     )
                 dsa_dict = dsa_module_data[fmha_quant_mode][kvcache_quant_mode][gemm_quant_mode][architecture]
                 full_s = s + prefix
-                result = self._interp_3d(num_heads, full_s, b, dsa_dict, "cubic")
+                try:
+                    result = self._interp_3d(num_heads, full_s, b, dsa_dict, "cubic")
+                except Exception:
+                    logger.debug(
+                        "Failed cubic interpolation for context DSA module; retrying with linear interpolation. "
+                        f"{b=}, {s=}, {prefix=}, {num_heads=}, {architecture=}, "
+                        f"{kvcache_quant_mode=}, {fmha_quant_mode=}, {gemm_quant_mode=}."
+                    )
+                    result = self._interp_3d(num_heads, full_s, b, dsa_dict, "linear")
                 latency = result["latency"]
                 energy = result.get("energy", 0.0)
                 if prefix > 0:
@@ -6782,21 +6790,17 @@ class PerfDatabase:
                     latency *= correction
                     energy *= correction
                 return PerformanceResult(latency, energy=energy)
-            except Exception:
-                if database_mode == common.DatabaseMode.HYBRID:
-                    logger.debug(
-                        f"Failed to query context DSA module for {b=}, {s=}, {prefix=}, {num_heads=}, "
-                        f"{index_n_heads=}, {index_head_dim=}, {index_topk=}; using empirical"
-                    )
-                    latency = get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
-                    return PerformanceResult(latency, energy=0.0)
-                else:
-                    logger.exception(
-                        f"Failed to query context DSA module for {b=}, {s=}, {prefix=}, {num_heads=}, "
-                        f"{index_n_heads=}, {index_head_dim=}, {index_topk=}, "
-                        f"{kvcache_quant_mode=}, {fmha_quant_mode=}, {database_mode=}."
-                    )
-                    raise
+
+            return self._query_silicon_or_hybrid(
+                get_silicon=get_silicon,
+                get_empirical=lambda: get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode),
+                database_mode=database_mode,
+                error_msg=(
+                    f"Failed to query context DSA module for {b=}, {s=}, {prefix=}, {num_heads=}, "
+                    f"{index_n_heads=}, {index_head_dim=}, {index_topk=}, "
+                    f"{kvcache_quant_mode=}, {fmha_quant_mode=}, {gemm_quant_mode=}, {architecture=}, {database_mode=}"
+                ),
+            )
 
     @functools.lru_cache(maxsize=32768)
     def query_generation_dsa_module(
@@ -6926,7 +6930,7 @@ class PerfDatabase:
             emp_latency = get_empirical(b, s, num_heads, kv_cache_dtype)
             return PerformanceResult(emp_latency, energy=0.0)
         else:
-            try:
+            def get_silicon() -> PerformanceResult:
                 dsa_module_data = getattr(self, "_generation_dsa_module_data", None)
                 if dsa_module_data is None:
                     raise PerfDataNotAvailableError(
@@ -6934,25 +6938,28 @@ class PerfDatabase:
                         f"backend='{self.backend}', version='{self.version}'."
                     )
                 dsa_dict = dsa_module_data[kv_cache_dtype][gemm_quant_mode][architecture]
-                result = self._interp_3d(num_heads, b, s, dsa_dict, "cubic")
+                try:
+                    result = self._interp_3d(num_heads, b, s, dsa_dict, "cubic")
+                except Exception:
+                    logger.debug(
+                        "Failed cubic interpolation for generation DSA module; retrying with linear interpolation. "
+                        f"{b=}, {s=}, {num_heads=}, {architecture=}, {kv_cache_dtype=}, {gemm_quant_mode=}."
+                    )
+                    result = self._interp_3d(num_heads, b, s, dsa_dict, "linear")
                 latency = result["latency"]
                 energy = result.get("energy", 0.0)
                 return PerformanceResult(latency, energy=energy)
-            except Exception:
-                if database_mode == common.DatabaseMode.HYBRID:
-                    logger.debug(
-                        f"Failed to query generation DSA module for {b=}, {s=}, {num_heads=}, "
-                        f"{index_n_heads=}, {index_head_dim=}, {index_topk=}; using empirical"
-                    )
-                    latency = get_empirical(b, s, num_heads, kv_cache_dtype)
-                    return PerformanceResult(latency, energy=0.0)
-                else:
-                    logger.exception(
-                        f"Failed to query generation DSA module for {b=}, {s=}, {num_heads=}, "
-                        f"{index_n_heads=}, {index_head_dim=}, {index_topk=}, "
-                        f"{kv_cache_dtype=}, {database_mode=}."
-                    )
-                    raise
+
+            return self._query_silicon_or_hybrid(
+                get_silicon=get_silicon,
+                get_empirical=lambda: get_empirical(b, s, num_heads, kv_cache_dtype),
+                database_mode=database_mode,
+                error_msg=(
+                    f"Failed to query generation DSA module for {b=}, {s=}, {num_heads=}, "
+                    f"{index_n_heads=}, {index_head_dim=}, {index_topk=}, "
+                    f"{kv_cache_dtype=}, {gemm_quant_mode=}, {architecture=}, {database_mode=}"
+                ),
+            )
 
 
 if __name__ == "__main__":
