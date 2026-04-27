@@ -19,7 +19,8 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_blackwell
 
-from helper import benchmark_with_power, get_sm_version, log_perf
+from collector.helper import benchmark_with_power, get_sm_version, log_perf
+from collector.registry_types import PerfFile
 
 # Mocking for standalone collector script
 sglang.srt.layers.dp_attention._ATTN_TP_SIZE = 1
@@ -93,7 +94,7 @@ class MockServerArgs:
     def __init__(self, kv_cache_dtype: torch.dtype, page_size: int):
         self.enable_lora = False
         self.enable_deterministic_inference = False
-        self.kv_cache_dtype = "fp8" if kv_cache_dtype == torch.float8_e4m3fn else "float16"
+        self.kv_cache_dtype = "fp8" if kv_cache_dtype == torch.float8_e4m3fn else "bfloat16"
         self.speculative_eagle_topk = 0
         self.speculative_num_draft_tokens = 0
         self.speculative_attention_mode = "prefill"
@@ -128,8 +129,9 @@ class MockModelRunner:
         self.sliding_window_size = None
         self.is_hybrid = False
         self.model_config = MockModelConfig(num_attention_heads=num_attention_heads, scaling=scaling)
-        # Keep attribute for compatibility across sglang versions (older code ignores it)
+        # Keep attributes for compatibility across sglang versions (older code ignores them)
         self.is_hybrid_swa = self.model_config.is_hybrid_swa
+        self.attn_cp_size = 1  # Context parallelism size; required by FlashAttentionBackend in sglang >=0.5.10
         self.server_args = MockServerArgs(kv_cache_dtype, page_size)
         self.use_mla_backend = True
 
@@ -205,7 +207,6 @@ def get_context_mla_test_cases():
                                 10,
                                 6,
                                 True,
-                                "context_mla_perf.txt",
                             ]
                         )
     return test_cases
@@ -273,7 +274,6 @@ def get_generation_mla_test_cases():
                                 10,
                                 6,
                                 False,
-                                "generation_mla_perf.txt",
                             ]
                         )
     return test_cases
@@ -291,6 +291,7 @@ def run_mla(
     warming_up,
     test_ite,
     is_context_phase,
+    *,
     perf_filename,
     device="cuda:0",
 ):
@@ -533,11 +534,11 @@ def run_mla(
         isl = 1
         step = input_len
 
-    str_type = "float16" if kv_cache_dtype == torch.bfloat16 else "fp8"
+    str_type = "bfloat16" if kv_cache_dtype == torch.bfloat16 else "fp8"
     log_perf(
         item_list=[
             {
-                "mla_dtype": "float16",
+                "mla_dtype": "bfloat16",
                 "kv_cache_dtype": str_type,
                 "num_heads": local_num_heads,
                 "batch_size": batch_size,
@@ -561,9 +562,9 @@ if __name__ == "__main__":
     test_cases = get_context_mla_test_cases()
     for test_case in test_cases[0:10]:
         print(test_case)
-        run_mla(*test_case)
+        run_mla(*test_case, perf_filename=PerfFile.CONTEXT_MLA)
 
     test_cases = get_generation_mla_test_cases()
     for test_case in test_cases[0:10]:
         print(test_case)
-        run_mla(*test_case)
+        run_mla(*test_case, perf_filename=PerfFile.GENERATION_MLA)

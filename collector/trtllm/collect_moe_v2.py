@@ -29,7 +29,7 @@ aic_debug = int(os.getenv("aic_moe_debug", "0"))  # noqa: SIM112
 
 def get_moe_test_cases():
     """Build list of MoE test case tuples for trtllm < 1.1 (power_law only, SM-dependent quant modes)."""
-    moe_list = ["float16"]
+    moe_list = ["bfloat16"]
     if get_sm_version() > 86:
         moe_list += ["fp8"]
         if get_sm_version() < 100:
@@ -90,7 +90,6 @@ def get_moe_test_cases():
                         common_moe_testcase.ep,
                         min_latency_mode,
                         common_moe_testcase.model_name,
-                        "moe_perf.txt",
                         common_moe_testcase.token_expert_distribution,
                         common_moe_testcase.power_law_alpha,
                     ]
@@ -110,9 +109,10 @@ def run_moe_torch(
     moe_ep_size,
     min_latency_mode,
     model_name,
-    perf_filename,
     distributed="power_law",
     power_law_alpha=0.0,
+    *,
+    perf_filename,
     device="cuda:0",
 ):
     """Run MoE forward passes and log latency/power to perf file (trtllm < 1.1 collector)."""
@@ -120,7 +120,7 @@ def run_moe_torch(
     torch.cuda.set_device(device)
     torch.set_default_device(device)
 
-    # moe type support float16, fp8_qdq, fp8_block, w4a8, nvfp4(not implemented yet)
+    # moe type support bfloat16, fp8_qdq, fp8_block, w4a8, nvfp4(not implemented yet)
     dtype = torch.bfloat16
     quant_algo = None
     if moe_type == "fp8_block":

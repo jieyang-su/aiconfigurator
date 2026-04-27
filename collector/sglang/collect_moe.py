@@ -15,6 +15,9 @@ import torch
 if _server_args_module._global_server_args is None:
     _mock_server_args = MagicMock()
     _mock_server_args.enable_deterministic_inference = False
+    _mock_server_args.enable_fused_moe_sum_all_reduce = (
+        False  # sglang >=0.5.10; prevents fused all-reduce in single-GPU benchmarks
+    )
     _server_args_module._global_server_args = _mock_server_args
 
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
@@ -35,6 +38,17 @@ try:
     HAS_FLASHINFER_CUTE = True
 except ImportError:
     HAS_FLASHINFER_CUTE = False
+
+# Marlin int4 MoE kernel (W4A16) — much faster than the Triton GPTQ/AWQ path.
+_HAS_MARLIN_MOE = False
+try:
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+    from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
+    from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
+
+    _HAS_MARLIN_MOE = True
+except ImportError:
+    pass
 
 try:
     from common_test_cases import get_common_moe_test_cases
@@ -72,11 +86,11 @@ def get_moe_test_cases():
     # L40S (SM89) has 100KB shared memory, fp8_block kernel needs ~144KB
     sm_version = get_sm_version()
     if sm_version < 90:
-        moe_list = ["float16"]
+        moe_list = ["bfloat16", "int4_wo"]
     elif sm_version < 100:
-        moe_list = ["float16", "fp8_block"]
+        moe_list = ["bfloat16", "fp8_block", "int4_wo"]
     else:
-        moe_list = ["float16", "fp8_block", "nvfp4"]
+        moe_list = ["bfloat16", "fp8_block", "nvfp4", "int4_wo"]
 
     test_cases = []
 
@@ -94,8 +108,23 @@ def get_moe_test_cases():
             ):
                 continue
 
-            # nvfp4 fp4_quantize requires weight dims divisible by 16 after TP sharding
-            if moe_type == "nvfp4" and (common_moe_testcase.inter_size // common_moe_testcase.tp) % 16 != 0:
+            if moe_type == "nvfp4":
+                shard_k = common_moe_testcase.inter_size // common_moe_testcase.tp
+                # fp4_quantize requires weight dims divisible by 16 after TP sharding.
+                # CuteDSL grouped GEMM additionally requires 16-byte contiguous alignment:
+                # for fp4 (4-bit), that's 32 elements (16 * 8 // 4 = 32).
+                # See: flashinfer/cute_dsl/blockscaled_gemm.py
+                #   Sm100BlockScaledPersistentDenseGemmKernel.is_valid_tensor_alignment()
+                if shard_k % 32 != 0:
+                    continue
+
+            # int4_wo (W4A16): packed K dims must be divisible by group_size (128).
+            # w1 packed K = hidden_size // 2  → need hidden_size % 256 == 0
+            # w2 packed K = shard_inter // 4 = inter_size // (2*tp) → need (inter_size // tp) % 256 == 0
+            if moe_type == "int4_wo" and (
+                common_moe_testcase.hidden_size % 256 != 0
+                or (common_moe_testcase.inter_size // common_moe_testcase.tp) % 256 != 0
+            ):
                 continue
 
             test_cases.append(
@@ -109,7 +138,6 @@ def get_moe_test_cases():
                     common_moe_testcase.tp,
                     common_moe_testcase.ep,
                     common_moe_testcase.model_name,
-                    "moe_perf.txt",
                     common_moe_testcase.token_expert_distribution,
                     common_moe_testcase.power_law_alpha,
                 ]
@@ -139,6 +167,7 @@ def benchmark_config(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_nvfp4: bool = False,
+    use_int4_w4a16: bool = False,
     block_shape: list[int] | None = None,
     num_iters: int = 10,
     distributed: str = "power_law",
@@ -150,22 +179,109 @@ def benchmark_config(
         num_iters = len(workloads)
         num_tokens = max(workload["hidden_states"].shape[0] for workload in workloads)
 
-    # 1. Gating Output Generation (Common)
-    if workloads is not None:
-        gating_output = None
-    elif distributed == "uniform":
-        gating_output = torch.randn(num_iters, num_tokens, num_experts, dtype=torch.float32, device=device)
-    elif distributed == "balanced":
-        gating_output = [balanced_logits(num_tokens, num_experts, topk).to(device) for _ in range(num_iters)]
-    elif distributed == "power_law":
-        gating_output = [
-            power_law_logits_v3(num_tokens, num_experts, topk, 1, power_law_alpha).to(device) for _ in range(num_iters)
-        ]
-    else:
-        raise ValueError(f"Unsupported distributed mode: {distributed}")
+    # 1. Gating Output Generation (not needed for Marlin int4 path which builds its own)
+    if not (use_int4_w4a16 and _HAS_MARLIN_MOE):
+        if workloads is not None:
+            gating_output = None
+        elif distributed == "uniform":
+            gating_output = torch.randn(num_iters, num_tokens, num_experts, dtype=torch.float32, device=device)
+        elif distributed == "balanced":
+            gating_output = [balanced_logits(num_tokens, num_experts, topk).to(device) for _ in range(num_iters)]
+        elif distributed == "power_law":
+            gating_output = [
+                power_law_logits_v3(num_tokens, num_experts, topk, 1, power_law_alpha).to(device)
+                for _ in range(num_iters)
+            ]
+        else:
+            raise ValueError(f"Unsupported distributed mode: {distributed}")
 
     # 2. Setup based on Path
-    if use_nvfp4:
+    if use_int4_w4a16 and _HAS_MARLIN_MOE:
+        # Marlin int4 MoE path: repack GPTQ weights into Marlin tile layout
+        # and call fused_marlin_moe which uses optimized CUDA kernels.
+        num_bits = 4
+        pack_factor = 8  # 32-bit int packs 8 x int4
+        group_size = block_shape[1] if block_shape else 128
+
+        # GPTQ-packed weights: (E, K // pack_factor, N) as int32
+        w1_packed = torch.randint(
+            -(2**31),
+            2**31 - 1,
+            (num_experts, hidden_size // pack_factor, shard_intermediate_size),
+            dtype=torch.int32,
+            device=device,
+        )
+        w2_packed = torch.randint(
+            -(2**31),
+            2**31 - 1,
+            (num_experts, (shard_intermediate_size // 2) // pack_factor, hidden_size),
+            dtype=torch.int32,
+            device=device,
+        )
+        empty_perm = torch.empty((num_experts, 0), dtype=torch.int32, device=device)
+
+        # Repack to Marlin layout: (E, K // 16, N * (num_bits // 2))
+        w1_marlin = gptq_marlin_moe_repack(
+            w1_packed,
+            empty_perm,
+            hidden_size,
+            shard_intermediate_size,
+            num_bits,
+        )
+        w2_marlin = gptq_marlin_moe_repack(
+            w2_packed,
+            empty_perm,
+            shard_intermediate_size // 2,
+            hidden_size,
+            num_bits,
+        )
+        del w1_packed, w2_packed
+
+        # Per-group scales: (E, K // group_size, N) — then permute for Marlin
+        w1_scale = torch.randn(
+            (num_experts, hidden_size // group_size, shard_intermediate_size),
+            dtype=dtype,
+            device=device,
+        )
+        w2_scale = torch.randn(
+            (num_experts, (shard_intermediate_size // 2) // group_size, hidden_size),
+            dtype=dtype,
+            device=device,
+        )
+        w1_scale = marlin_moe_permute_scales(w1_scale, hidden_size, shard_intermediate_size, group_size)
+        w2_scale = marlin_moe_permute_scales(w2_scale, shard_intermediate_size // 2, hidden_size, group_size)
+
+        x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+
+        if distributed == "power_law":
+            gating_list = [
+                power_law_logits_v3(num_tokens, num_experts, topk, 1, power_law_alpha).to(device)
+                for _ in range(num_iters)
+            ]
+        elif distributed == "balanced":
+            gating_list = [balanced_logits(num_tokens, num_experts, topk).to(device) for _ in range(num_iters)]
+        else:
+            gating_list = [
+                torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device) for _ in range(num_iters)
+            ]
+
+        def run_op(i):
+            gating = gating_list[i % num_iters]
+            new_topk = select_experts(x, gating, TopKConfig(top_k=topk))
+            fused_marlin_moe(
+                x,
+                w1_marlin,
+                w2_marlin,
+                w1_scale,
+                w2_scale,
+                gating,
+                new_topk.topk_weights,
+                new_topk.topk_ids,
+                num_bits=num_bits,
+                is_k_full=True,
+            )
+
+    elif use_nvfp4:
         if not HAS_FLASHINFER_CUTE:
             raise ImportError("FlashInfer CuteDSL not available")
 
@@ -228,7 +344,7 @@ def benchmark_config(
                 masked_m=masked_m_list[i % num_iters],
             )
     else:
-        init_dtype = torch.float16 if use_fp8_w8a8 else dtype
+        init_dtype = torch.bfloat16 if use_fp8_w8a8 else dtype
         x = None if workloads is not None else torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
         if use_int8_w8a16 or use_int8_w8a8:
             w1 = torch.randint(
@@ -236,6 +352,16 @@ def benchmark_config(
             )
             w2 = torch.randint(
                 -127, 127, (num_experts, hidden_size, shard_intermediate_size // 2), dtype=torch.int8, device=device
+            )
+        elif use_int4_w4a16:
+            # W4A16: 2 int4 values packed per int8 byte — K dimension halved.
+            # w1 shape: (E, N=shard_inter, K_packed=hidden//2)
+            # w2 shape: (E, N=hidden, K_packed=shard_inter//4)
+            w1 = torch.randint(
+                0, 127, (num_experts, shard_intermediate_size, hidden_size // 2), dtype=torch.int8, device=device
+            )
+            w2 = torch.randint(
+                0, 127, (num_experts, hidden_size, shard_intermediate_size // 4), dtype=torch.int8, device=device
             )
         else:
             w1 = torch.randn(num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype, device=device)
@@ -245,6 +371,22 @@ def benchmark_config(
         if use_int8_w8a16:
             w1_scale = torch.randn((num_experts, 2 * shard_intermediate_size), dtype=torch.float32, device=device)
             w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32, device=device)
+        elif use_int4_w4a16:
+            # Per-group scales along K. The GPTQ kernel receives K = A.shape[1]
+            # (unpacked hidden size), so scale groups are hidden_size // group_size,
+            # NOT (hidden_size // 2) // group_size (the packed size).
+            # w2's K is shard_intermediate_size // 2 (post silu_and_mul, unpacked).
+            group_size = block_shape[1] if block_shape else 128
+            w1_scale = torch.randn(
+                (num_experts, shard_intermediate_size, hidden_size // group_size),
+                dtype=torch.float32,
+                device=device,
+            )
+            w2_scale = torch.randn(
+                (num_experts, hidden_size, (shard_intermediate_size // 2) // group_size),
+                dtype=torch.float32,
+                device=device,
+            )
         elif use_fp8_w8a8 or use_int8_w8a8:
             if use_int8_w8a8 and block_shape is None:
                 w1_scale = torch.randn(num_experts, shard_intermediate_size, dtype=torch.float32, device=device)
@@ -301,6 +443,7 @@ def benchmark_config(
                     use_fp8_w8a8=use_fp8_w8a8,
                     use_int8_w8a8=use_int8_w8a8,
                     use_int8_w8a16=use_int8_w8a16,
+                    use_int4_w4a16=use_int4_w4a16,
                     w1_scale=w1_scale,
                     w2_scale=w2_scale,
                     a1_scale=a1_scale,
@@ -338,6 +481,7 @@ def benchmark(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_nvfp4: bool = False,
+    use_int4_w4a16: bool = False,
     block_shape: list[int] | None = None,
     distributed: str = "power_law",
     power_law_alpha: float = 0,
@@ -348,8 +492,9 @@ def benchmark(
         max(workload["hidden_states"].shape[0] for workload in workloads) if workloads is not None else num_tokens
     )
 
-    if use_nvfp4:
-        # nvfp4 uses flashinfer cutedsl backend, which doesn't need triton configs
+    if use_nvfp4 or (use_int4_w4a16 and _HAS_MARLIN_MOE):
+        # nvfp4 uses flashinfer cutedsl backend; int4_w4a16 uses Marlin CUDA
+        # kernels — neither needs Triton tuning configs.
         kernel_time, power_stats = benchmark_config(
             None,
             benchmark_num_tokens,
@@ -362,6 +507,7 @@ def benchmark(
             use_int8_w8a8,
             use_int8_w8a16,
             use_nvfp4,
+            use_int4_w4a16,
             block_shape,
             distributed=distributed,
             power_law_alpha=power_law_alpha,
@@ -372,6 +518,7 @@ def benchmark(
     dtype_str = get_config_dtype_str(
         dtype,
         use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
         use_fp8_w8a8=use_fp8_w8a8,
     )
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
@@ -404,6 +551,7 @@ def benchmark(
         use_int8_w8a8,
         use_int8_w8a16,
         use_nvfp4,
+        use_int4_w4a16,
         block_shape,
         distributed=distributed,
         power_law_alpha=power_law_alpha,
@@ -485,9 +633,10 @@ def run_moe_torch(
     moe_tp_size,
     moe_ep_size,
     model_name,
-    perf_filename,
     distributed="power_law",
     power_law_alpha=0,
+    *,
+    perf_filename,
     device="cuda:0",
 ):
     torch.cuda.set_device(device)
@@ -495,13 +644,22 @@ def run_moe_torch(
 
     assert moe_type in [
         "fp8_block",
-        "float16",
+        "bfloat16",
         "nvfp4",
-    ], "only support moe type = fp8_block, float16 or nvfp4"
+        "int4_wo",
+    ], "only support moe type = fp8_block, bfloat16, nvfp4, or int4_wo"
     assert inter_size % moe_tp_size == 0, "inter_size % moe_tp_size must be 0"
     assert num_experts % moe_ep_size == 0, "num_experts must be divisible by moe_ep_size"
 
     num_local_experts = num_experts // moe_ep_size
+    use_int4_w4a16 = moe_type == "int4_wo"
+    # int4_wo uses block_shape=[0, group_size] for grouped scales (group_size=128)
+    if use_int4_w4a16:
+        block_shape = [0, 128]
+    elif moe_type == "fp8_block" and (inter_size // moe_tp_size) % 128 == 0 and hidden_size % 128 == 0:
+        block_shape = [128, 128]
+    else:
+        block_shape = None
 
     rank0_workloads: list[Rank0Workload] | None = None
     if moe_ep_size > 1 and distributed in ("power_law", "balanced"):
@@ -530,9 +688,8 @@ def run_moe_torch(
             False,
             False,
             use_nvfp4=moe_type == "nvfp4",
-            block_shape=[128, 128]
-            if (moe_type == "fp8_block" and inter_size // moe_tp_size % 128 == 0 and hidden_size % 128 == 0)
-            else None,
+            use_int4_w4a16=use_int4_w4a16,
+            block_shape=block_shape,
             distributed=distributed,
             power_law_alpha=power_law_alpha,
             workloads=rank0_workloads,
@@ -549,9 +706,8 @@ def run_moe_torch(
             False,
             False,
             use_nvfp4=moe_type == "nvfp4",
-            block_shape=[128, 128]
-            if (moe_type == "fp8_block" and inter_size // moe_tp_size % 128 == 0 and hidden_size % 128 == 0)
-            else None,
+            use_int4_w4a16=use_int4_w4a16,
+            block_shape=block_shape,
             distributed=distributed,
             power_law_alpha=power_law_alpha,
         )
@@ -575,14 +731,22 @@ def run_moe_torch(
         version=pkg_resources.get_distribution("sglang").version,
         device_name=torch.cuda.get_device_name(device),
         op_name="moe",
-        kernel_source="sglang_flashinfer_cutedsl_moe" if moe_type == "nvfp4" else "sglang_fused_moe_triton",
+        kernel_source=(
+            "sglang_flashinfer_cutedsl_moe"
+            if moe_type == "nvfp4"
+            else "sglang_marlin_moe"
+            if moe_type == "int4_wo" and _HAS_MARLIN_MOE
+            else "sglang_fused_moe_triton"
+        ),
         perf_filename=perf_filename,
         power_stats=power_stats,
     )
 
 
 if __name__ == "__main__":
+    from collector.registry_types import PerfFile
+
     test_cases = get_moe_test_cases()
     for test_case in test_cases:
         print(test_case)
-        run_moe_torch(*test_case)
+        run_moe_torch(*test_case, perf_filename=PerfFile.MOE)

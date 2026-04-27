@@ -84,7 +84,8 @@ class MockServerArgs:
         self.multi_item_scoring_delimiter = None
         self.dllm_algorithm = None
         self.dllm_algorithm_config = None
-        self.enable_piecewise_cuda_graph = False
+        self.enable_piecewise_cuda_graph = False  # sglang <=0.5.9
+        self.disable_piecewise_cuda_graph = True  # sglang >=0.5.10
         self.model_path = None
         self.revision = None
         # Required by TritonAttnBackend
@@ -109,6 +110,7 @@ class MockModelRunner:
         self.token_to_kv_pool = None
         self.attn_backend = None
         self.server_args = MockServerArgs(page_size=page_size)
+        self.attn_cp_size = 1  # Context parallelism size; required by FlashAttentionBackend in sglang >=0.5.10
         self.is_draft_worker = False
         self.model_is_mrope = False
         self.sliding_window_size = None
@@ -175,12 +177,12 @@ def get_context_attention_test_cases():
                         continue
 
                     # BF16 attention - works on all GPUs
-                    test_cases.append([b, s, n, num_kv_heads, 128, False, False, True, "context_attention_perf.txt"])
+                    test_cases.append([b, s, n, num_kv_heads, 128, False, False, True])
 
                     # FP8 attention - requires SM90+ (Hopper)
                     if not skip_fp8:
-                        test_cases.append([b, s, n, num_kv_heads, 128, True, False, True, "context_attention_perf.txt"])
-                        test_cases.append([b, s, n, num_kv_heads, 128, True, True, True, "context_attention_perf.txt"])
+                        test_cases.append([b, s, n, num_kv_heads, 128, True, False, True])
+                        test_cases.append([b, s, n, num_kv_heads, 128, True, True, True])
 
     return test_cases
 
@@ -227,10 +229,10 @@ def get_generation_attention_test_cases():
                 target_s_list = target_s_list[:-1]
             for s in target_s_list:
                 # BF16 attention - works on all GPUs
-                test_cases.append([b, s, n, n, 128, False, False, False, "generation_attention_perf.txt"])
+                test_cases.append([b, s, n, n, 128, False, False, False])
                 # FP8 attention - requires SM90+ (Hopper)
                 if not skip_fp8:
-                    test_cases.append([b, s, n, n, 128, True, False, False, "generation_attention_perf.txt"])
+                    test_cases.append([b, s, n, n, 128, True, False, False])
 
     # XQA
     max_bsn = 8192 * 1024 * 2
@@ -263,10 +265,10 @@ def get_generation_attention_test_cases():
                     continue
                 for s in target_s_list:
                     # BF16 attention - works on all GPUs
-                    test_cases.append([b, s, n, n_kv, 128, False, False, False, "generation_attention_perf.txt"])
+                    test_cases.append([b, s, n, n_kv, 128, False, False, False])
                     # FP8 attention - requires SM90+ (Hopper)
                     if not skip_fp8:
-                        test_cases.append([b, s, n, n_kv, 128, True, False, False, "generation_attention_perf.txt"])
+                        test_cases.append([b, s, n, n_kv, 128, True, False, False])
     return test_cases
 
 
@@ -279,9 +281,9 @@ def run_attention_torch(
     use_fp8_kv_cache,
     use_fp8_context_fmha,
     is_context_phase,
+    *,
     perf_filename,
     device="cuda:0",
-    *,
     page_size: int = 64,
 ):
     if use_fp8_context_fmha:
@@ -514,8 +516,8 @@ def run_attention_torch(
                 "num_key_value_heads": num_key_value_heads,
                 "head_dim": head_dim,
                 "beam_width": 1,
-                "attn_dtype": "fp8" if use_fp8_context_fmha else "float16",
-                "kv_cache_dtype": "fp8" if use_fp8_kv_cache else "float16",
+                "attn_dtype": "fp8" if use_fp8_context_fmha else "bfloat16",
+                "kv_cache_dtype": "fp8" if use_fp8_kv_cache else "bfloat16",
                 "step": step,
                 "latency": latency,
             }

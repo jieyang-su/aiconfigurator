@@ -87,7 +87,7 @@ def get_gemm_xpu_test_cases() -> list[GemmCommonTestCase]:
 
 
 def get_gemm_test_cases():
-    gemm_list = ["float16", "fp8"]
+    gemm_list = ["bfloat16", "fp8"]
 
     test_cases = []
 
@@ -96,19 +96,19 @@ def get_gemm_test_cases():
         n = gemm_common_testcase.n
         k = gemm_common_testcase.k
         for gemm_type in gemm_list:
-            test_cases.append([gemm_type, x, n, k, "gemm_perf.txt"])
+            test_cases.append([gemm_type, x, n, k])
 
     return test_cases
 
 
 @with_exit_stack
-def run_gemm(exit_stack, gemm_type, m, n, k, perf_filename, device="xpu:0"):
+def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="xpu:0"):
     # Force DeepGEMM path when available to capture the intended kernel.
     os.environ["VLLM_USE_DEEP_GEMM"] = "1"
 
     setup_distributed(device)
 
-    dtype = torch.float16
+    dtype = torch.bfloat16
     torch.set_default_dtype(dtype)
     get_device_module().set_device(device)
 
@@ -227,6 +227,8 @@ def run_gemm(exit_stack, gemm_type, m, n, k, perf_filename, device="xpu:0"):
 
 
 if __name__ == "__main__":
+    from collector.registry_types import PerfFile
+
     test_cases = get_gemm_test_cases()
     for test_case in test_cases[:10]:
-        run_gemm(*test_case)
+        run_gemm(*test_case, perf_filename=PerfFile.GEMM)

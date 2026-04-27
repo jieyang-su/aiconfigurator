@@ -113,13 +113,32 @@ def _resolve_local_model_path(model_id: str) -> str:
         config = json.load(f)
 
     # Normalise model_type so sglang's AutoConfig recognises it.
+    original_arch = None
     if config.get("model_type") in ("deepseek_v32", "glm_moe_dsa"):
+        original_arch = (config.get("architectures") or [None])[0]
         config["architectures"] = ["DeepseekV3ForCausalLM"]
         config["model_type"] = "deepseek_v3"
 
     # Strip auto_map to prevent transformers from attempting to download
     # custom config/model classes from HuggingFace when trust_remote_code=True.
     config.pop("auto_map", None)
+
+    # Re-apply GLM-5 arch-specific overrides that sglang would normally
+    # apply in server_args.py:1609-1612 based on
+    # hf_config.architectures[0] == "GlmMoeDsaForCausalLM" - but we just
+    # rewrote that string to "DeepseekV3ForCausalLM" above so AutoConfig
+    # can find the model_type, so sglang's gate never fires. Without
+    # this, on Blackwell every GLM-5 DSA context probe with max_kv_len
+    # <= 2048 (the default DENSE_ATTN threshold) dispatches to
+    # _forward_standard_mha -> flashinfer.prefill.trtllm_ragged_attention_deepseek
+    # which asserts on GLM-5's v_head_dim=256 and kills the subprocess
+    # after ~14 rows/bucket.
+    if (
+        original_arch == "GlmMoeDsaForCausalLM"
+        and get_sm_version() >= 100
+        and "SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD" not in os.environ
+    ):
+        os.environ["SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"] = "0"
 
     tmp_dir = os.path.join(
         tempfile.gettempdir(),
@@ -143,9 +162,16 @@ def _get_precision_combos(phase: str):
     All strings are perf-database-compatible (not SGLang-native).
 
     SGLang precision axes:
-      gemm_type:      always "bfloat16" — model runner handles projections internally
-      kv_cache_dtype: "bfloat16" always; "fp8" on SM >= 90 (Hopper+)
-      compute_dtype:  always "bfloat16"
+      compute_dtype:  always "bfloat16" (DSA / NSA kernels run bf16 FMHA;
+                      on B200 decode with fp8 KV the trtllm path runs fp8
+                      FMHA internally, but the latency is captured under the
+                      fp8 KV row).
+      kv_cache_dtype: "bfloat16" always; "fp8" on SM >= 90 (Hopper+).
+      gemm_type:      "bfloat16" for bf16 weights; "fp8_block" on SM >= 89,
+                      in which case load_model_runner launches sglang with
+                      quantization="fp8" so the inner attention projections
+                      (q_b_proj, kv_b_proj, o_proj, wq_b, wk) and the fp8
+                      paged MQA scoring kernel fire on real fp8 weights.
 
     fp4_e2m1 omitted — SGLang supports it on SM >= 100, but KVCacheQuantMode
     enum has no fp4 entry, so perf_database cannot consume it yet.
@@ -154,7 +180,10 @@ def _get_precision_combos(phase: str):
     kv_dtypes = ["bfloat16"]
     if sm >= 90:
         kv_dtypes.append("fp8")
-    return [("bfloat16", kv, "bfloat16") for kv in kv_dtypes]
+    combos = [("bfloat16", kv, "bfloat16") for kv in kv_dtypes]
+    if sm >= 89:
+        combos += [("bfloat16", kv, "fp8_block") for kv in kv_dtypes]
+    return combos
 
 
 def _get_backends(attn_type: str):
@@ -202,17 +231,16 @@ def _get_mla_backend_list() -> list[str]:
 # Sweep ranges — aligned with vllm/trtllm collect_mla_module.py
 _BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 _SEQ_LENGTHS = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-_HEAD_NUMS = [128, 64, 32, 16]
+_HEAD_NUMS = [128, 64, 32, 16, 8]  # 8 covers GLM-5 (native 64) at tp=8
 
 
 def get_context_test_cases(attn_type: str):
     """Context-phase test cases.
 
     Returns list of [seq_len, batch_size, num_heads, kv_cache_dtype,
-                     compute_dtype, gemm_type, perf_filename].
+                     compute_dtype, gemm_type].
     """
     cases = []
-    base_fname = f"{attn_type}_context_module_perf.txt"
     for compute_dtype, kv_dtype, gemm_type in _get_precision_combos("context"):
         for num_heads in _HEAD_NUMS:
             for batch_size in _BATCH_SIZES:
@@ -221,7 +249,7 @@ def get_context_test_cases(attn_type: str):
                         continue
                     if seq_len >= 8192 and batch_size > 8:
                         continue
-                    cases.append([seq_len, batch_size, num_heads, kv_dtype, compute_dtype, gemm_type, base_fname])
+                    cases.append([seq_len, batch_size, num_heads, kv_dtype, compute_dtype, gemm_type])
     return cases
 
 
@@ -229,10 +257,9 @@ def get_generation_test_cases(attn_type: str):
     """Generation-phase test cases.
 
     Returns list of [kv_cache_len, batch_size, num_heads, kv_cache_dtype,
-                     compute_dtype, gemm_type, perf_filename].
+                     compute_dtype, gemm_type].
     """
     cases = []
-    base_fname = f"{attn_type}_generation_module_perf.txt"
     for compute_dtype, kv_dtype, gemm_type in _get_precision_combos("generation"):
         for num_heads in _HEAD_NUMS:
             for batch_size in _BATCH_SIZES:
@@ -241,7 +268,7 @@ def get_generation_test_cases(attn_type: str):
                         continue
                     if seq_len >= 8192 and batch_size > 16:
                         continue
-                    cases.append([seq_len, batch_size, num_heads, kv_dtype, compute_dtype, gemm_type, base_fname])
+                    cases.append([seq_len, batch_size, num_heads, kv_dtype, compute_dtype, gemm_type])
     return cases
 
 
@@ -249,7 +276,7 @@ def _build_module_test_cases(attn_type: str, mode: str):
     """Build one test case per unique (num_heads, precision, model) group.
 
     Output format: [seq_len, batch_size, num_heads, kv_cache_dtype,
-                    compute_dtype, gemm_type, perf_filename, model_path,
+                    compute_dtype, gemm_type, model_path,
                     attn_type, attention_backend]
 
     Each test case triggers a subprocess that sweeps all (batch_size, seq_len)
@@ -257,10 +284,9 @@ def _build_module_test_cases(attn_type: str, mode: str):
     individual point. seq_len and batch_size are set to 0 as placeholders.
 
     attention_backend is None for DSA (resolved at runtime by _get_backends()).
-    All test cases are 10 elements so that collect.py's ``func(*task, device)``
-    maps positional args correctly to run_mla_module_worker().
+    perf_filename is supplied by collect.py via functools.partial as a keyword
+    argument, so it is not included in the test case tuple.
     """
-    base_fname = f"{attn_type}_{mode}_module_perf.txt"
     model_paths = [m for m, t in SUPPORTED_MODELS.items() if t == attn_type]
     cases = []
     for model_path in model_paths:
@@ -277,7 +303,6 @@ def _build_module_test_cases(attn_type: str, mode: str):
                         kv_dtype,
                         compute_dtype,
                         gemm_type,
-                        base_fname,
                         model_path,
                         attn_type,
                         None,
@@ -290,16 +315,17 @@ def _build_wideep_mla_test_cases(mode: str):
     """Build test cases for wideep MLA collection (backward-compatible).
 
     Output format: [seq_len, batch_size, num_heads, kv_cache_dtype,
-                    compute_dtype, gemm_type, perf_filename, model_path,
+                    compute_dtype, gemm_type, model_path,
                     attn_type, attention_backend]
 
     Matches the old collect_wideep_attn.py behavior:
     - Single precision combo (bfloat16 run, logged as fp8_block/fp8)
     - Sweeps multiple attention backends per SM version
     - Only DeepSeek-V3 (the MLA model), not V3.2/GLM-5 (DSA models)
+
+    perf_filename is supplied by collect.py via functools.partial as a keyword
+    argument, so it is not included in the test case tuple.
     """
-    phase = "context" if mode == "context" else "generation"
-    base_fname = f"wideep_{phase}_mla_perf.txt"
     model_paths = [m for m, t in SUPPORTED_MODELS.items() if t == "mla"]
     backends = _get_mla_backend_list()
     cases = []
@@ -318,7 +344,6 @@ def _build_wideep_mla_test_cases(mode: str):
                         "bfloat16",
                         "bfloat16",
                         "bfloat16",
-                        base_fname,
                         model_path,
                         "mla",
                         backend,
@@ -364,6 +389,37 @@ def cleanup_distributed():
 
     if hasattr(expert_location, "_global_expert_location_metadata"):
         expert_location._global_expert_location_metadata = None
+
+
+def _ensure_fp8_block_quant_config(hf_cfg) -> None:
+    """Populate hf_config.quantization_config with weight_block_size for fp8_block.
+
+    After _resolve_local_model_path rewrites the model_type to deepseek_v3, the
+    JSON's ``quantization_config`` section may not be preserved as an attribute
+    on the HF config object. sglang's _get_quantization_config then falls back
+    to ``Fp8Config()`` with no weight_block_size, which flips Fp8LinearMethod
+    to the channel-FP8 path — that path transposes the weight post-load and
+    breaks downstream DeepseekV2 post_load_weights. Re-inject the block-scale
+    fields so block_quant=True fires.
+    """
+    default_qc = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+        "fmt": "e4m3",
+    }
+    qc = getattr(hf_cfg, "quantization_config", None)
+    if qc is None:
+        hf_cfg.quantization_config = default_qc
+        return
+    if isinstance(qc, dict):
+        for k, v in default_qc.items():
+            if qc.get(k) is None:
+                qc[k] = v
+        return
+    for k, v in default_qc.items():
+        if getattr(qc, k, None) is None:
+            setattr(qc, k, v)
 
 
 def _patch_nsa_rope_contiguity(model_runner):
@@ -417,6 +473,7 @@ def load_model_runner(
     attention_backend: str,
     device: str = "cuda:0",
     tp_rank: int = 0,
+    gemm_type: str = "bfloat16",
 ):
     """Load SGLang ModelRunner with dummy weights.
 
@@ -426,6 +483,11 @@ def load_model_runner(
         kv_cache_dtype: Perf-DB-compatible string ("bfloat16" or "fp8").
             Mapped to SGLang-native string via SGLANG_KV_DTYPE.
         attention_backend: Backend string for ServerArgs (e.g. "nsa", "fa3").
+        gemm_type: Perf-DB-compatible string ("bfloat16" or "fp8_block").
+            "fp8_block" launches sglang with quantization="fp8" so the
+            attention module's linear projections and the paged MQA scoring
+            kernel fire on real fp8 weights; "bfloat16" keeps quantization
+            disabled and all projections run bf16 with dummy weights.
 
     Environment variables:
         SGLANG_TEST_NUM_LAYERS: Number of layers to load (default 2).
@@ -473,16 +535,22 @@ def load_model_runner(
         kv_cache_dtype=sglang_kv_dtype,
     )
 
-    # Disable fp8 weight quantization.  sglang auto-enables fp8 for DeepSeek
-    # models on SM>=100, but the quantization path crashes on GLM-5 weights
-    # (channel_quant_to_tensor_quant .view(-1) on non-contiguous tensor).
-    # We only need attention kernel perf with dummy weights, not quantised MoE.
-    server_args.quantization = None
+    # Quantization control: bf16 (dummy weights) vs fp8 (real fp8 weight
+    # paths so attention projections and indexer MQA scoring actually fire in
+    # fp8).
+    if gemm_type == "fp8_block":
+        server_args.quantization = "fp8"
+    else:
+        server_args.quantization = None
 
     # Disable piecewise CUDA graph — its warmup compile OOMs on large models
     # (e.g. 64 GiB allocation with fp8 + 128 heads on H200).
     # Not a ServerArgs constructor param; set post-init like collect_attn.py.
-    server_args.enable_piecewise_cuda_graph = False
+    # Field renamed in sglang 0.5.10: enable_piecewise_cuda_graph → disable_piecewise_cuda_graph.
+    if hasattr(server_args, "disable_piecewise_cuda_graph"):
+        server_args.disable_piecewise_cuda_graph = True  # sglang >=0.5.10
+    else:
+        server_args.enable_piecewise_cuda_graph = False  # sglang <=0.5.9
 
     server_args.attention_backend = attention_backend
     print(f"Using attention backend: {attention_backend}, kv_cache_dtype: {sglang_kv_dtype}, gpu_id: {gpu_id}")
@@ -500,6 +568,18 @@ def load_model_runner(
     nccl_port = 29500 + random.randint(0, 10000) + gpu_id * 100
 
     model_config = ModelConfig.from_server_args(server_args)
+
+    # Bug A fix: ensure hf_config.quantization_config carries weight_block_size
+    # so sglang constructs Fp8Config with block_quant=True. Without this, the
+    # Fp8LinearMethod post-load path at fp8.py:660 transposes kv_b_proj.weight
+    # from (out=7168, in=512) to (in=512, out=7168), and then
+    # deepseek_weight_loader.py:555 unflatten(dim0=512, 448) fails with
+    # `448 ∤ 512`. Our _resolve_local_model_path writes quantization_config into
+    # the tmp config.json, but after the model_type rewrite to deepseek_v3 the
+    # attribute may not survive onto hf_config — re-inject it here.
+    if gemm_type == "fp8_block":
+        _ensure_fp8_block_quant_config(model_config.hf_config)
+
     model_runner = ModelRunner(
         model_config=model_config,
         mem_fraction_static=0.5,
@@ -565,8 +645,8 @@ def run_attention_torch(
         log_kv_dtype = "fp8"
         log_gemm_type = "fp8_block"
     else:
-        # DSA: log raw dtypes; perf_database._normalize_dtype_key() handles
-        # the bfloat16 → float16 mapping on the consumer side.
+        # DSA: log dtype strings that match the common.*QuantMode enum member
+        # names expected by perf_database loaders (e.g. "bfloat16", "fp8").
         log_mla_dtype = compute_dtype
         log_kv_dtype = kv_cache_dtype
         log_gemm_type = gemm_type
@@ -912,6 +992,22 @@ def _run_decode(
                 zero_allocator=zero_allocator,
             )
 
+        # Pre-warm JIT / autotuning before CUDA graph capture.
+        # DSA decode on Blackwell calls DeepGEMM fp8_paged_mqa_logits and
+        # flashinfer trtllm_batch_decode_with_kv_cache_mla, both of which
+        # JIT or autotune on first call to a new (heads, bs, kv_len) shape.
+        # If that work spills into the graph-capture window inside
+        # benchmark_with_power, it emits cudaMemcpy-like ops that aren't
+        # permitted during capture and the whole sweep silently skips
+        # (Issue #3 — reproduces only at reduced heads ∈ {8, 16, 32} where
+        # the warmup-time JIT cache from heads=64 doesn't satisfy the new
+        # template instantiation). A few extra eager kernel_func calls
+        # with explicit syncs in between flush that path before capture.
+        if torch.cuda.is_available():
+            for _ in range(5):
+                kernel_func()
+                torch.cuda.synchronize()
+
         with benchmark_with_power(
             device=device,
             kernel_func=kernel_func,
@@ -1037,13 +1133,41 @@ def run_mla_module(
         phase_name = "Generation"
 
     # Filter to matching precision combo.
-    # Test case format: [seq_len, batch_size, num_heads, kv_dtype, compute_dtype, gemm_type, ...]
+    # Test case format: [seq_len, batch_size, num_heads, kv_dtype, compute_dtype, gemm_type]
     # run_attention_torch expects: (batch_size, seq_length, is_prefill)
     cases = [
         (tc[1], tc[0], is_prefill)
         for tc in all_cases
         if tc[3] == kv_cache_dtype and tc[4] == compute_dtype and tc[5] == gemm_type and tc[2] == head_num
     ]
+
+    # Known-crash skip: B200 DSv3.2 DSA generation at reduced heads ≤ 32 and
+    # kv_cache_length ≥ 256 produces an async CUDA illegal memory access
+    # inside the flashinfer trtllm_batch_decode_with_kv_cache_mla kernel —
+    # the subprocess SIGABRTs and every remaining (bs, kv_len) in this task
+    # is lost. Root cause is collector-setup divergence from production
+    # (dummy weights + cleared KV pool + json_model_override_args heads
+    # override) rather than a real kernel bug — InferenceX SemiAnalysis
+    # benchmarks show GLM-5 tp=4 on B200 + fp8-KV works in production.
+    # Skipping these points lets the subprocess complete the sweep and
+    # populate rows for bs in {2..1024} x kv_len in {1..128} at reduced heads
+    # instead of losing them behind the first SIGABRT at (bs=1, kv_len=256).
+    if (
+        not is_prefill
+        and attn_type == "dsa"
+        and model_path == "deepseek-ai/DeepSeek-V3.2"
+        and head_num <= 32
+        and get_sm_version() == 100
+    ):
+        before = len(cases)
+        cases = [(bs, seq_len, ip) for (bs, seq_len, ip) in cases if seq_len < 256]
+        skipped = before - len(cases)
+        if skipped:
+            print(
+                f"[SKIP] B200 DSv3.2 DSA gen reduced-heads: dropping {skipped} "
+                f"(bs, kv_len) cases with kv_len>=256 to avoid SIGABRT "
+                f"(heads={head_num}, kv={kv_cache_dtype}, gemm={gemm_type})"
+            )
 
     print(f"\n{'=' * 60}")
     print(
@@ -1063,6 +1187,7 @@ def run_mla_module(
             kv_cache_dtype=kv_cache_dtype,
             attention_backend=attention_backend,
             device=device,
+            gemm_type=gemm_type,
         )
 
         run_attention_torch(
@@ -1139,22 +1264,26 @@ def run_mla_module_worker(
     kv_cache_dtype: str,
     compute_dtype: str,
     gemm_type: str,
-    perf_filename: str,
     model_path: str,
     attn_type: str,
     attention_backend: str | None = None,
+    *,
+    perf_filename: str,
     device: str = "cuda:0",
 ):
-    """Worker-compatible positional wrapper used by collector/collect.py.
+    """Worker-compatible wrapper used by collector/collect.py.
 
     Each call runs ALL (batch_size, seq_len) combos for the given
     (attn_type, num_heads, precision, model) combo in a subprocess.
     The seq_len and batch_size args from the individual test case are
     ignored here because the subprocess sweeps all combos internally.
 
-    For wideep MLA test cases, attention_backend is the 10th positional
+    For wideep MLA test cases, attention_backend is the 9th positional
     element specifying which backend to benchmark (e.g. "flashinfer", "fa3").
     For DSA test cases, it defaults to None and _get_backends() is used.
+
+    perf_filename and device are keyword-only arguments supplied by
+    collect.py via functools.partial and the worker dispatch loop.
     """
     device_str = str(device) if not isinstance(device, str) else device
     gpu_id = int(device_str.split(":")[-1]) if ":" in device_str else 0

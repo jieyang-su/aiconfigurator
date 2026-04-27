@@ -62,7 +62,7 @@ class MockAttentionLayer:
 
 
 # https://github.com/vllm-project/vllm/tree/main/vllm/v1/attention/backends
-# support MHA GQA MQA fp16 tensor and float16/fp8 kv cache
+# support MHA GQA MQA bfloat16 tensor and bfloat16/fp8 kv cache
 
 
 @with_exit_stack
@@ -75,12 +75,13 @@ def run_attention_torch(
     head_dim,
     use_fp8_kv_cache,
     is_context_phase,
+    *,
     perf_filename,
     device="cuda:0",
 ):
     torch.cuda.set_device(device)
 
-    dtype = torch.float16
+    dtype = torch.bfloat16
     model = os.path.join(os.path.dirname(__file__), "fake_hf_model")
     block_size = 64
 
@@ -346,8 +347,8 @@ def run_attention_torch(
         step = input_len
         op_name = "generation_attention"
 
-    kv_cache_dtype_str = "float16" if not use_fp8_kv_cache else "fp8"
-    dtype_str = "float16"
+    kv_cache_dtype_str = "bfloat16" if not use_fp8_kv_cache else "fp8"
+    dtype_str = "bfloat16"
     kernel_source = f"vllm_{backend_name_str}".lower()
 
     log_perf(
@@ -444,7 +445,6 @@ def get_context_attention_test_cases(if_unit_test=False):
                                 128,
                                 is_fp8_kv_cache,
                                 True,
-                                "context_attention_perf.txt",
                             ]
                         )
 
@@ -526,21 +526,22 @@ def get_generation_attention_test_cases():
                                 128,
                                 is_fp8_kv_cache,
                                 False,
-                                "generation_attention_perf.txt",
                             ]
                         )
     return test_cases
 
 
 if __name__ == "__main__":
+    from collector.registry_types import PerfFile
+
     test_cases = get_context_attention_test_cases()
     test_cases = test_cases[:10]
     for test_case in test_cases:
         print(f"Running context attention test case: {test_case}")
-        run_attention_torch(*test_case)
+        run_attention_torch(*test_case, perf_filename=PerfFile.CONTEXT_ATTENTION)
 
     test_cases = get_generation_attention_test_cases()
     test_cases = test_cases[:10]
     for test_case in test_cases:
         print(f"Running generation attention test case: {test_case}")
-        run_attention_torch(*test_case)
+        run_attention_torch(*test_case, perf_filename=PerfFile.GENERATION_ATTENTION)

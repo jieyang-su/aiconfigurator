@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
+import functools
 import os
 import warnings
 
@@ -372,7 +373,7 @@ def worker(
 
         try:
             worker_logger.debug(f"Starting task {task_id}")
-            func(*task, device)
+            func(*task, device=device)
             worker_logger.debug(f"Completed task {task_id}")
         except Exception as e:
             # Build comprehensive error info
@@ -397,10 +398,16 @@ def worker(
             for handler in worker_logger.handlers:
                 handler.flush()
 
-            # This error is could be fatal and require a process restart.
-            if isinstance(e, torch.AcceleratorError):
+            # These errors are fatal and require a process restart to
+            # reset the GPU CUDA context.
+            is_cuda_fatal = isinstance(e, torch.AcceleratorError)
+            if not is_cuda_fatal:
+                # DSLCudaRuntimeError from CUTLASS DSL also corrupts CUDA
+                # context but isn't a torch.AcceleratorError subclass.
+                is_cuda_fatal = type(e).__name__ == "DSLCudaRuntimeError"
+            if is_cuda_fatal:
                 worker_logger.warning(
-                    f"Fatal AcceleratorError encountered on task {task_id}. "
+                    f"Fatal {type(e).__name__} encountered on task {task_id}. "
                     f"Worker {device_id} exiting to reset GPU context. "
                     f"Progress: {progress_value.value}"
                 )
@@ -440,13 +447,16 @@ def parallel_run(tasks, func, num_processes, module_name="unknown", resume_optio
     Args:
         num_processes: Number of parallel processes. If 0, runs sequentially in main process.
     """
+    # func may be a functools.partial (perf_filename bound by collect_ops),
+    # which lacks __name__. Fall back to partial.func to get the wrapped function.
+    func_name = getattr(func, "__name__", None) or getattr(func, "func", func).__name__
     raw_task_infos = []
     for i, task in enumerate(tasks):
         if isinstance(task, dict) and "id" in task and "params" in task:
             task_id = task["id"]
             task_params = task["params"]
         else:
-            task_id = create_test_case_id(task, func.__name__, module_name)
+            task_id = create_test_case_id(task, func_name, module_name)
             task_params = task
         raw_task_infos.append({"id": task_id, "params": task_params, "index": i})
 
@@ -456,7 +466,7 @@ def parallel_run(tasks, func, num_processes, module_name="unknown", resume_optio
     resume_tracker = ResumeCheckpoint(
         backend=resume_options.get("backend", "unknown") if resume_options else "unknown",
         module_name=module_name,
-        run_func_name=func.__name__,
+        run_func_name=func_name,
         checkpoint_dir=checkpoint_dir,
     )
 
@@ -581,7 +591,7 @@ def parallel_run(tasks, func, num_processes, module_name="unknown", resume_optio
                 task_params = task_info["params"]
 
                 try:
-                    func(*task_params, device)
+                    func(*task_params, device=device)
                     resume_tracker.mark_done(task_id)
                 except Exception as e:
                     error_info = {
@@ -768,6 +778,7 @@ def collect_ops(
 
             get_func = getattr(get_module, collection["get_func"])
             run_func = getattr(run_module, collection["run_func"])
+            run_func = functools.partial(run_func, perf_filename=collection["perf_filename"])
 
             def get_func_with_limit(get_func=get_func):
                 cases = get_func()
@@ -1091,8 +1102,6 @@ def main():
         if os.environ.get("COLLECTOR_LOCAL_MODEL_PATH"):
             logger.info(f"Using local model directory: {os.environ['COLLECTOR_LOCAL_MODEL_PATH']}")
 
-    num_processes = get_device_module().device_count()
-    logger.info(f"Starting collection with {num_processes} GPU processes")
     resume_options = {
         "resume": args.resume,
         "checkpoint_dir": args.checkpoint_dir,

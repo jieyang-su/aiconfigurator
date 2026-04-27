@@ -51,7 +51,6 @@ def get_context_mla_test_cases():
                                 10,
                                 6,
                                 True,
-                                "context_mla_perf.txt",
                             ]
                         )
     return test_cases
@@ -102,7 +101,6 @@ def get_generation_mla_test_cases():
                                 10,
                                 6,
                                 False,
-                                "generation_mla_perf.txt",
                             ]
                         )
     return test_cases
@@ -120,6 +118,7 @@ def run_mla(
     warming_up,
     test_ite,
     is_context_phase,
+    *,
     perf_filename,
     device="cuda:0",
 ):
@@ -374,8 +373,8 @@ def run_mla(
     log_perf(
         item_list=[
             {
-                "mla_dtype": "float16",
-                "kv_cache_dtype": "float16",
+                "mla_dtype": "bfloat16",
+                "kv_cache_dtype": "bfloat16",
                 "num_heads": num_heads,
                 "batch_size": batch_size,
                 "isl": isl,

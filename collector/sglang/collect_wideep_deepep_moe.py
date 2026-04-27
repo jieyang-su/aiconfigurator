@@ -33,6 +33,35 @@ except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from helper import _get_moe_model_path, log_perf, power_law_deepep_decode, power_law_deepep_prefill
 from importlib.metadata import version as get_version
+from math import ceil as _ceil
+
+
+def _is_scale_ue8m0() -> bool:
+    """Check if deep_gemm uses ue8m0 scale format (Blackwell GPUs)."""
+    try:
+        from sglang.srt.layers.deep_gemm_wrapper import configurer as deep_gemm_wrapper
+
+        return getattr(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", False)
+    except ImportError:
+        return False
+
+
+def _make_scale_tensor(num_tokens: int, hidden_size: int, device) -> torch.Tensor:
+    """Create a scale tensor matching the format expected by run_moe_core.
+
+    On Blackwell (ue8m0), scales are packed as int32 with 4 scales per element.
+    On older GPUs, scales are float32 with one per 128-element block.
+    """
+    scale_dim = hidden_size // 128
+    if _is_scale_ue8m0():
+        return torch.ones(
+            num_tokens,
+            _ceil(scale_dim / 4),
+            device=device,
+            dtype=torch.int32,
+        )
+    return torch.ones(num_tokens, scale_dim, device=device, dtype=torch.float32)
+
 
 
 _MODEL_CONFIG_DIR = os.path.join(
@@ -257,11 +286,10 @@ def benchmark_moe_layer_prefill(
                 hidden_states_per_token_iter = torch.nn.functional.pad(hidden_states_per_token_iter, (0, pad_size))
 
             hidden_states_fp8_tensor_iter = hidden_states_per_token_iter.to(torch.float8_e4m3fn)
-            scale_tensor_iter = torch.ones(
+            scale_tensor_iter = _make_scale_tensor(
                 hidden_states_per_token_iter.shape[0],
-                hidden_states_per_token_iter.shape[1] // 128,
-                device=hidden_states_per_token_iter.device,
-                dtype=torch.float32,
+                hidden_states_per_token_iter.shape[1],
+                hidden_states_per_token_iter.device,
             )
 
             num_tokens_iter = hidden_states_per_token_iter.shape[0]
@@ -335,11 +363,10 @@ def benchmark_moe_layer_prefill(
             for _ in range(num_warmup):
                 for topk_idx_sample, topk_weights_sample, num_recv_sample in power_law_samples:
                     hidden_states_fp8_tensor_iter = hidden_states_per_token_iter.to(torch.float8_e4m3fn)
-                    scale_tensor_iter = torch.ones(
+                    scale_tensor_iter = _make_scale_tensor(
                         hidden_states_per_token_iter.shape[0],
-                        hidden_states_per_token_iter.shape[1] // 128,
-                        device=hidden_states_per_token_iter.device,
-                        dtype=torch.float32,
+                        hidden_states_per_token_iter.shape[1],
+                        hidden_states_per_token_iter.device,
                     )
                     dispatch_output = DeepEPNormalDispatchOutput(
                         hidden_states=hidden_states_fp8_tensor_iter,
@@ -358,11 +385,10 @@ def benchmark_moe_layer_prefill(
             for i in range(num_iterations):
                 for topk_idx_sample, topk_weights_sample, num_recv_sample in power_law_samples:
                     hidden_states_fp8_tensor_iter = hidden_states_per_token_iter.to(torch.float8_e4m3fn)
-                    scale_tensor_iter = torch.ones(
+                    scale_tensor_iter = _make_scale_tensor(
                         hidden_states_per_token_iter.shape[0],
-                        hidden_states_per_token_iter.shape[1] // 128,
-                        device=hidden_states_per_token_iter.device,
-                        dtype=torch.float32,
+                        hidden_states_per_token_iter.shape[1],
+                        hidden_states_per_token_iter.device,
                     )
                     dispatch_output = DeepEPNormalDispatchOutput(
                         hidden_states=hidden_states_fp8_tensor_iter,
@@ -893,8 +919,8 @@ def run_moe(
 # ============================================================================
 
 
-def get_wideep_moe_test_cases(total_experts=None):
-    """Returns list of [num_experts, perf_filename] for MOE collection.
+def get_wideep_moe_test_cases(total_experts=256):
+    """Returns list of [num_experts] for MOE collection.
 
     Each num_experts value simulates a different EP size based on model's total experts.
     Starts from EP=2 (half experts per GPU) to focus on wideep multi-GPU scenarios.
@@ -932,7 +958,7 @@ def get_wideep_moe_test_cases(total_experts=None):
     test_cases = []
     n = total_experts // 2  # Start from EP=2
     while n >= 1:
-        test_cases.append([n, "wideep_moe_perf.txt"])
+        test_cases.append([n])
         n //= 2
     return test_cases
 
@@ -1035,7 +1061,7 @@ run_moe_benchmark({num_experts}, {gpu_id}, {output_path!r})
         raise RuntimeError(f"MOE subprocess failed with exit code {proc.returncode}")
 
 
-def run_wideep_moe(num_experts, perf_filename, device="cuda:0"):
+def run_wideep_moe(num_experts, *, perf_filename, device="cuda:0"):
     """Run wideep DeepEP MOE benchmark.
 
     Compatible with collect.py framework - uses subprocess for GPU isolation.
@@ -1048,11 +1074,16 @@ def run_wideep_moe(num_experts, perf_filename, device="cuda:0"):
     print(f"MOE: num_experts={num_experts}, GPU={gpu_id}")
     print("=" * 60)
 
-    _run_moe_subprocess(num_experts, gpu_id, None)
+    # Resolve output_path from cwd so perf files land in the collector
+    # framework's result directory (consistent with collect_moe.py behavior).
+    output_path = os.getcwd()
+    _run_moe_subprocess(num_experts, gpu_id, output_path)
 
 
 if __name__ == "__main__":
     import argparse
+
+    from registry_types import PerfFile
 
     parser = argparse.ArgumentParser(description="SGLang Wideep DeepEP MOE Benchmark")
     parser.add_argument("--output-path", default=None, help="Output directory for perf files")
@@ -1063,7 +1094,7 @@ if __name__ == "__main__":
 
     # Run all MOE test cases
     for test_case in get_wideep_moe_test_cases():
-        run_wideep_moe(*test_case)
+        run_wideep_moe(*test_case, perf_filename=PerfFile.WIDEEP_MOE)
 
     print("\n" + "=" * 60)
     print("SCRIPT COMPLETED SUCCESSFULLY")
