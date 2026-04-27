@@ -340,7 +340,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_nodes = int(os.getenv("WORLD_SIZE", 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
-    num_sms = [16, 20, 24]
+    #num_sms = [16, 20, 24]
+    num_sms = [16]
     tokens = [
         16,
         32,
@@ -350,12 +351,22 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         512,
         1024,
         2048,
-        4096,
-        8192,
-        16384,
-        32768,
-        65536,
     ]
+    # tokens = [
+    #     16,
+    #     32,
+    #     64,
+    #     128,
+    #     256,
+    #     512,
+    #     1024,
+    #     2048,
+    #     4096,
+    #     8192,
+    #     16384,
+    #     32768,
+    #     65536,
+    # ]
     ll_tokens = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 256]
     if not args.test_ll_compatibility:
         for num_sm in num_sms:

@@ -2942,6 +2942,10 @@ class PerfDatabase:
             gemm_modes = self.supported_quant_mode.get("gemm", []) or []
             if common.GEMMQuantMode.fp8.name in gemm_modes and common.GEMMQuantMode.fp8_static.name not in gemm_modes:
                 gemm_modes.append(common.GEMMQuantMode.fp8_static.name)
+            # `fp8_block` is a behavioral mode that reuses `fp8` TRT-LLM MoE perf tables.
+            moe_modes = self.supported_quant_mode.get("moe", []) or []
+            if common.MoEQuantMode.fp8.name in moe_modes and common.MoEQuantMode.fp8_block.name not in moe_modes:
+                moe_modes.append(common.MoEQuantMode.fp8_block.name)
         elif self.backend == "vllm":
             self.supported_quant_mode = {
                 "gemm": _enum_key_names(getattr(self, "_gemm_data", None)),
@@ -5412,6 +5416,9 @@ class PerfDatabase:
                             f"backend='{self.backend}', version='{self.version}'. "
                             "Please use HYBRID or EMPIRICAL database mode, or provide the data file."
                         )
+                    table_quant_mode = (
+                        common.MoEQuantMode.fp8 if quant_mode == common.MoEQuantMode.fp8_block else quant_mode
+                    )
                     # aligned with trtllm, kernel source selection.
                     # Low-latency kernel only available for gated MoE (SwiGLU), not for Relu2
                     if (
@@ -5423,10 +5430,10 @@ class PerfDatabase:
                         try:
                             used_workload_distribution = (
                                 workload_distribution
-                                if workload_distribution in self._moe_low_latency_data[quant_mode]
+                                if workload_distribution in self._moe_low_latency_data[table_quant_mode]
                                 else "uniform"
                             )
-                            moe_dict = self._moe_low_latency_data[quant_mode][used_workload_distribution][topk][
+                            moe_dict = self._moe_low_latency_data[table_quant_mode][used_workload_distribution][topk][
                                 num_experts
                             ][hidden_size][inter_size][moe_tp_size][moe_ep_size]
                             logger.debug(
@@ -5437,17 +5444,19 @@ class PerfDatabase:
                         except:
                             used_workload_distribution = (
                                 workload_distribution
-                                if workload_distribution in self._moe_data[quant_mode]
+                                if workload_distribution in self._moe_data[table_quant_mode]
                                 else "uniform"
                             )
-                            moe_dict = self._moe_data[quant_mode][used_workload_distribution][topk][num_experts][
+                            moe_dict = self._moe_data[table_quant_mode][used_workload_distribution][topk][num_experts][
                                 hidden_size
                             ][inter_size][moe_tp_size][moe_ep_size]
                     else:
                         used_workload_distribution = (
-                            workload_distribution if workload_distribution in self._moe_data[quant_mode] else "uniform"
+                            workload_distribution
+                            if workload_distribution in self._moe_data[table_quant_mode]
+                            else "uniform"
                         )
-                        moe_dict = self._moe_data[quant_mode][used_workload_distribution][topk][num_experts][
+                        moe_dict = self._moe_data[table_quant_mode][used_workload_distribution][topk][num_experts][
                             hidden_size
                         ][inter_size][moe_tp_size][moe_ep_size]
                     token_points = sorted(moe_dict.keys())

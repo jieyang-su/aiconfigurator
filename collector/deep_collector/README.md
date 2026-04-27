@@ -20,7 +20,7 @@ docker run -it --network host --gpus all  -v aiconfigurator/collector/deep_colle
 
 Server:
 ```bash
-export MASTER_ADDR=10.6.131.20
+export MASTER_ADDR=10.110.183.24
 export WORLD_SIZE=2
 export MASTER_PORT=40303
 export RANK=0
@@ -28,7 +28,7 @@ export RANK=0
 
 Client:
 ```bash
-export MASTER_ADDR=10.6.131.20
+export MASTER_ADDR=10.110.183.24
 export WORLD_SIZE=2
 export MASTER_PORT=40303
 export RANK=1
@@ -75,10 +75,16 @@ On the first node:
 Note: Replace {num_node} with the total number of nodes (e.g., 2 or 4).
 ```bash
 python /new_workspace/test_internode.py |& tee deepep_node_{num_node}_mode_normal.log
+export CUDA_LAUNCH_BLOCKING=1
+export NCCL_DEBUG=INFO
+export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+python3 test_internode.py |& tee deepep_node_2_mode_normal.log
 ```
 On the other node(s):
 ```bash
 python /new_workspace/test_internode.py
+python3 test_internode.py
 ```
 
 # Test low-latency mode
@@ -87,10 +93,12 @@ On the first node:
 Note: Replace {num_node} with the total number of nodes (e.g., 2 or 4).
 ```bash
 python /new_workspace/test_internode.py  --test-ll-compatibility |& tee deepep_node_{num_node}_mode_ll.log
+python3 test_internode.py --test-ll-compatibility  |& tee deepep_node_2_mode_ll.log
 ```
 On the other node(s):
 ```bash
 python /new_workspace/test_internode.py  --test-ll-compatibility
+python3 test_internode.py --test-ll-compatibility 
 ```
 
 # Post-process log files
@@ -98,4 +106,6 @@ Save the processed deepep data under path path/to/aiconfigurator/src/aiconfigura
 Replace xxx with the GPU type (e.g., A100). Point --log-dir to that directory.
 ```bash
 python aiconfigurator/collector/deep_collector/extract_data.py --log-dir path/to/aiconfigurator/src/aiconfigurator/systems/data/xxx/sglang/0.5.0/
+
+python3 extract_data.py --log-dir ./
 ```

@@ -132,6 +132,20 @@ print(f"Agg supported: {agg}, Disagg supported: {disagg}")
 An example here, 
 ```bash
 aiconfigurator cli default --model-path Qwen/Qwen3-32B-FP8 --total-gpus 32 --system h200_sxm --isl 4000 --osl 500 --prefix 500 --ttft 300 --tpot 10
+export PYTHONPATH=$PWD/src
+
+python -m aiconfigurator.main cli default \
+  --systems-paths "$PWD/src/aiconfigurator/systems" \
+  --model-path deepseek-ai/DeepSeek-V3 \
+  --total-gpus 64 \
+  --system mtia_450 \
+  --isl 4000 \
+  --osl 500 \
+  --prefix 500 \
+  --ttft 300 \
+  --tpot 10 \
+  --database-mode EMPIRICAL \
+  --backend auto
 ```
 
 ```text

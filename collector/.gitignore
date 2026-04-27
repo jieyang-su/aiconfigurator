@@ -1,3 +1,4 @@
 moe_perf.txt
 *.log
 moe_*/
+collector/nccl-tests
