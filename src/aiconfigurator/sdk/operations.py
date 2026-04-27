@@ -1664,6 +1664,44 @@ class OverlapOp(Operation):
             result = op.query(database, **kwargs)
             latency_b += float(result)
             energy_b += getattr(result, "energy", 0.0)
+        # Handle MoE latency hijacking for either branch
+        mock_moe_policy = kwargs.get("mock_moe_policy")
+        if mock_moe_policy is not None and "moe_overlap" in self._name:
+            moe_ops_in_a = [op for op in self._group_a if type(op).__name__ in ("MoE", "TrtLLMWideEPMoE")]
+            if moe_ops_in_a:
+                total_sf = sum(op._scale_factor for op in moe_ops_in_a)
+                dp_size = getattr(moe_ops_in_a[0], "_attention_dp_size", 1)
+                moe_tp = getattr(moe_ops_in_a[0], "_moe_tp_size", 1)
+                moe_ep = getattr(moe_ops_in_a[0], "_moe_ep_size", 1)
+                tokens = kwargs.get("x", 1) * dp_size
+                bottleneck = 0.58 * tokens if tokens > 64 else 0.0
+                hijacked_latency = (float(1160) + bottleneck*total_sf) / 1000.0
+                if tokens > 64 and tokens <=96 and moe_tp == 1 and moe_ep == 4 and dp_size == 4 and mock_moe_policy == "normal":
+                    print(f"[DEBUG] [MoE-TP={moe_tp}, EP={moe_ep}, DP={dp_size}] MoE batch_size: {tokens}, native: {latency_a:.4f}, hijacked: {hijacked_latency:.4f}")
+                if mock_moe_policy == "normal":
+                    latency_a = hijacked_latency
+                elif mock_moe_policy == "pareto_best":
+                    latency_a = min(latency_a, hijacked_latency)
+                else:
+                    raise ValueError(f"Unknown mock_moe_policy: {mock_moe_policy}")
+
+            moe_ops_in_b = [op for op in self._group_b if type(op).__name__ in ("MoE", "TrtLLMWideEPMoE")]
+            if moe_ops_in_b:
+                total_sf = sum(op._scale_factor for op in moe_ops_in_b)
+                dp_size = getattr(moe_ops_in_b[0], "_attention_dp_size", 1)
+                moe_tp = getattr(moe_ops_in_b[0], "_moe_tp_size", 1)
+                moe_ep = getattr(moe_ops_in_b[0], "_moe_ep_size", 1)
+                tokens = kwargs.get("x", 1) * dp_size
+                bottleneck = 0.58 * tokens if tokens > 64 else 0.0
+                hijacked_latency = (float(1160) + bottleneck*total_sf) / 1000.0
+                if tokens > 64 and tokens <=96 and moe_tp == 1 and moe_ep == 4 and dp_size == 4 and mock_moe_policy == "normal":
+                    print(f"[DEBUG] [MoE-TP={moe_tp}, EP={moe_ep}, DP={dp_size}] MoE batch_size: {tokens}, native: {latency_a:.4f}, hijacked: {hijacked_latency:.4f}")
+                if mock_moe_policy == "normal":
+                    latency_b = hijacked_latency
+                elif mock_moe_policy == "pareto_best":
+                    latency_b = min(latency_b, hijacked_latency)
+                else:
+                    raise ValueError(f"Unknown mock_moe_policy: {mock_moe_policy}")
 
         return PerformanceResult(
             latency=max(latency_a, latency_b),

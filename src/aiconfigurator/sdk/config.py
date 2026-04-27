@@ -35,6 +35,7 @@ class ModelConfig:
     enable_wideep: bool = False
     enable_eplb: bool = False  # Expert Parallel Load Balancing
     wideep_num_slots: int = None  # EPLB num_slots, defaults to num_experts if None
+    mock_moe_policy: str = None  # "normal", "pareto_best",normal means only use mocked latency,pareto_best means use minimal latency among mocked and AIC
 
 
 @dataclass

@@ -1,0 +1,184 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# ============================================================================
+# DeepSeek PD disaggregation with per-phase WideEP/EPLB on TensorRT-LLM.
+#
+# Three experiments covering the WideEP x EPLB per-phase matrix:
+#
+#   Exp 1 – prefill WideEP+EPLB ON  / decode WideEP OFF
+#   Exp 2 – prefill WideEP OFF      / decode WideEP+EPLB ON
+#   Exp 3 – both WideEP ON, EPLB differs (prefill ON / decode OFF)
+#
+# Per-phase WideEP/EPLB settings are specified inside each worker_config.
+# If not specified, they fall back to the global enable_wideep / enable_eplb.
+# ============================================================================
+
+exps:
+  - disagg_prefill_Rubin_decode_Rubin
+  - disagg_prefill_Rubin_decode_Rubin_LPX
+  - disagg_mixed_pareto_best
+
+# ── Exp 1: Prefill standard MoE / Decode WideEP+EPLB ON ─────────────────────
+disagg_prefill_Rubin_decode_Rubin:
+  mode: "patch"
+  serving_mode: "disagg"
+  model_path: "deepseek-ai/DeepSeek-V3"
+  total_gpus: 96
+  system_name: "vr200"
+  decode_system_name: "vr200"
+  backend_name: "trtllm"
+  database_mode: "SILICON"
+  isl: 8192
+  # prefix: 16427
+  osl: 1024
+  ttft: 5000.0
+  tpot: 80
+  config:
+    prefill_worker_config:
+      enable_wideep: false
+      enable_eplb: false
+      gemm_quant_mode: "nvfp4"
+      moe_quant_mode: "nvfp4"
+      kvcache_quant_mode: "fp8"
+      fmha_quant_mode: "bfloat16"
+      comm_quant_mode: "half"
+      num_gpu_per_worker: [4]
+      tp_list: [1]
+      pp_list: [1]
+      dp_list: [4]
+      moe_tp_list: [1]
+      moe_ep_list: [4]
+
+    decode_worker_config:
+      enable_wideep: true
+      enable_eplb: true
+      gemm_quant_mode: "nvfp4"
+      moe_quant_mode: "nvfp4"
+      kvcache_quant_mode: "fp8"
+      fmha_quant_mode: "bfloat16"
+      comm_quant_mode: "half"
+      num_gpu_per_worker: [4, 8, 16, 32, 64]
+      tp_list: [1, 2, 4, 8]
+      pp_list: [1]
+      dp_list: [4, 8, 16, 32, 64]
+      moe_tp_list: [1]
+      moe_ep_list: [4, 8, 16, 32, 64]
+
+    replica_config:
+      max_gpu_per_replica: 512
+
+    advanced_tuning_config:
+      prefill_latency_correction_scale: 1.1
+      decode_latency_correction_scale: 1.08
+      prefill_max_batch_size: 1
+      decode_max_batch_size: 512
+
+disagg_prefill_Rubin_decode_Rubin_LPX:
+  mode: "patch"
+  serving_mode: "disagg"
+  model_path: "deepseek-ai/DeepSeek-V3"
+  total_gpus: 96
+  system_name: "vr200"
+  decode_system_name: "vr200"
+  backend_name: "trtllm"
+  database_mode: "SILICON"
+  isl: 8192
+  # prefix: 16427
+  osl: 1024
+  ttft: 5000.0
+  tpot: 80
+  config:
+    prefill_worker_config:
+      enable_wideep: false
+      enable_eplb: false
+      gemm_quant_mode: "nvfp4"
+      moe_quant_mode: "nvfp4"
+      kvcache_quant_mode: "fp8"
+      fmha_quant_mode: "bfloat16"
+      comm_quant_mode: "half"
+      num_gpu_per_worker: [4]
+      tp_list: [1]
+      pp_list: [1]
+      dp_list: [4]
+      moe_tp_list: [1]
+      moe_ep_list: [4]
+
+    decode_worker_config:
+      mock_moe_policy: "normal"
+      enable_wideep: true
+      enable_eplb: true
+      gemm_quant_mode: "nvfp4"
+      moe_quant_mode: "nvfp4"
+      kvcache_quant_mode: "fp8"
+      fmha_quant_mode: "bfloat16"
+      comm_quant_mode: "half"
+      num_gpu_per_worker: [4, 8, 16, 32, 64]
+      tp_list: [1, 2, 4, 8]
+      pp_list: [1]
+      dp_list: [4, 8, 16, 32, 64]
+      moe_tp_list: [1]
+      moe_ep_list: [4, 8, 16, 32, 64]
+
+    replica_config:
+      max_gpu_per_replica: 512
+
+    advanced_tuning_config:
+      prefill_latency_correction_scale: 1.1
+      decode_latency_correction_scale: 1.08
+      prefill_max_batch_size: 1
+      decode_max_batch_size: 512
+
+disagg_mixed_pareto_best:
+  mode: "patch"
+  serving_mode: "disagg"
+  model_path: "deepseek-ai/DeepSeek-V3"
+  total_gpus: 96
+  system_name: "vr200"
+  decode_system_name: "vr200"
+  backend_name: "trtllm"
+  database_mode: "SILICON"
+  isl: 8192
+  # prefix: 16427
+  osl: 1024
+  ttft: 5000.0
+  tpot: 80
+  config:
+    prefill_worker_config:
+      enable_wideep: false
+      enable_eplb: false
+      gemm_quant_mode: "nvfp4"
+      moe_quant_mode: "nvfp4"
+      kvcache_quant_mode: "fp8"
+      fmha_quant_mode: "bfloat16"
+      comm_quant_mode: "half"
+      num_gpu_per_worker: [4]
+      tp_list: [1]
+      pp_list: [1]
+      dp_list: [4]
+      moe_tp_list: [1]
+      moe_ep_list: [4]
+
+    decode_worker_config:
+      mock_moe_policy: "pareto_best"
+      enable_wideep: true
+      enable_eplb: true
+      gemm_quant_mode: "nvfp4"
+      moe_quant_mode: "nvfp4"
+      kvcache_quant_mode: "fp8"
+      fmha_quant_mode: "bfloat16"
+      comm_quant_mode: "half"
+      num_gpu_per_worker: [4, 8, 16, 32, 64]
+      tp_list: [1, 2, 4, 8]
+      pp_list: [1]
+      dp_list: [4, 8, 16, 32, 64]
+      moe_tp_list: [1]
+      moe_ep_list: [4, 8, 16, 32, 64]
+
+    replica_config:
+      max_gpu_per_replica: 512
+
+    advanced_tuning_config:
+      prefill_latency_correction_scale: 1.1
+      decode_latency_correction_scale: 1.08
+      prefill_max_batch_size: 1
+      decode_max_batch_size: 512

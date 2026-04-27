@@ -1148,6 +1148,7 @@ class TaskRunner:
             moe_backend=task_config.moe_backend,  # sglang wideep only
             attention_backend=task_config.worker_config.attention_backend or task_config.attention_backend,
             enable_wideep=task_config.enable_wideep,
+            mock_moe_policy=task_config.worker_config.get("mock_moe_policy"),
         )
         try:
             from aiconfigurator.sdk import pareto_analysis as pa
@@ -1258,6 +1259,7 @@ class TaskRunner:
             attention_backend=prefill_attention_backend,
             enable_wideep=prefill_enable_wideep,
             enable_eplb=prefill_enable_eplb,
+            mock_moe_policy=_pwc.get("mock_moe_policy"),
         )
 
         try:
@@ -1320,6 +1322,7 @@ class TaskRunner:
             attention_backend=decode_attention_backend,
             enable_wideep=decode_enable_wideep,
             enable_eplb=decode_enable_eplb,
+            mock_moe_policy=_dwc.get("mock_moe_policy"),
         )
 
         try:

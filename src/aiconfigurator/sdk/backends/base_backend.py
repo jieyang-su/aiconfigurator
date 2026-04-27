@@ -61,6 +61,7 @@ class BaseBackend(ABC):
                 prefix=prefix,
                 model_name=getattr(model, "model_name", ""),
                 seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
+                mock_moe_policy=getattr(model.config, "mock_moe_policy", None),
             )
             context_latency_dict[op._name] += float(result)
             context_energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
@@ -96,6 +97,7 @@ class BaseBackend(ABC):
                     s=isl + i + 1,
                     model_name=getattr(model, "model_name", ""),
                     gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
+                    mock_moe_policy=getattr(model.config, "mock_moe_policy", None),
                 )
                 latency_dict[op._name] += float(result)
                 energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
