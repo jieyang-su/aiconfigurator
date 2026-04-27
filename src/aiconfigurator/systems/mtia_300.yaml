@@ -10,7 +10,7 @@ gpu:
   mem_bw_empirical_scaling_factor: 0.8
   mem_empirical_constant_latency: 0.000003 # 3us
   mem_capacity: 216000000000 # 216GB
-  float16_tc_flops: 600000000000000 # 0.6PFLOPS BF16
+  bfloat16_tc_flops: 600000000000000 # 0.6PFLOPS BF16
   int8_tc_flops: 1200000000000000 # 1.2PFLOPS FP8/MX8 proxy
   fp8_tc_flops: 1200000000000000 # 1.2PFLOPS FP8/MX8
   power: 800 # Watt

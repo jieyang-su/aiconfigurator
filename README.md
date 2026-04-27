@@ -142,10 +142,9 @@ python -m aiconfigurator.main cli default \
   --isl 4000 \
   --osl 500 \
   --prefix 500 \
-  --ttft 300 \
-  --tpot 10 \
-  --database-mode EMPIRICAL \
-  --backend auto
+  --ttft 100 \
+  --tpot 20 
+  --database-mode HYBRID
 ```
 
 ```text

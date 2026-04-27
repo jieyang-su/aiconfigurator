@@ -3348,7 +3348,8 @@ class PerfDatabase:
         """
         Find the nearest 1d point
         """
-        assert values is not None and len(values) >= 1, "values is None or empty"
+        if values is None or len(values) < 1:
+            raise PerfDataNotAvailableError(f"No interpolation points available for x={x}; values is None or empty")
         if len(values) == 1:
             if inner_only and x != values[0]:
                 raise ValueError(f"x is not equal to the only value in the list. {x=}, {values=}")

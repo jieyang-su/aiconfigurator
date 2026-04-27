@@ -6,6 +6,7 @@ from typing import Optional
 
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.perf_database import PerfDatabase
+from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
 from aiconfigurator.sdk.performance_result import PerformanceResult
 
 logger = logging.getLogger(__name__)
@@ -1502,6 +1503,105 @@ class Mamba2(Operation):
         )
 
     def get_weights(self, **kwargs):  # Mamba2 weights
+        return self._weights * self._scale_factor
+
+
+class FallbackOp(Operation):
+    """Try a primary op first, then sum fallback ops when module data is unavailable."""
+
+    def __init__(self, name: str, primary: Operation, fallback: list[Operation]) -> None:
+        super().__init__(name, 1.0)
+        self._primary = primary
+        self._fallback = fallback
+        self._skip_primary = False
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        if not self._skip_primary:
+            perf_logger = logging.getLogger("aiconfigurator.sdk.perf_database")
+            original_level = perf_logger.level
+            original_database_mode = getattr(database, "_default_database_mode", None)
+            try:
+                perf_logger.setLevel(max(original_level, logging.ERROR))
+                if original_database_mode is not None:
+                    database._default_database_mode = common.DatabaseMode.SILICON
+                return self._primary.query(database, **kwargs)
+            except (PerfDataNotAvailableError, KeyError, AssertionError) as exc:
+                if isinstance(exc, PerfDataNotAvailableError):
+                    self._skip_primary = True
+            finally:
+                perf_logger.setLevel(original_level)
+                if original_database_mode is not None:
+                    database._default_database_mode = original_database_mode
+
+        total_latency = 0.0
+        total_energy = 0.0
+        for op in self._fallback:
+            result = op.query(database, **kwargs)
+            total_latency += float(result)
+            total_energy += result.energy
+        return PerformanceResult(total_latency, energy=total_energy)
+
+    def get_weights(self, **kwargs):
+        primary_weights = self._primary.get_weights(**kwargs)
+        if primary_weights:
+            return primary_weights
+        return sum(op.get_weights(**kwargs) for op in self._fallback)
+
+
+class MLAModule(Operation):
+    """Module-level MLA op that delegates to perf-database fused MLA queries."""
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        is_context: bool,
+        num_heads: int,
+        kvcache_quant_mode: common.KVCacheQuantMode,
+        fmha_quant_mode: common.FMHAQuantMode,
+        gemm_quant_mode: common.GEMMQuantMode,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._is_context = is_context
+        self._num_heads = num_heads
+        self._kvcache_quant_mode = kvcache_quant_mode
+        self._fmha_quant_mode = fmha_quant_mode
+        self._gemm_quant_mode = gemm_quant_mode
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        batch_size = kwargs.get("batch_size")
+        s = kwargs.get("s")
+
+        if self._is_context:
+            result = database.query_context_mla_module(
+                b=batch_size,
+                s=s,
+                prefix=kwargs.get("prefix", 0),
+                num_heads=self._num_heads,
+                kvcache_quant_mode=self._kvcache_quant_mode,
+                fmha_quant_mode=self._fmha_quant_mode,
+                gemm_quant_mode=self._gemm_quant_mode,
+            )
+        else:
+            beam_width = kwargs.get("beam_width")
+            if beam_width != 1:
+                raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
+            result = database.query_generation_mla_module(
+                b=batch_size,
+                s=s,
+                num_heads=self._num_heads,
+                kv_cache_dtype=self._kvcache_quant_mode,
+                fmha_quant_mode=self._fmha_quant_mode,
+                gemm_quant_mode=self._gemm_quant_mode,
+            )
+
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+        )
+
+    def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
 
 

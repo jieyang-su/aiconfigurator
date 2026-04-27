@@ -6,6 +6,7 @@ from collections import defaultdict
 import pytest
 
 from aiconfigurator.sdk import common
+from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
 
 pytestmark = pytest.mark.unit
 
@@ -49,7 +50,7 @@ class TestInterpolationMethods:
     def test_nearest_1d_point_helper_errors(self, comprehensive_perf_db):
         """Test error cases for _nearest_1d_point_helper."""
         # Empty list
-        with pytest.raises(AssertionError):
+        with pytest.raises(PerfDataNotAvailableError, match="No interpolation points available"):
             comprehensive_perf_db._nearest_1d_point_helper(10, [], inner_only=True)
 
         # Single value list with mismatched x
