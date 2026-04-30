@@ -1717,6 +1717,324 @@ class GenerationDSAModule(Operation):
         return self._weights * self._scale_factor
 
 
+class DeepSeekV4MHCModule(Operation):
+    """DeepSeek-V4 manifold-constrained hyper-connection pre/post module."""
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        op: str,
+        hidden_size: int,
+        hc_mult: int,
+        sinkhorn_iters: int,
+        quant_mode: common.GEMMQuantMode,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        if op not in {"pre", "post", "both"}:
+            raise ValueError(f"Unsupported DeepSeek-V4 mHC op: {op}")
+        self._op = op
+        self._hidden_size = hidden_size
+        self._hc_mult = hc_mult
+        self._sinkhorn_iters = sinkhorn_iters
+        self._quant_mode = quant_mode
+        mix_hc = (2 + hc_mult) * hc_mult
+        hc_dim = hc_mult * hidden_size
+        # Two parameter sets per decoder block: attention mHC and FFN mHC.
+        self._weights = 2 * (mix_hc * hc_dim + mix_hc + 3) * quant_mode.value.memory
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        result = database.query_deepseek_v4_mhc_module(
+            num_tokens=kwargs.get("x"),
+            hidden_size=self._hidden_size,
+            hc_mult=self._hc_mult,
+            sinkhorn_iters=self._sinkhorn_iters,
+            op=self._op,
+            quant_mode=self._quant_mode,
+        )
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+class _BaseDeepSeekV4AttentionModule(Operation):
+    """Common DeepSeek-V4 compressed attention module metadata."""
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        num_heads: int,
+        hidden_size: int,
+        q_lora_rank: int,
+        o_lora_rank: int,
+        head_dim: int,
+        rope_head_dim: int,
+        index_n_heads: int,
+        index_head_dim: int,
+        index_topk: int,
+        window_size: int,
+        compress_ratio: int,
+        o_groups: int,
+        kvcache_quant_mode: common.KVCacheQuantMode,
+        fmha_quant_mode: common.FMHAQuantMode,
+        gemm_quant_mode: common.GEMMQuantMode,
+        architecture: str = "DeepseekV4ForCausalLM",
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._num_heads = num_heads
+        self._hidden_size = hidden_size
+        self._q_lora_rank = q_lora_rank
+        self._o_lora_rank = o_lora_rank
+        self._head_dim = head_dim
+        self._rope_head_dim = rope_head_dim
+        self._index_n_heads = index_n_heads
+        self._index_head_dim = index_head_dim
+        self._index_topk = index_topk
+        self._window_size = window_size
+        self._compress_ratio = compress_ratio
+        self._o_groups = o_groups
+        self._kvcache_quant_mode = kvcache_quant_mode
+        self._fmha_quant_mode = fmha_quant_mode
+        self._gemm_quant_mode = gemm_quant_mode
+        self._architecture = architecture
+        self._weights = self._estimate_weights()
+
+    def _estimate_weights(self) -> float:
+        gemm_weight_elems = (
+            self._hidden_size * self._q_lora_rank
+            + self._q_lora_rank * self._num_heads * self._head_dim
+            + self._hidden_size * self._head_dim
+            + self._o_groups * self._o_lora_rank * self._hidden_size
+        )
+        bfloat16_weight_elems = self._num_heads * self._head_dim * self._o_lora_rank
+        float32_weight_elems = self._num_heads
+        if self._compress_ratio:
+            compressor_mult = 2 if self._compress_ratio == 4 else 1
+            gemm_weight_elems += 2 * self._hidden_size * compressor_mult * self._head_dim
+            float32_weight_elems += self._compress_ratio * compressor_mult * self._head_dim
+        if self._compress_ratio == 4:
+            gemm_weight_elems += self._q_lora_rank * self._index_n_heads * self._index_head_dim
+            gemm_weight_elems += 2 * self._hidden_size * 2 * self._index_head_dim
+            bfloat16_weight_elems += self._hidden_size * self._index_n_heads
+            float32_weight_elems += self._compress_ratio * 2 * self._index_head_dim
+        return (
+            gemm_weight_elems * self._gemm_quant_mode.value.memory
+            + bfloat16_weight_elems * common.GEMMQuantMode.bfloat16.value.memory
+            + float32_weight_elems * 4
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
+    """Context-phase DeepSeek-V4 SWA/CSA/HCA compressed attention module."""
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        result = database.query_context_deepseek_v4_attention_module(
+            b=kwargs.get("batch_size"),
+            s=kwargs.get("s"),
+            prefix=kwargs.get("prefix", 0),
+            num_heads=self._num_heads,
+            hidden_size=self._hidden_size,
+            q_lora_rank=self._q_lora_rank,
+            o_lora_rank=self._o_lora_rank,
+            head_dim=self._head_dim,
+            rope_head_dim=self._rope_head_dim,
+            index_n_heads=self._index_n_heads,
+            index_head_dim=self._index_head_dim,
+            index_topk=self._index_topk,
+            window_size=self._window_size,
+            compress_ratio=self._compress_ratio,
+            o_groups=self._o_groups,
+            kvcache_quant_mode=self._kvcache_quant_mode,
+            fmha_quant_mode=self._fmha_quant_mode,
+            gemm_quant_mode=self._gemm_quant_mode,
+            architecture=self._architecture,
+        )
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+
+
+class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
+    """Decode-phase DeepSeek-V4 SWA/CSA/HCA compressed attention module."""
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        beam_width = kwargs.get("beam_width")
+        if beam_width != 1:
+            raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
+        result = database.query_generation_deepseek_v4_attention_module(
+            b=kwargs.get("batch_size"),
+            s=kwargs.get("s"),
+            num_heads=self._num_heads,
+            hidden_size=self._hidden_size,
+            q_lora_rank=self._q_lora_rank,
+            o_lora_rank=self._o_lora_rank,
+            head_dim=self._head_dim,
+            rope_head_dim=self._rope_head_dim,
+            index_n_heads=self._index_n_heads,
+            index_head_dim=self._index_head_dim,
+            index_topk=self._index_topk,
+            window_size=self._window_size,
+            compress_ratio=self._compress_ratio,
+            o_groups=self._o_groups,
+            kvcache_quant_mode=self._kvcache_quant_mode,
+            fmha_quant_mode=self._fmha_quant_mode,
+            gemm_quant_mode=self._gemm_quant_mode,
+            architecture=self._architecture,
+        )
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+
+
+class MLAModule(Operation):
+    """
+    Module-level MLA operation for both context and generation phases.
+
+    Models the complete MLA attention block as a single profiled operation.
+    For context: replaces q_b_proj + kv_b_proj + ContextMLA + proj.
+    For generation: replaces MLABmm(pre) + GenerationMLA + MLABmm(post).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        is_context: bool,
+        num_heads: int,
+        kvcache_quant_mode: common.KVCacheQuantMode,
+        fmha_quant_mode: common.FMHAQuantMode,
+        gemm_quant_mode: common.GEMMQuantMode,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._is_context = is_context
+        self._num_heads = num_heads
+        self._kvcache_quant_mode = kvcache_quant_mode
+        self._fmha_quant_mode = fmha_quant_mode
+        self._gemm_quant_mode = gemm_quant_mode
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """Query MLA module latency with energy data."""
+        batch_size = kwargs.get("batch_size")
+        s = kwargs.get("s")
+
+        if self._is_context:
+            prefix = kwargs.get("prefix", 0)
+            result = database.query_context_mla_module(
+                b=batch_size,
+                s=s,
+                prefix=prefix,
+                num_heads=self._num_heads,
+                kvcache_quant_mode=self._kvcache_quant_mode,
+                fmha_quant_mode=self._fmha_quant_mode,
+                gemm_quant_mode=self._gemm_quant_mode,
+            )
+        else:
+            beam_width = kwargs.get("beam_width")
+            if beam_width != 1:
+                raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
+            result = database.query_generation_mla_module(
+                b=batch_size,
+                s=s,
+                num_heads=self._num_heads,
+                kv_cache_dtype=self._kvcache_quant_mode,
+                fmha_quant_mode=self._fmha_quant_mode,
+                gemm_quant_mode=self._gemm_quant_mode,
+            )
+
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+class FallbackOp(Operation):
+    """
+    Try a primary operation first; if it raises PerfDataNotAvailableError,
+    fall back to a sequence of fallback operations (summed).
+
+    This supports transitional periods where some systems have module-level
+    profiling data (single op) while others still have granular per-kernel data
+    (multiple ops). The fallback is symmetric: either group can be primary.
+
+    The primary is always queried in SILICON mode so that HYBRID does not
+    silently swallow a miss with an empirical estimate — the fallback ops
+    (which have real data) should be preferred over an empirical guess.
+
+    Once the primary fails on the first call, it is skipped on all subsequent
+    calls to avoid redundant work.
+
+    Latency = primary.query()  OR  sum(fallback[i].query())
+    Energy  = same source as whichever succeeds
+    Weights = sum of whichever group is used (primary or fallback)
+    """
+
+    def __init__(self, name: str, primary: Operation, fallback: list[Operation]) -> None:
+        """
+        Args:
+            name: Operation name for latency breakdown reporting.
+            primary: Single operation to try first.
+            fallback: List of operations to sum if primary fails.
+        """
+        super().__init__(name, 1.0)  # scale_factor handled by inner ops
+        self._primary = primary
+        self._fallback = fallback
+        self._primary_unavailable = False
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        import logging as _logging
+
+        from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
+
+        if not self._primary_unavailable:
+            # Force SILICON mode on the primary so that HYBRID doesn't silently
+            # return an empirical estimate when module data is missing.
+            prev_mode = database._default_database_mode
+            database._default_database_mode = common.DatabaseMode.SILICON
+
+            # Suppress ERROR-level logs from perf_database during the primary
+            # attempt, since a failure here is expected and handled by fallback.
+            perf_db_logger = _logging.getLogger("aiconfigurator.sdk.perf_database")
+            prev_log_level = perf_db_logger.level
+            perf_db_logger.setLevel(_logging.CRITICAL)
+            try:
+                return self._primary.query(database, **kwargs)
+            except (PerfDataNotAvailableError, KeyError, AssertionError) as e:
+                if isinstance(e, PerfDataNotAvailableError):
+                    self._primary_unavailable = True
+                logger.debug(
+                    "FallbackOp '%s': primary op '%s' failed (%s: %s), using fallback ops",
+                    self._name,
+                    self._primary._name,
+                    type(e).__name__,
+                    e,
+                )
+            finally:
+                database._default_database_mode = prev_mode
+                perf_db_logger.setLevel(prev_log_level)
+
+        total_latency = 0.0
+        total_energy = 0.0
+        for op in self._fallback:
+            result = op.query(database, **kwargs)
+            total_latency += float(result)
+            total_energy += getattr(result, "energy", 0.0)
+        return PerformanceResult(total_latency, energy=total_energy)
+
+    def get_weights(self, **kwargs):
+        # Use primary weights if available, otherwise sum fallback weights.
+        # In practice both should be equivalent since they model the same block.
+        if not self._primary_unavailable:
+            primary_w = self._primary.get_weights(**kwargs)
+            if primary_w > 0:
+                return primary_w
+        return sum(op.get_weights(**kwargs) for op in self._fallback)
+
+
 class OverlapOp(Operation):
     """
     Two groups of operations that execute in parallel (overlap).
