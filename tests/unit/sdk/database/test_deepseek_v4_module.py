@@ -13,8 +13,8 @@ from aiconfigurator.sdk.models import get_model
 from aiconfigurator.sdk.perf_database import (
     LoadedOpData,
     load_context_deepseek_v4_attention_module_data,
-    load_deepseek_v4_mhc_module_data,
     load_generation_deepseek_v4_attention_module_data,
+    load_mhc_module_data,
 )
 
 pytestmark = pytest.mark.unit
@@ -62,7 +62,7 @@ def _context_deepseek_v4_data(compress_ratio: int, attn_dict: dict) -> dict:
 
 
 def test_deepseek_v4_module_loaders_are_placeholders(tmp_path):
-    assert load_deepseek_v4_mhc_module_data(str(tmp_path / "deepseek_v4_mhc_module_perf.txt")) is None
+    assert load_mhc_module_data(str(tmp_path / "mhc_module_perf.txt")) is None
     assert load_context_deepseek_v4_attention_module_data(str(tmp_path / "deepseek_v4_context_module_perf.txt")) is None
     assert (
         load_generation_deepseek_v4_attention_module_data(str(tmp_path / "deepseek_v4_generation_module_perf.txt"))
@@ -73,7 +73,7 @@ def test_deepseek_v4_module_loaders_are_placeholders(tmp_path):
 class TestDeepSeekV4MHCModule:
     def test_mhc_sol_and_hybrid_return_positive(self, comprehensive_perf_db):
         for mode in (common.DatabaseMode.SOL, common.DatabaseMode.HYBRID):
-            result = comprehensive_perf_db.query_deepseek_v4_mhc_module(
+            result = comprehensive_perf_db.query_mhc_module(
                 num_tokens=512,
                 hidden_size=7168,
                 hc_mult=4,
@@ -85,7 +85,7 @@ class TestDeepSeekV4MHCModule:
             assert float(result) > 0
 
     def test_mhc_sol_full_shape(self, comprehensive_perf_db):
-        result = comprehensive_perf_db.query_deepseek_v4_mhc_module(
+        result = comprehensive_perf_db.query_mhc_module(
             num_tokens=512,
             hidden_size=7168,
             hc_mult=4,
@@ -119,7 +119,7 @@ class TestDeepSeekV4MHCModule:
         )
         assert fp8_op.get_weights() == pytest.approx(bf16_op.get_weights() / 2)
 
-        bf16_sol = comprehensive_perf_db.query_deepseek_v4_mhc_module(
+        bf16_sol = comprehensive_perf_db.query_mhc_module(
             num_tokens=512,
             hidden_size=7168,
             hc_mult=4,
@@ -128,7 +128,7 @@ class TestDeepSeekV4MHCModule:
             quant_mode=common.GEMMQuantMode.bfloat16,
             database_mode=common.DatabaseMode.SOL_FULL,
         )
-        fp8_sol = comprehensive_perf_db.query_deepseek_v4_mhc_module(
+        fp8_sol = comprehensive_perf_db.query_mhc_module(
             num_tokens=512,
             hidden_size=7168,
             hc_mult=4,
@@ -188,15 +188,17 @@ class TestDeepSeekV4AttentionModule:
 
     def test_csa_context_uses_raw_piecewise_around_compressed_topk_boundary(self, mutable_comprehensive_perf_db):
         db = mutable_comprehensive_perf_db
+        # Data keyed by tp_size (=4 for num_heads=16, recovered as 64 // num_heads).
+        # See _dsv4_flash_tp_from_num_heads in perf_database.py.
         raw_attn_dict = {
-            16: {
+            4: {
                 4096: {2: _deepseek_v4_value(20.0)},
                 8192: {2: _deepseek_v4_value(80.0)},
                 12288: {2: _deepseek_v4_value(100.0)},
             }
         }
         extrapolated_attn_dict = {
-            16: {
+            4: {
                 4096: {2: _deepseek_v4_value(20.0)},
                 4097: {2: _deepseek_v4_value(21.0)},
                 8192: {2: _deepseek_v4_value(80.0)},
