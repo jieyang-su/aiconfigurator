@@ -739,7 +739,19 @@ def get_common_gdn_test_cases() -> list[GdnCommonTestCase]:
 # can resolve them via getattr on each per-backend module.
 
 _DSV4_FLASH_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+_DSV4_FLASH_SUPPORTED_MODELS = (
+    _DSV4_FLASH_DEFAULT_MODEL,
+    "sgl-project/DeepSeek-V4-Flash-FP8",
+)
 DSV4_FLASH_ATTN_KINDS = ("csa", "hca")
+
+
+def _dsv4_flash_model_path() -> str:
+    """Return the active V4-Flash model id for generated test cases."""
+    filt = _get_model_path_filter()
+    if filt in _DSV4_FLASH_SUPPORTED_MODELS:
+        return filt
+    return _DSV4_FLASH_DEFAULT_MODEL
 
 
 def _dsv4_flash_active() -> bool:
@@ -750,7 +762,7 @@ def _dsv4_flash_active() -> bool:
     cases so the collector skips it.
     """
     filt = _get_model_path_filter()
-    return filt is None or filt == _DSV4_FLASH_DEFAULT_MODEL
+    return filt is None or filt in _DSV4_FLASH_SUPPORTED_MODELS
 
 
 # --- Module-level (full self_attn) sweep ---
@@ -858,6 +870,7 @@ def _build_dsv4_flash_module_test_cases(mode: str, attn_kinds=DSV4_FLASH_ATTN_KI
     Each spawned subprocess builds ONE ``ModelRunner`` for ``(bs, max_sl)``
     and sweeps every valid sl for that bs internally.
     """
+    model_path = _dsv4_flash_model_path()
     pairs = _dsv4_flash_module_filter_pairs(mode, _DSV4_FLASH_MODULE_BATCH_SIZES, _DSV4_FLASH_MODULE_SEQ_LENGTHS)
     bs_set = sorted({bs for bs, _ in pairs})
 
@@ -874,7 +887,7 @@ def _build_dsv4_flash_module_test_cases(mode: str, attn_kinds=DSV4_FLASH_ATTN_KI
                             kv_dtype,
                             compute_dtype,
                             gemm_type,
-                            _DSV4_FLASH_DEFAULT_MODEL,
+                            model_path,
                             attn_kind,
                             None,
                         ]
@@ -994,6 +1007,7 @@ def _build_dsv4_flash_sparse_test_cases(
     tp_list_attn = list(tp_list_attn) if tp_list_attn is not None else list(_DSV4_FLASH_SPARSE_TP_LIST_ATTN)
     tp_list_indexer = list(tp_list_indexer) if tp_list_indexer is not None else list(_DSV4_FLASH_SPARSE_TP_LIST_INDEXER)
 
+    model_path = _dsv4_flash_model_path()
     cases = []
     for kernel in kernels:
         tp_list = tp_list_attn if kernel == "hca_attn" else tp_list_indexer
@@ -1017,7 +1031,7 @@ def _build_dsv4_flash_sparse_test_cases(
                                 past_kv,
                                 tp_size,
                                 kernel,
-                                _DSV4_FLASH_DEFAULT_MODEL,
+                                model_path,
                             ]
                         )
     return cases
@@ -1027,7 +1041,7 @@ def _dsv4_flash_sparse_smoke_or_full(kernel: str):
     if not _dsv4_flash_active():
         return []
     if "--smoke" in sys.argv:
-        return [[1, 1024, 8192, 1, kernel, _DSV4_FLASH_DEFAULT_MODEL]]
+        return [[1, 1024, 8192, 1, kernel, _dsv4_flash_model_path()]]
     return _build_dsv4_flash_sparse_test_cases(kernels=(kernel,))
 
 

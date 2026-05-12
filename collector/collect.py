@@ -73,6 +73,21 @@ RESUME_SCHEMA_VERSION = "collector-resume-v1"
 STALL_THRESHOLD = 30  # iterations (x 0.5 s sleep = 15 s) before stall bailout
 
 
+def _resolve_perf_filename(perf_filename: str) -> str:
+    """Resolve bare perf filenames into the active collector run directory."""
+    if os.path.isabs(perf_filename) or os.path.dirname(perf_filename):
+        return perf_filename
+
+    log_dir = os.environ.get("COLLECTOR_LOG_DIR", "").strip()
+    if not log_dir:
+        return perf_filename
+
+    collector_dir = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.isabs(log_dir):
+        log_dir = os.path.join(collector_dir, log_dir)
+    return os.path.join(log_dir, perf_filename)
+
+
 def _normalize_model_token(value: str) -> str:
     """Normalize a model name or path component for loose matching."""
     return re.sub(r"[^a-z0-9]+", "", value.lower())
@@ -845,7 +860,10 @@ def collect_ops(
 
             get_func = getattr(get_module, collection["get_func"])
             run_func = getattr(run_module, collection["run_func"])
-            run_func = functools.partial(run_func, perf_filename=collection["perf_filename"])
+            run_func = functools.partial(
+                run_func,
+                perf_filename=_resolve_perf_filename(collection["perf_filename"]),
+            )
 
             def get_func_with_limit(get_func=get_func):
                 cases = get_func()

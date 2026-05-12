@@ -388,6 +388,22 @@ def test_dsv4_flash_test_cases_active_under_v4_filter(monkeypatch):
     assert {c[7] for c in cases} == {"csa"}
 
 
+def test_dsv4_flash_test_cases_active_under_fp8_v4_filter(monkeypatch):
+    monkeypatch.setenv("COLLECTOR_MODEL_PATH", "sgl-project/DeepSeek-V4-Flash-FP8")
+    from collector.common_test_cases import (
+        get_dsv4_flash_csa_context_test_cases,
+        get_dsv4_flash_paged_mqa_logits_test_cases,
+    )
+
+    module_cases = get_dsv4_flash_csa_context_test_cases()
+    sparse_cases = get_dsv4_flash_paged_mqa_logits_test_cases()
+
+    assert len(module_cases) > 0
+    assert len(sparse_cases) > 0
+    assert {c[6] for c in module_cases} == {"sgl-project/DeepSeek-V4-Flash-FP8"}
+    assert {c[5] for c in sparse_cases} == {"sgl-project/DeepSeek-V4-Flash-FP8"}
+
+
 def test_dsv4_flash_sparse_test_cases_only_indexer_tp1(monkeypatch):
     """Sweep is fixed at tp=[1] (kernel is TP-invariant)."""
     monkeypatch.setenv("COLLECTOR_MODEL_PATH", "deepseek-ai/DeepSeek-V4-Flash")

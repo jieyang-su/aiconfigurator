@@ -149,20 +149,42 @@ ATTN_KIND_TO_COMPRESS_RATIO = {
 
 CLI_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Pro"
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
+_MODEL_CONFIG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "src",
+    "aiconfigurator",
+    "model_configs",
+)
+
+_DSV4_FP4_EXPERTS_OVERRIDES = {
+    "sgl-project/DeepSeek-V4-Flash-FP8": False,
+}
+
+
+def _dsv4_fp4_experts_override(model_path: str) -> bool | None:
+    return _DSV4_FP4_EXPERTS_OVERRIDES.get(model_path)
+
+
+def _resolve_subprocess_visible_device(logical_gpu_id: int) -> str:
+    """Map a worker-local GPU index back through the parent's visibility mask."""
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible_devices:
+        return str(logical_gpu_id)
+
+    device_tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
+    if 0 <= logical_gpu_id < len(device_tokens):
+        return device_tokens[logical_gpu_id]
+    raise ValueError(
+        f"logical gpu_id={logical_gpu_id} is out of range for CUDA_VISIBLE_DEVICES={visible_devices!r}"
+    )
 
 
 def _pick_free_port(gpu_id: int) -> int:
-    """Return a free TCP port from a ``gpu_id``-scoped 1000-port range.
+    """Return a candidate TCP port from a ``gpu_id``-scoped 1000-port range.
 
-    Used as ``nccl_port`` for the per-subprocess torch.distributed
-    rendezvous.  Up to 8 collector workers run in parallel, each pinned
-    to one GPU.  Partitioning the port space by ``gpu_id`` makes
-    cross-worker collision impossible: worker N's candidate set is
-    [40000 + N*1000, 40000 + N*1000 + 999], disjoint from every other
-    worker's.  The bind / close / subprocess re-bind window inside one
-    worker is harmless because no peer worker can race for the same
-    port (unrelated system services landing on our specific freed port
-    in <1ms is negligibly rare).
+    The bind / close probe is only advisory: another process may still grab
+    the port before torch.distributed binds it.  Callers should retry on
+    ``EADDRINUSE`` during ModelRunner initialization.
     """
     base = 40000 + gpu_id * 1000
     for _ in range(100):
@@ -176,6 +198,11 @@ def _pick_free_port(gpu_id: int) -> int:
         s.close()
         return port
     raise RuntimeError(f"no free port in [{base}, {base + 999}] for gpu_id={gpu_id}")
+
+
+def _is_port_in_use_error(exc: Exception) -> bool:
+    message = str(exc)
+    return "EADDRINUSE" in message or "address already in use" in message.lower()
 
 
 def _kv_dtype_db_to_sglang(kv_dtype_db: str) -> str:
@@ -253,6 +280,16 @@ def _download_non_weight_model_files(model_id: str) -> tuple[str, dict]:
     return os.path.dirname(config_file), config
 
 
+def _load_aic_cached_model_config(model_id: str) -> dict | None:
+    """Load a packaged config from AIC's model_configs cache when available."""
+    config_file = os.path.join(_MODEL_CONFIG_DIR, f"{model_id.replace('/', '--')}_config.json")
+    if not os.path.isfile(config_file):
+        return None
+
+    with open(config_file) as f:
+        return json.load(f)
+
+
 def _resolve_model_path(
     model_path: str,
     *,
@@ -289,7 +326,12 @@ def _resolve_model_path(
         with open(os.path.join(src_dir, "config.json")) as f:
             config = json.load(f)
     else:
-        src_dir, config = _download_non_weight_model_files(model_path)
+        cached_config = _load_aic_cached_model_config(model_path)
+        if cached_config is not None:
+            src_dir = None
+            config = cached_config
+        else:
+            src_dir, config = _download_non_weight_model_files(model_path)
 
     config = copy.deepcopy(config)
     if strip_auto_map:
@@ -347,7 +389,8 @@ def _resolve_model_path(
         f"aic_dsv4_{attn_kind}_{model_path.replace('/', '_')}_{os.getpid()}",
     )
     os.makedirs(tmp_dir, exist_ok=True)
-    _copy_non_weight_files(src_dir, tmp_dir)
+    if src_dir is not None:
+        _copy_non_weight_files(src_dir, tmp_dir)
     with open(os.path.join(tmp_dir, "config.json"), "w") as f:
         json.dump(config, f)
     return tmp_dir
@@ -442,11 +485,15 @@ def _load_model_runner(
     gemm_type: str = "bfloat16",
     tp_size: int = 1,
 ):
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import initialize_moe_config
+    from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
+    from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.entrypoints.engine import _set_envs_and_config
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.utils import suppress_other_loggers
+    from sglang.srt.utils import is_blackwell_supported, is_sm90_supported, suppress_other_loggers
 
     suppress_other_loggers()
     torch.cuda.set_device(device)
@@ -489,6 +536,11 @@ def _load_model_runner(
     # gemm_type controls projection GEMM dispatch.  "fp8_block" → DeepGEMM
     # (matches production V4-Flash-FP8); anything else → cuBLASLt bf16.
     server_args.quantization = "fp8" if gemm_type == "fp8_block" else None
+    if server_args.quantization == "fp8" and server_args.moe_runner_backend == "auto":
+        if is_blackwell_supported():
+            server_args.moe_runner_backend = "flashinfer_mxfp4"
+        elif is_sm90_supported():
+            server_args.moe_runner_backend = "marlin"
     server_args.enable_piecewise_cuda_graph = False
     server_args.attention_backend = "compressed"
 
@@ -497,25 +549,52 @@ def _load_model_runner(
         f"attn_kind={attn_kind}, backend=compressed, kv_cache_dtype={kv_cache_dtype}, "
         f"max_total_tokens={max_total_tokens}, shrink_unused_moe={shrink_unused_moe}, "
         f"disable_weight_quant={disable_weight_quant}, gemm_type={gemm_type}, "
-        f"quantization={server_args.quantization}, tp_size={tp_size}"
+        f"quantization={server_args.quantization}, moe_runner_backend={server_args.moe_runner_backend}, "
+        f"tp_size={tp_size}"
     )
+    fp4_experts_override = _dsv4_fp4_experts_override(model_path)
+    with contextlib.ExitStack() as stack:
+        if fp4_experts_override is not None:
+            stack.enter_context(envs.SGLANG_DSV4_FP4_EXPERTS.override(fp4_experts_override))
+            print(f"[dsv4-collector] SGLANG_DSV4_FP4_EXPERTS={fp4_experts_override}")
 
-    _set_envs_and_config(server_args)
-    model_config = ModelConfig.from_server_args(server_args)
-    with _tp_load_model_patch(tp_size):
-        model_runner = ModelRunner(
-            model_config=model_config,
-            mem_fraction_static=mem_fraction_static,
-            gpu_id=gpu_id,
-            tp_rank=0,
-            tp_size=1,
-            pp_rank=0,
-            pp_size=1,
-            moe_ep_rank=0,
-            moe_ep_size=1,
-            nccl_port=_pick_free_port(gpu_id),
-            server_args=server_args,
-        )
+        _set_envs_and_config(server_args)
+        if hasattr(ModelConfig, "from_server_args"):
+            initialize_moe_config(server_args)
+            initialize_fp8_gemm_config(server_args)
+            initialize_fp4_gemm_config(server_args)
+        model_config = ModelConfig.from_server_args(server_args)
+        with _tp_load_model_patch(tp_size):
+            model_runner = None
+            max_port_attempts = 8
+            for port_attempt in range(max_port_attempts):
+                nccl_port = _pick_free_port(gpu_id)
+                try:
+                    model_runner = ModelRunner(
+                        model_config=model_config,
+                        mem_fraction_static=mem_fraction_static,
+                        gpu_id=gpu_id,
+                        tp_rank=0,
+                        tp_size=1,
+                        pp_rank=0,
+                        pp_size=1,
+                        moe_ep_rank=0,
+                        moe_ep_size=1,
+                        nccl_port=nccl_port,
+                        server_args=server_args,
+                    )
+                    break
+                except Exception as exc:
+                    if not _is_port_in_use_error(exc) or port_attempt == max_port_attempts - 1:
+                        raise
+                    print(
+                        f"[dsv4-collector] nccl_port={nccl_port} busy during init; "
+                        f"retrying ({port_attempt + 1}/{max_port_attempts - 1})"
+                    )
+                    torch.cuda.empty_cache()
+                    gc.collect()
+            if model_runner is None:
+                raise RuntimeError("failed to construct ModelRunner after port retries")
     allocator = model_runner.token_to_kv_pool_allocator
     pool_parts = []
     for name in (
@@ -1024,7 +1103,7 @@ def _run_subprocess(
     handled by ``run_dsv4_mla_module``'s try/except per forward.
     """
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    env["CUDA_VISIBLE_DEVICES"] = _resolve_subprocess_visible_device(gpu_id)
     env.setdefault("SGLANG_APPLY_CONFIG_BACKUP", "none")
     env.setdefault("SGLANG_LOAD_FORMAT", "dummy")
     # Hard-disable DeepGEMM bulk pre-compile.  First sl in this sweep
@@ -1054,17 +1133,24 @@ def _run_subprocess(
         stderr=subprocess.STDOUT,
         cwd=os.path.dirname(os.path.abspath(__file__)),
     )
+    output_text = ""
     try:
         stdout, _ = proc.communicate(timeout=3600)  # up to 1 hour per (kind, tp, gemm, bs)
-        if stdout:
-            print(stdout.decode("utf-8", errors="replace"))
+        output_text = stdout.decode("utf-8", errors="replace") if stdout else ""
+        if output_text:
+            print(output_text)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait()
+        stdout, _ = proc.communicate()
+        output_text = stdout.decode("utf-8", errors="replace") if stdout else ""
+
     if proc.returncode != 0:
+        output_tail = output_text[-4000:].strip()
+        detail = f"\n--- child output tail ---\n{output_tail}" if output_tail else ""
         raise RuntimeError(
             f"dsv4_flash_{attn_kind}_{mode} subprocess failed for "
             f"(bs={batch_size}, tp={tp_size}, gemm={gemm_type}); exit={proc.returncode}"
+            f"{detail}"
         )
 
 
@@ -1159,7 +1245,8 @@ def run_dsv4_flash_attn_worker(
     if tp_size not in _TP_SIZES:
         raise ValueError(f"unsupported tp_size={tp_size}; expected one of {_TP_SIZES}")
 
-    is_prefill = "context" in perf_filename
+    perf_basename = os.path.basename(perf_filename)
+    is_prefill = "context" in perf_basename
     mode = "context" if is_prefill else "generation"
 
     device_str = str(device)
