@@ -1182,15 +1182,9 @@ def main():
         setup_logging(debug=args.debug)
 
     if args.model_path:
-<<<<<<< HEAD
-        logger.info(f"Model filter active: collecting only for '{os.environ['COLLECTOR_MODEL_PATH']}'")
-        if os.environ.get("COLLECTOR_LOCAL_MODEL_PATH"):
-            logger.info(f"Using local model directory: {os.environ['COLLECTOR_LOCAL_MODEL_PATH']}")
-=======
         logger.info(f"Model filter active: collecting only for '{args.model_path}'")
         if ops and args.ops is None:
             logger.info(f"  expanded to model-specific ops: {ops}")
->>>>>>> upstream/main
 
     resume_options = {
         "resume": args.resume,
