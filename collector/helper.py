@@ -48,6 +48,21 @@ def _parse_bool_env(env_var: str, default: bool = False) -> bool:
     return value.lower() in ("true", "1", "yes")
 
 
+def resolve_subprocess_visible_device(logical_device_id: int) -> str:
+    """Map a logical worker-local device index through CUDA_VISIBLE_DEVICES."""
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible_devices:
+        return str(logical_device_id)
+
+    device_tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
+    if 0 <= logical_device_id < len(device_tokens):
+        return device_tokens[logical_device_id]
+
+    raise ValueError(
+        f"logical gpu_id={logical_device_id} is out of range for CUDA_VISIBLE_DEVICES={visible_devices!r}"
+    )
+
+
 def _ensure_nvml_initialized():
     """Initialize NVML once per process. Thread-safe."""
     global _NVML_INITIALIZED
@@ -1479,8 +1494,8 @@ def _get_deepseek_model_path():
     if collector_local_path:
         return collector_local_path
 
-    collector_model_path = os.environ.get("COLLECTOR_MODEL_PATH")
-    if collector_model_path and os.path.exists(collector_model_path):
+    collector_model_path = os.environ.get("COLLECTOR_MODEL_PATH", "").strip()
+    if collector_model_path:
         return collector_model_path
 
     env_path = os.environ.get("DEEPSEEK_MODEL_PATH")
@@ -1525,8 +1540,9 @@ def _get_moe_model_path():
 
     Checks environment variables in priority order:
     1. COLLECTOR_LOCAL_MODEL_PATH - local path passed via collect.py --model-path
-    2. MOE_MODEL_PATH - generic, for any MoE model
-    3. DEEPSEEK_MODEL_PATH - backward compatibility for DeepSeek models
+    2. COLLECTOR_MODEL_PATH - validated canonical model ID or local path
+    3. MOE_MODEL_PATH - generic, for any MoE model
+    4. DEEPSEEK_MODEL_PATH - backward compatibility for DeepSeek models
     Otherwise, download only the necessary config files from HuggingFace.
     This allows running the collector without downloading the full model weights.
     """
@@ -1534,8 +1550,8 @@ def _get_moe_model_path():
     if collector_local_path:
         return collector_local_path
 
-    collector_model_path = os.environ.get("COLLECTOR_MODEL_PATH")
-    if collector_model_path and os.path.exists(collector_model_path):
+    collector_model_path = os.environ.get("COLLECTOR_MODEL_PATH", "").strip()
+    if collector_model_path:
         return collector_model_path
 
     # Try MOE_MODEL_PATH first (generic)

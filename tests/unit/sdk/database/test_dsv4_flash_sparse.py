@@ -23,7 +23,9 @@ from aiconfigurator.sdk import common
 from aiconfigurator.sdk.perf_database import (
     DSV4_FLASH_NATIVE_HEADS,
     LoadedOpData,
+    PerfDatabase,
     _deep_merge_dsv4_dicts,
+    _dsv4_flash_outer_linear_3d_lookup,
     _dsv4_flash_robust_3d_lookup,
     _dsv4_flash_tp_from_num_heads,
     load_context_dsv4_flash_kind_module_data,
@@ -244,6 +246,216 @@ def test_robust_3d_lookup_falls_back_to_linear_when_cubic_fails():
     result = _dsv4_flash_robust_3d_lookup(_Stub(), {}, 8, 8192, 1)
     assert calls == ["cubic", "linear"]
     assert result["latency"] == pytest.approx(4.94)
+
+
+def test_robust_3d_lookup_falls_back_to_outer_linear_when_inner_interp_overflows():
+    calls = []
+
+    class _Stub:
+        def _interp_3d(self, x, y, z, d, method):
+            calls.append(method)
+            raise ValueError("query outside measured boundary")
+
+        def _nearest_1d_point_helper(self, x, values, inner_only=True):
+            return PerfDatabase._nearest_1d_point_helper(self, x, values, inner_only)
+
+        @staticmethod
+        def _interp_1d(x, y, value):
+            return PerfDatabase._interp_1d(None, x, y, value)
+
+        @staticmethod
+        def _validate(value):
+            return value
+
+    data = {
+        8: {
+            128: {
+                3073: {"latency": 3.073, "energy": 0.0},
+                4097: {"latency": 4.097, "energy": 0.0},
+            }
+        }
+    }
+    result = _dsv4_flash_robust_3d_lookup(_Stub(), data, 8, 128, 4129, allow_extrapolation=True)
+    assert calls == ["cubic", "linear"]
+    assert result["latency"] == pytest.approx(4.129)
+
+
+def test_outer_linear_3d_lookup_extrapolates_past_generation_seq_cap():
+    class _Stub:
+        def _nearest_1d_point_helper(self, x, values, inner_only=True):
+            return PerfDatabase._nearest_1d_point_helper(self, x, values, inner_only)
+
+        @staticmethod
+        def _interp_1d(x, y, value):
+            return PerfDatabase._interp_1d(None, x, y, value)
+
+        @staticmethod
+        def _validate(value):
+            return value
+
+    data = {
+        8: {
+            128: {
+                3073: {"latency": 3.073, "energy": 0.0},
+                4097: {"latency": 4.097, "energy": 0.0},
+            }
+        }
+    }
+    result = _dsv4_flash_outer_linear_3d_lookup(_Stub(), data, 8, 128, 4129)
+    assert result["latency"] == pytest.approx(4.129)
+
+
+def test_generation_query_uses_outer_linear_fallback_for_v4_flash(mutable_comprehensive_perf_db):
+    db = mutable_comprehensive_perf_db
+    arch = "DeepseekV4ForCausalLM"
+    db._generation_deepseek_v4_attention_module_data = LoadedOpData(
+        {
+            common.KVCacheQuantMode.fp8: {
+                common.GEMMQuantMode.fp8_block: {
+                    arch: {
+                        4: {
+                            8: {
+                                128: {
+                                    3073: {"latency": 3.073, "power": 0.0, "energy": 0.0},
+                                    4097: {"latency": 4.097, "power": 0.0, "energy": 0.0},
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        None,
+        "test",
+    )
+
+    result = db.query_generation_deepseek_v4_attention_module(
+        b=128,
+        s=4129,
+        num_heads=8,
+        hidden_size=4096,
+        q_lora_rank=1536,
+        o_lora_rank=4096,
+        head_dim=192,
+        rope_head_dim=64,
+        index_n_heads=1,
+        index_head_dim=192,
+        index_topk=128,
+        window_size=0,
+        compress_ratio=4,
+        o_groups=1,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+        gemm_quant_mode=common.GEMMQuantMode.fp8_block,
+        database_mode=common.DatabaseMode.SILICON,
+        architecture=arch,
+    )
+
+    assert float(result) == pytest.approx(4.129)
+    assert result.source == "silicon"
+
+
+def test_context_query_uses_outer_linear_fallback_for_v4_flash(mutable_comprehensive_perf_db):
+    db = mutable_comprehensive_perf_db
+    arch = "DeepseekV4ForCausalLM"
+    db._raw_context_deepseek_v4_attention_module_data = None
+    db._context_deepseek_v4_attention_module_data = LoadedOpData(
+        {
+            common.FMHAQuantMode.bfloat16: {
+                common.KVCacheQuantMode.fp8: {
+                    common.GEMMQuantMode.fp8_block: {
+                        arch: {
+                            4: {
+                                8: {
+                                    6144: {1: {"latency": 6.144, "power": 0.0, "energy": 0.0}},
+                                    8192: {1: {"latency": 8.192, "power": 0.0, "energy": 0.0}},
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        None,
+        "test",
+    )
+
+    result = db.query_context_deepseek_v4_attention_module(
+        b=1,
+        s=8193,
+        prefix=0,
+        num_heads=8,
+        hidden_size=4096,
+        q_lora_rank=1536,
+        o_lora_rank=4096,
+        head_dim=192,
+        rope_head_dim=64,
+        index_n_heads=1,
+        index_head_dim=192,
+        index_topk=128,
+        window_size=0,
+        compress_ratio=4,
+        o_groups=1,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+        gemm_quant_mode=common.GEMMQuantMode.fp8_block,
+        database_mode=common.DatabaseMode.SILICON,
+        architecture=arch,
+    )
+
+    assert float(result) == pytest.approx(8.193)
+    assert result.source == "silicon"
+
+
+def test_hybrid_generation_falls_back_to_empirical_instead_of_extrapolating(mutable_comprehensive_perf_db):
+    db = mutable_comprehensive_perf_db
+    arch = "DeepseekV4ForCausalLM"
+    db._generation_deepseek_v4_attention_module_data = LoadedOpData(
+        {
+            common.KVCacheQuantMode.fp8: {
+                common.GEMMQuantMode.fp8_block: {
+                    arch: {
+                        4: {
+                            8: {
+                                128: {
+                                    3073: {"latency": 3.073, "power": 0.0, "energy": 0.0},
+                                    4097: {"latency": 4.097, "power": 0.0, "energy": 0.0},
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        None,
+        "test",
+    )
+
+    result = db.query_generation_deepseek_v4_attention_module(
+        b=128,
+        s=4129,
+        num_heads=8,
+        hidden_size=4096,
+        q_lora_rank=1536,
+        o_lora_rank=4096,
+        head_dim=192,
+        rope_head_dim=64,
+        index_n_heads=1,
+        index_head_dim=192,
+        index_topk=128,
+        window_size=0,
+        compress_ratio=4,
+        o_groups=1,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+        gemm_quant_mode=common.GEMMQuantMode.fp8_block,
+        database_mode=common.DatabaseMode.HYBRID,
+        architecture=arch,
+    )
+
+    assert result.source == "empirical"
+    assert float(result) > 0
+    assert float(result) != pytest.approx(4.129)
 
 
 # ───────────────────────────────────────────────────────────────────────

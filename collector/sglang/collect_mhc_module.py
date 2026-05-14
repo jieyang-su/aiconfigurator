@@ -92,6 +92,11 @@ def get_mhc_module_test_cases() -> list[dict]:
     Loading the one-layer runner is expensive, so we pay it once per op
     (pre/post) instead of per (op, num_tokens) combo.
     """
+    model_path = os.environ.get("COLLECTOR_MODEL_PATH", "").strip()
+    if model_path:
+        supported_models = {case.model_name for case in get_common_mhc_test_cases()}
+        if model_path not in supported_models:
+            return []
     return [{"id": f"mhc_{op}_all", "params": [op]} for op in ("pre", "post")]
 
 

@@ -1350,8 +1350,8 @@ def _dsv4_flash_tp_from_num_heads(num_heads: int) -> int:
     return max(1, DSV4_FLASH_NATIVE_HEADS // max(num_heads, 1))
 
 
-def _dsv4_flash_robust_3d_lookup(self, dict_, x, y, z):
-    """V4-Flash-only 3D lookup: try exact, then cubic, then linear.
+def _dsv4_flash_robust_3d_lookup(self, dict_, x, y, z, *, allow_extrapolation: bool = False):
+    """V4-Flash-only 3D lookup: try exact, cubic, linear, then outer-linear.
 
     Generic ``_interp_3d`` raises ``QhullError`` when the point cloud has
     a degenerate axis (e.g. our V4-Flash sweep caps b=1 at s=8192, so the
@@ -1361,10 +1361,14 @@ def _dsv4_flash_robust_3d_lookup(self, dict_, x, y, z):
       1. Try an exact ``dict[x][y][z]`` lookup — handles the common case
          of querying at a measured bench point.
       2. Fall back to cubic 3D interp.
-      3. Fall back to linear 3D interp (different qhull tolerances; less
-         likely to fail on near-degenerate inputs).
+        3. Fall back to linear 3D interp (different qhull tolerances; less
+            likely to fail on near-degenerate inputs).
+        4. If ``allow_extrapolation`` is enabled and the query sits slightly
+            outside the measured boundary, do a final per-axis linear outer
+            extrapolation using the nearest edge points.
 
-    Caller swallows lower-level exceptions if all three paths fail.
+    This lets SILICON use bounded edge extrapolation while HYBRID remains a
+    strict silicon query that falls back to empirical mode on failure.
     """
     # Use .get() chain instead of [] indexing: dict_ may be a (nested)
     # defaultdict, so [] reads would create spurious empty branches that
@@ -1377,7 +1381,49 @@ def _dsv4_flash_robust_3d_lookup(self, dict_, x, y, z):
     try:
         return self._interp_3d(x, y, z, dict_, "cubic")
     except Exception:
-        return self._interp_3d(x, y, z, dict_, "linear")
+        try:
+            return self._interp_3d(x, y, z, dict_, "linear")
+        except Exception:
+            if allow_extrapolation:
+                return _dsv4_flash_outer_linear_3d_lookup(self, dict_, x, y, z)
+            raise
+
+
+def _dsv4_flash_outer_linear_3d_lookup(self, dict_, x, y, z):
+    """V4-Flash-only 3D linear interpolation with boundary extrapolation.
+
+    Used as a last-resort fallback when a V4-Flash query lands slightly beyond
+    the measured grid (for example generation s=4129 with max 4097, or context
+    s=8193 with max 8192). This keeps the V4-Flash behavior local instead of
+    changing generic interpolation semantics.
+    """
+    def _interp_metric(axis_values, metric_values, target):
+        if len(axis_values) == 1:
+            return metric_values[0]
+        return self._validate(self._interp_1d(axis_values, metric_values, target))
+
+    def _interp_leaf(axis_values, leaves, target):
+        latency = _interp_metric(axis_values, [leaf["latency"] for leaf in leaves], target)
+        power = _interp_metric(axis_values, [leaf.get("power", 0.0) for leaf in leaves], target)
+        energy = _interp_metric(axis_values, [leaf.get("energy", 0.0) for leaf in leaves], target)
+        return {"latency": latency, "power": power, "energy": energy}
+
+    def _lookup_1d(z_dict, target_z):
+        z_left, z_right = self._nearest_1d_point_helper(target_z, list(z_dict.keys()), inner_only=False)
+        z_values = sorted(set([z_left, z_right]))
+        leaves = [z_dict[k] for k in z_values]
+        return _interp_leaf(z_values, leaves, target_z)
+
+    def _lookup_2d(y_dict, target_y, target_z):
+        y_left, y_right = self._nearest_1d_point_helper(target_y, list(y_dict.keys()), inner_only=False)
+        y_values = sorted(set([y_left, y_right]))
+        leaves = [_lookup_1d(y_dict[j], target_z) for j in y_values]
+        return _interp_leaf(y_values, leaves, target_y)
+
+    x_left, x_right = self._nearest_1d_point_helper(x, list(dict_.keys()), inner_only=False)
+    x_values = sorted(set([x_left, x_right]))
+    leaves = [_lookup_2d(dict_[i], y, z) for i in x_values]
+    return _interp_leaf(x_values, leaves, x)
 
 
 def load_context_dsv4_flash_kind_module_data(file_path: str):
@@ -7933,7 +7979,14 @@ class PerfDatabase:
                 # avoid qhull crashes on the caps-driven flat b axis.  Generic
                 # ``_interp_3d`` is left untouched for other architectures.
                 result = (
-                    _dsv4_flash_robust_3d_lookup(self, deepseek_v4_dict, head_axis, lookup_s, b)
+                    _dsv4_flash_robust_3d_lookup(
+                        self,
+                        deepseek_v4_dict,
+                        head_axis,
+                        lookup_s,
+                        b,
+                        allow_extrapolation=database_mode == common.DatabaseMode.SILICON,
+                    )
                     if architecture == "DeepseekV4ForCausalLM"
                     else self._interp_3d(head_axis, lookup_s, b, deepseek_v4_dict, "cubic")
                 )
@@ -8067,7 +8120,14 @@ class PerfDatabase:
             # V4-Flash robust lookup (exact → cubic → linear) — see helper
             # docstring; generic ``_interp_3d`` left untouched for others.
             result = (
-                _dsv4_flash_robust_3d_lookup(self, deepseek_v4_dict, head_axis, b, s)
+                _dsv4_flash_robust_3d_lookup(
+                    self,
+                    deepseek_v4_dict,
+                    head_axis,
+                    b,
+                    s,
+                    allow_extrapolation=database_mode == common.DatabaseMode.SILICON,
+                )
                 if architecture == "DeepseekV4ForCausalLM"
                 else self._interp_3d(head_axis, b, s, deepseek_v4_dict, "cubic")
             )

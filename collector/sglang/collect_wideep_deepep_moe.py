@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 
 import numpy as np
 import torch
@@ -25,15 +26,31 @@ from sglang.srt.utils import (
 )
 
 try:
-    from helper import _get_moe_model_path, log_perf, power_law_deepep_decode, power_law_deepep_prefill
+    from helper import (
+        _get_moe_model_path,
+        log_perf,
+        power_law_deepep_decode,
+        power_law_deepep_prefill,
+        resolve_subprocess_visible_device,
+    )
 except ModuleNotFoundError:
     import os
     import sys
 
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from helper import _get_moe_model_path, log_perf, power_law_deepep_decode, power_law_deepep_prefill
+    from helper import (
+        _get_moe_model_path,
+        log_perf,
+        power_law_deepep_decode,
+        power_law_deepep_prefill,
+        resolve_subprocess_visible_device,
+    )
 from importlib.metadata import version as get_version
 from math import ceil as _ceil
+
+
+MOE_SUBPROCESS_TIMEOUT_SEC = 1800
+MOE_PROGRESS_LOG_INTERVAL_SEC = 60
 
 
 def _is_scale_ue8m0() -> bool:
@@ -1031,7 +1048,8 @@ def _run_moe_subprocess(num_experts, gpu_id, output_path=None):
     import sys
 
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    visible_device = resolve_subprocess_visible_device(gpu_id)
+    env["CUDA_VISIBLE_DEVICES"] = visible_device
 
     code = f'''
 import sys
@@ -1048,14 +1066,40 @@ run_moe_benchmark({num_experts}, {gpu_id}, {output_path!r})
         cwd=os.path.dirname(os.path.abspath(__file__)),
     )
 
-    try:
-        stdout, _ = proc.communicate(timeout=600)  # 10 min timeout per MOE config
-        if stdout:
-            print(stdout.decode("utf-8", errors="replace"))
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        print(f"MOE subprocess timed out for num_experts={num_experts}")
+    print(
+        "Starting MOE subprocess: "
+        f"num_experts={num_experts}, gpu_id={gpu_id}, "
+        f"CUDA_VISIBLE_DEVICES={visible_device}, timeout={MOE_SUBPROCESS_TIMEOUT_SEC}s"
+    )
+
+    start_time = time.monotonic()
+    stdout = b""
+    while True:
+        elapsed = time.monotonic() - start_time
+        remaining = MOE_SUBPROCESS_TIMEOUT_SEC - elapsed
+        if remaining <= 0:
+            proc.kill()
+            stdout, _ = proc.communicate()
+            print(
+                "MOE subprocess timed out "
+                f"after {int(elapsed)}s for num_experts={num_experts}, "
+                f"gpu_id={gpu_id}, CUDA_VISIBLE_DEVICES={visible_device}"
+            )
+            break
+
+        try:
+            stdout, _ = proc.communicate(timeout=min(MOE_PROGRESS_LOG_INTERVAL_SEC, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            print(
+                "MOE subprocess still running: "
+                f"num_experts={num_experts}, gpu_id={gpu_id}, "
+                f"CUDA_VISIBLE_DEVICES={visible_device}, "
+                f"elapsed={int(time.monotonic() - start_time)}s/{MOE_SUBPROCESS_TIMEOUT_SEC}s"
+            )
+
+    if stdout:
+        print(stdout.decode("utf-8", errors="replace"))
 
     if proc.returncode != 0:
         raise RuntimeError(f"MOE subprocess failed with exit code {proc.returncode}")
@@ -1074,9 +1118,10 @@ def run_wideep_moe(num_experts, *, perf_filename, device="cuda:0"):
     print(f"MOE: num_experts={num_experts}, GPU={gpu_id}")
     print("=" * 60)
 
-    # Resolve output_path from cwd so perf files land in the collector
-    # framework's result directory (consistent with collect_moe.py behavior).
-    output_path = os.getcwd()
+    # collect.py resolves perf_filename into the active run directory. Use that
+    # directory so WideEP's split outputs land next to the other collector
+    # artifacts instead of the caller's current working directory.
+    output_path = os.path.dirname(os.path.abspath(str(perf_filename))) or os.getcwd()
     _run_moe_subprocess(num_experts, gpu_id, output_path)
 
 

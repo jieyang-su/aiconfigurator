@@ -52,10 +52,10 @@ os.environ.setdefault("SGLANG_APPLY_CONFIG_BACKUP", "none")
 os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
 
 try:
-    from helper import benchmark_with_power, log_perf
+    from helper import benchmark_with_power, log_perf, resolve_subprocess_visible_device
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from helper import benchmark_with_power, log_perf
+    from helper import benchmark_with_power, log_perf, resolve_subprocess_visible_device
 
 
 # Re-export test case generators from the dedicated test_cases module so
@@ -163,20 +163,6 @@ _DSV4_FP4_EXPERTS_OVERRIDES = {
 
 def _dsv4_fp4_experts_override(model_path: str) -> bool | None:
     return _DSV4_FP4_EXPERTS_OVERRIDES.get(model_path)
-
-
-def _resolve_subprocess_visible_device(logical_gpu_id: int) -> str:
-    """Map a worker-local GPU index back through the parent's visibility mask."""
-    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if not visible_devices:
-        return str(logical_gpu_id)
-
-    device_tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
-    if 0 <= logical_gpu_id < len(device_tokens):
-        return device_tokens[logical_gpu_id]
-    raise ValueError(
-        f"logical gpu_id={logical_gpu_id} is out of range for CUDA_VISIBLE_DEVICES={visible_devices!r}"
-    )
 
 
 def _pick_free_port(gpu_id: int) -> int:
@@ -1103,7 +1089,7 @@ def _run_subprocess(
     handled by ``run_dsv4_mla_module``'s try/except per forward.
     """
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = _resolve_subprocess_visible_device(gpu_id)
+    env["CUDA_VISIBLE_DEVICES"] = resolve_subprocess_visible_device(gpu_id)
     env.setdefault("SGLANG_APPLY_CONFIG_BACKUP", "none")
     env.setdefault("SGLANG_LOAD_FORMAT", "dummy")
     # Hard-disable DeepGEMM bulk pre-compile.  First sl in this sweep

@@ -34,11 +34,16 @@ from importlib.metadata import version as get_version
 import numpy as np
 import torch
 
+# Some SGLang images default to replacing large patched configs with packaged
+# V4 backups. That breaks V3/V3.2/GLM-5 MLA/DSA collection by rewriting the
+# temporary config into DeepseekV4ForCausalLM and then rejecting bf16 KV.
+os.environ.setdefault("SGLANG_APPLY_CONFIG_BACKUP", "none")
+
 try:
-    from helper import benchmark_with_power, get_sm_version, log_perf
+    from helper import benchmark_with_power, get_sm_version, log_perf, resolve_subprocess_visible_device
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from helper import benchmark_with_power, get_sm_version, log_perf
+    from helper import benchmark_with_power, get_sm_version, log_perf, resolve_subprocess_visible_device
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -79,6 +84,20 @@ _MODEL_CONFIG_DIR = os.path.join(
     "aiconfigurator",
     "model_configs",
 )
+
+
+def _get_selected_model_path() -> str | None:
+    """Return the active collect.py --model-path filter, if any."""
+    model_path = os.environ.get("COLLECTOR_MODEL_PATH", "").strip()
+    return model_path or None
+
+
+def _filter_supported_model_paths(model_paths: list[str]) -> list[str]:
+    """Apply the active model-path filter to a supported-model list."""
+    selected_model = _get_selected_model_path()
+    if selected_model is None:
+        return model_paths
+    return [model_path for model_path in model_paths if model_path == selected_model]
 
 
 def _resolve_local_model_path(model_id: str) -> str:
@@ -325,7 +344,7 @@ def _build_module_test_cases(attn_type: str, mode: str):
     perf_filename is supplied by collect.py via functools.partial as a keyword
     argument, so it is not included in the test case tuple.
     """
-    model_paths = [m for m, t in SUPPORTED_MODELS.items() if t == attn_type]
+    model_paths = _filter_supported_model_paths([m for m, t in SUPPORTED_MODELS.items() if t == attn_type])
     cases = []
     for model_path in model_paths:
         native_heads = MODEL_NATIVE_HEADS.get(model_path, 128)
@@ -364,7 +383,7 @@ def _build_wideep_mla_test_cases(mode: str):
     perf_filename is supplied by collect.py via functools.partial as a keyword
     argument, so it is not included in the test case tuple.
     """
-    model_paths = [m for m, t in SUPPORTED_MODELS.items() if t == "mla"]
+    model_paths = _filter_supported_model_paths([m for m, t in SUPPORTED_MODELS.items() if t == "mla"])
     backends = _get_mla_backend_list()
     cases = []
     for model_path in model_paths:
@@ -1269,7 +1288,7 @@ def _run_mla_subprocess(
 ):
     """Run MLA/DSA benchmark in a subprocess with CUDA_VISIBLE_DEVICES isolation."""
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    env["CUDA_VISIBLE_DEVICES"] = resolve_subprocess_visible_device(gpu_id)
 
     phase = "context" if is_prefill else "generation"
     output_repr = f'"{output_path}"' if output_path else "None"
