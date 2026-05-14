@@ -149,6 +149,7 @@ def cli_default(
     generator_set: list[str] | None = None,
     generator_config: str | None = None,
     generator_dynamo_version: str | None = None,
+    engine_step_backend: str | None = None,
 ) -> CLIResult:
     """
     Run the default CLI mode: compare aggregated vs disaggregated serving.
@@ -190,6 +191,7 @@ def cli_default(
             Equivalent to repeating ``--generator-set`` on the CLI.
         generator_config: Path to a unified generator YAML config file.
         generator_dynamo_version: Override Dynamo version used by the generator.
+        engine_step_backend: Experimental static latency backend ("python" or "rust").
 
     Returns:
         CLIResult with chosen experiment, best configs, pareto fronts, and throughputs.
@@ -243,6 +245,7 @@ def cli_default(
         prefix=prefix,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         max_seq_len=max_seq_len,
+        engine_step_backend=engine_step_backend,
     )
 
     result = _execute_and_wrap_result(task_configs, mode="default", top_n=top_n, strict_sla=strict_sla)
@@ -653,6 +656,7 @@ def cli_estimate(
     systems_paths: str | None = None,
     free_gpu_memory_fraction: float | None = None,
     max_seq_len: int | None = None,
+    engine_step_backend: str | None = None,
 ) -> EstimateResult:
     """
     Estimate TTFT, TPOT, and power for a single model/system/config combination.
@@ -708,6 +712,7 @@ def cli_estimate(
         max_seq_len: The TRT-LLM ``--max_seq_len`` setting used at serving time.
             Controls how many KV blocks TRT-LLM pre-allocates per sequence. Defaults
             to ``isl + osl`` when ``None``.
+        engine_step_backend: Experimental static latency backend ("python" or "rust").
 
     Returns:
         EstimateResult with ttft, tpot, power_w, mode, and the full raw result dict.
@@ -728,24 +733,50 @@ def cli_estimate(
     from aiconfigurator.sdk.perf_database import (
         get_database,
         get_latest_database_version,
+        get_systems_paths,
         set_systems_paths,
     )
 
+    active_systems_paths = None
     if systems_paths is not None:
-        set_systems_paths(systems_paths)
+        previous_systems_paths = get_systems_paths()
+        try:
+            set_systems_paths(systems_paths)
+            active_systems_paths = get_systems_paths()
+        finally:
+            set_systems_paths(previous_systems_paths)
 
-    # Resolve backend version
-    resolved_version = backend_version
-    if resolved_version is None:
-        resolved_version = get_latest_database_version(system=system_name, backend=backend_name)
+    def _resolve_version_for(sys_name: str) -> str:
+        resolved_version = backend_version
         if resolved_version is None:
-            raise ValueError(
-                f"No database found for system={system_name}, backend={backend_name}. "
-                "Check --systems-paths or available databases."
-            )
+            if active_systems_paths is None:
+                resolved_version = get_latest_database_version(system=sys_name, backend=backend_name)
+            else:
+                resolved_version = get_latest_database_version(
+                    system=sys_name,
+                    backend=backend_name,
+                    systems_paths=active_systems_paths,
+                )
+        if resolved_version is None:
+            if database_mode == "SILICON":
+                raise ValueError(
+                    f"No database found for system={sys_name}, backend={backend_name}. "
+                    "Check --systems-paths or available databases."
+                )
+            resolved_version = "estimate"
+        return resolved_version
 
     def _load_database(sys_name: str):
-        db = get_database(sys_name, backend_name, resolved_version)
+        resolved_version = _resolve_version_for(sys_name)
+        database_kwargs = {"allow_missing_data": database_mode != "SILICON"}
+        if active_systems_paths is not None:
+            database_kwargs["systems_paths"] = active_systems_paths
+        db = get_database(
+            sys_name,
+            backend_name,
+            resolved_version,
+            **database_kwargs,
+        )
         if db is None:
             raise ValueError(
                 f"Failed to load perf database for system={sys_name}, "
@@ -758,6 +789,7 @@ def cli_estimate(
         return db
 
     if mode == "agg":
+        resolved_version = _resolve_version_for(system_name)
         return _run_agg_estimate(
             model_path=model_path,
             system_name=system_name,
@@ -782,8 +814,17 @@ def cli_estimate(
             get_model=get_model,
             free_gpu_memory_fraction=free_gpu_memory_fraction,
             max_seq_len=max_seq_len,
+            engine_step_backend=engine_step_backend,
         )
     elif mode == "disagg":
+        prefill_resolved_version = _resolve_version_for(system_name)
+        decode_system = decode_system_name or system_name
+        decode_resolved_version = _resolve_version_for(decode_system)
+        resolved_version = (
+            prefill_resolved_version
+            if prefill_resolved_version == decode_resolved_version
+            else f"{prefill_resolved_version}-{decode_resolved_version}"
+        )
         # Validate required disagg params
         for name, val in [
             ("prefill_batch_size", prefill_batch_size),
@@ -797,7 +838,7 @@ def cli_estimate(
         return _run_disagg_estimate(
             model_path=model_path,
             system_name=system_name,
-            decode_system_name=decode_system_name or system_name,
+            decode_system_name=decode_system,
             backend_name=backend_name,
             resolved_version=resolved_version,
             isl=isl,
@@ -831,6 +872,7 @@ def cli_estimate(
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
+            engine_step_backend=engine_step_backend,
         )
     else:
         raise ValueError(f"Unsupported estimate mode: {mode!r}. Use 'agg' or 'disagg'.")
@@ -861,6 +903,7 @@ def _run_agg_estimate(
     get_model,
     free_gpu_memory_fraction=None,
     max_seq_len=None,
+    engine_step_backend=None,
 ) -> EstimateResult:
     """Run aggregated (IFB) estimation."""
     from aiconfigurator.sdk.config import RuntimeConfig
@@ -882,7 +925,12 @@ def _run_agg_estimate(
         moe_quant_mode,
         comm_quant_mode,
     )
-    runtime_config = RuntimeConfig(isl=isl, osl=osl, batch_size=batch_size)
+    runtime_config = RuntimeConfig(
+        isl=isl,
+        osl=osl,
+        batch_size=batch_size,
+        engine_step_backend=engine_step_backend,
+    )
 
     model = get_model(model_path, model_config, backend_name)
     database = load_database(system_name)
@@ -969,6 +1017,7 @@ def _run_disagg_estimate(
     load_database,
     get_backend,
     get_model,
+    engine_step_backend=None,
 ) -> EstimateResult:
     """Run disaggregated estimation."""
     from aiconfigurator.sdk.config import RuntimeConfig
@@ -1015,7 +1064,7 @@ def _run_disagg_estimate(
         comm_quant_mode,
     )
 
-    runtime_config = RuntimeConfig(isl=isl, osl=osl)
+    runtime_config = RuntimeConfig(isl=isl, osl=osl, engine_step_backend=engine_step_backend)
 
     prefill_database = load_database(system_name)
     decode_database = load_database(decode_system_name)

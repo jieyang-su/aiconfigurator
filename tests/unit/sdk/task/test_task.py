@@ -39,7 +39,7 @@ def stub_perf_database(monkeypatch):
         def __init__(self, sm_version: int):
             self.system_spec = {"gpu": {"sm_version": sm_version}}
 
-    def fake_get_database(system, backend, version):
+    def fake_get_database(system, backend, version, database_mode=None):
         if "b200" in system:
             sm = 100
         elif "h200" in system:
@@ -103,6 +103,39 @@ def test_taskconfig_disagg_default():
     assert cfg.advanced_tuning_config.rate_matching_prefill_degradation_factor is None
     assert cfg.advanced_tuning_config.rate_matching_decode_degradation_factor is None
     assert "disagg-defaults" in cfg.applied_layers
+
+
+def test_taskconfig_disagg_validation_uses_worker_backend_versions(monkeypatch):
+    calls = []
+
+    class FakeDatabase:
+        def __init__(self):
+            self.system_spec = {"gpu": {"sm_version": 90}}
+            self.supported_quant_mode = {}
+
+    versions = {"h200_sxm": "prefill-version", "b200_sxm": "decode-version"}
+
+    def fake_latest_version(system, backend):
+        return versions[system]
+
+    def fake_get_database(system, backend, version, database_mode=None, allow_missing_data=False):
+        calls.append((system, backend, version))
+        return FakeDatabase()
+
+    monkeypatch.setattr(task_module, "get_latest_database_version", fake_latest_version)
+    monkeypatch.setattr(task_module, "get_database", fake_get_database)
+
+    task = TaskConfig(
+        serving_mode="disagg",
+        model_path="Qwen/Qwen3-32B",
+        system_name="h200_sxm",
+        decode_system_name="b200_sxm",
+    )
+
+    assert task.backend_version == "prefill-version-decode-version"
+    assert ("h200_sxm", "trtllm", "prefill-version") in calls
+    assert ("b200_sxm", "trtllm", "decode-version") in calls
+    assert ("h200_sxm", "trtllm", task.backend_version) not in calls
 
 
 def test_taskconfig_profile_application():
@@ -378,7 +411,7 @@ def test_taskconfig_rejects_unsupported_quant_mode(monkeypatch):
             self.system_spec = {"gpu": {"sm_version": 90}}
             self.supported_quant_mode = {"gemm": ["bfloat16"]}
 
-    def fake_get_database(system, backend, version):
+    def fake_get_database(system, backend, version, database_mode=None):
         return FakeDatabase()
 
     monkeypatch.setattr(task_module, "get_database", fake_get_database)
@@ -392,13 +425,64 @@ def test_taskconfig_rejects_unsupported_quant_mode(monkeypatch):
         )
 
 
+def test_taskconfig_dense_model_skips_moe_quant_validation(monkeypatch):
+    class FakeDatabase:
+        def __init__(self):
+            self.system_spec = {"gpu": {"sm_version": 90}}
+            self.supported_quant_mode = {
+                "gemm": ["fp8"],
+                "moe": ["bfloat16"],
+                "context_attention": ["fp8"],
+                "generation_attention": ["fp8"],
+            }
+
+    def fake_get_database(system, backend, version, database_mode=None):
+        return FakeDatabase()
+
+    monkeypatch.setattr(task_module, "get_database", fake_get_database)
+
+    task = TaskConfig(
+        serving_mode="agg",
+        model_path="Qwen/Qwen3-32B",
+        system_name="h200_sxm",
+        profiles=["fp8"],
+    )
+
+    assert _enum_name(task.config.worker_config.moe_quant_mode) == "fp8"
+
+
+def test_taskconfig_moe_model_validates_moe_quant_mode(monkeypatch):
+    class FakeDatabase:
+        def __init__(self):
+            self.system_spec = {"gpu": {"sm_version": 90}}
+            self.supported_quant_mode = {
+                "gemm": ["fp8"],
+                "moe": ["bfloat16"],
+                "context_attention": ["fp8"],
+                "generation_attention": ["fp8"],
+            }
+
+    def fake_get_database(system, backend, version, database_mode=None):
+        return FakeDatabase()
+
+    monkeypatch.setattr(task_module, "get_database", fake_get_database)
+
+    with pytest.raises(ValueError, match=r"Unsupported moe quant mode"):
+        TaskConfig(
+            serving_mode="agg",
+            model_path="Qwen/Qwen3-30B-A3B",
+            system_name="h200_sxm",
+            profiles=["fp8"],
+        )
+
+
 def test_taskconfig_sol_still_validates_quant_for_non_deepseek_v4(monkeypatch):
     class FakeDatabase:
         def __init__(self):
             self.system_spec = {"gpu": {"sm_version": 90}}
             self.supported_quant_mode = {"gemm": ["bfloat16"]}
 
-    def fake_get_database(system, backend, version):
+    def fake_get_database(system, backend, version, database_mode=None):
         return FakeDatabase()
 
     monkeypatch.setattr(task_module, "get_database", fake_get_database)
@@ -436,7 +520,7 @@ def test_taskconfig_quant_merge_uses_model_info_when_missing(monkeypatch):
                 "generation_attention": ["bfloat16"],
             }
 
-    def fake_get_database(system, backend, version):
+    def fake_get_database(system, backend, version, database_mode=None):
         return FakeDatabase()
 
     def fake_model_info(_path):
@@ -468,7 +552,7 @@ def test_taskconfig_quant_merge_preserves_explicit_values(monkeypatch):
                 "generation_attention": ["bfloat16"],
             }
 
-    def fake_get_database(system, backend, version):
+    def fake_get_database(system, backend, version, database_mode=None):
         return FakeDatabase()
 
     def fake_model_info(_path):
@@ -510,7 +594,7 @@ def test_taskconfig_quant_merge_deepseek_fmha_fallback(monkeypatch):
                 "generation_mla": ["fp8"],
             }
 
-    def fake_get_database(system, backend, version):
+    def fake_get_database(system, backend, version, database_mode=None):
         return FakeDatabase()
 
     def fake_model_info(_path):

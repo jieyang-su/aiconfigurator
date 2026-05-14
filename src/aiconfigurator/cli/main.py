@@ -29,6 +29,59 @@ from aiconfigurator.sdk.utils import ListFlowDumper, get_model_config_from_model
 logger = logging.getLogger(__name__)
 
 
+def _latest_support_matrix_version(
+    matrix: list[dict[str, str]],
+    system: str,
+    backend: str,
+    model: str | None = None,
+    architecture: str | None = None,
+) -> str | None:
+    """Pick the highest PEP 440 version for the relevant support-matrix rows.
+
+    Matches system and backend case-insensitively. When a model is provided,
+    exact-model rows win, then architecture rows. If neither model nor
+    architecture matches, return None instead of selecting an unrelated row.
+    """
+    rows = [
+        row for row in matrix if row["System"].lower() == system.lower() and row["Backend"].lower() == backend.lower()
+    ]
+
+    if model:
+        exact_rows = [row for row in rows if row["HuggingFaceID"].lower() == model.lower()]
+        if exact_rows:
+            rows = exact_rows
+        elif architecture:
+            architecture_rows = [row for row in rows if row["Architecture"] == architecture]
+            if architecture_rows:
+                rows = architecture_rows
+            else:
+                logger.debug(
+                    "No support-matrix rows match model=%s or architecture=%s for system=%s backend=%s",
+                    model,
+                    architecture,
+                    system,
+                    backend,
+                )
+                return None
+        else:
+            logger.debug(
+                "No exact support-matrix rows match model=%s for system=%s backend=%s and no architecture was provided",
+                model,
+                system,
+                backend,
+            )
+            return None
+
+    versions = [
+        (version, parsed)
+        for version in {row["Version"] for row in rows}
+        if (parsed := common.parse_support_matrix_version(version))
+    ]
+    if not versions:
+        return None
+    return max(versions, key=lambda version: version[1])[0]
+
+
 def _build_common_cli_parser() -> argparse.ArgumentParser:
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument("--debug", action="store_true", help="Enable debug mode.")
@@ -70,6 +123,13 @@ def _build_common_cli_experiments_parser() -> argparse.ArgumentParser:
         default="dynamo-j2",
         help="Deployment target platform. Options: dynamo-j2 (default, Jinja2 templates), "
         "dynamo-python (Dynamo Python config modifiers), llm-d (llm-d Helm values).",
+    )
+    common_parser.add_argument(
+        "--engine-step-backend",
+        choices=["python", "rust"],
+        default=None,
+        help="Experimental static latency backend. Default keeps the existing Python SDK path; "
+        "use 'rust' to route static step estimates through the Rust FPM estimator.",
     )
     add_generator_override_arguments(common_parser)
     return common_parser
@@ -123,7 +183,10 @@ def _add_default_mode_arguments(parser):
         "--system",
         type=str,
         required=True,
-        help="System name (GPU type). Example: h200_sxm,h100_sxm,b200_sxm,b300_sxm,gb200,a100_sxm,l40s,gb300.",
+        help=(
+            "System name (GPU type). Example: "
+            "h200_sxm,h100_sxm,h100_pcie,b200_sxm,b300_sxm,gb200,a100_sxm,a100_pcie,l40s,l4,a30,gb300."
+        ),
     )
     parser.add_argument(
         "--decode-system",
@@ -271,7 +334,10 @@ def _add_generate_mode_arguments(parser):
         "--system",
         type=str,
         required=True,
-        help="System name (GPU type). Example: h200_sxm,h100_sxm,b200_sxm,b300_sxm,gb200,a100_sxm,l40s,gb300.",
+        help=(
+            "System name (GPU type). Example: "
+            "h200_sxm,h100_sxm,h100_pcie,b200_sxm,b300_sxm,gb200,a100_sxm,a100_pcie,l40s,l4,a30,gb300."
+        ),
     )
     parser.add_argument(
         "--backend",
@@ -304,7 +370,10 @@ def _add_estimate_mode_arguments(parser):
         "--system",
         type=str,
         required=True,
-        help="System name (GPU type). Example: h200_sxm,h100_sxm,b200_sxm,b300_sxm,gb200,a100_sxm,l40s,gb300.",
+        help=(
+            "System name (GPU type). Example: "
+            "h200_sxm,h100_sxm,h100_pcie,b200_sxm,b300_sxm,gb200,a100_sxm,a100_pcie,l40s,l4,a30,gb300."
+        ),
     )
     parser.add_argument(
         "--decode-system",
@@ -490,7 +559,7 @@ def _add_support_mode_arguments(parser):
         type=str,
         required=True,
         help="System name (GPU type) or 'all' for a matrix view across every system. "
-        "Example: h200_sxm, h100_sxm, b200_sxm, b300_sxm, gb200, a100_sxm, l40s, gb300.",
+        "Example: h200_sxm, h100_sxm, h100_pcie, b200_sxm, b300_sxm, gb200, a100_sxm, a100_pcie, l40s, l4, a30, gb300.",
     )
     parser.add_argument(
         "--backend",
@@ -693,6 +762,7 @@ def build_default_task_configs(
     free_gpu_memory_fraction: float | None = None,
     max_seq_len: int | None = None,
     enable_wideep: bool = False,
+    engine_step_backend: str | None = None,
 ) -> dict[str, TaskConfig]:
     """Build agg and disagg task configs for default mode comparison.
 
@@ -715,6 +785,7 @@ def build_default_task_configs(
         nextn_accept_rates: Acceptance rates for MTP draft tokens.
         enable_chunked_prefill: Whether to enable chunked prefill for finer context token sweep.
         enable_wideep: Whether to enable Wide Expert Parallelism (WideEP) for MoE models.
+        engine_step_backend: Experimental static latency backend ("python" or "rust").
 
     Returns:
         Dict with TaskConfig objects. When backend='auto', returns 6 configs
@@ -732,6 +803,31 @@ def build_default_task_configs(
         for backend_name in backends_to_sweep:
             sys_backends = supported.get(system, {})
             decode_backends = supported.get(decode_system, {}) if decode_system != system else sys_backends
+            if database_mode != common.DatabaseMode.SILICON.name:
+                sys_versions = sys_backends.get(backend_name, [])
+                decode_versions = decode_backends.get(backend_name, [])
+                if not sys_versions or (decode_system != system and not decode_versions):
+                    logger.warning(
+                        "No measured database for backend %s on system=%s%s; including it for %s estimates.",
+                        backend_name,
+                        system,
+                        f", decode_system={decode_system}" if decode_system != system else "",
+                        database_mode,
+                    )
+                elif backend_version is not None and (
+                    backend_version not in sys_versions
+                    or (decode_system != system and backend_version not in decode_versions)
+                ):
+                    logger.warning(
+                        "No measured database version %s for backend %s on system=%s%s; including it for %s estimates.",
+                        backend_version,
+                        backend_name,
+                        system,
+                        f", decode_system={decode_system}" if decode_system != system else "",
+                        database_mode,
+                    )
+                available.append(backend_name)
+                continue
             if backend_name not in sys_backends:
                 logger.warning("Skipping backend %s: not supported for system %s.", backend_name, system)
                 continue
@@ -764,10 +860,31 @@ def build_default_task_configs(
             )
             raise SystemExit(1)
         backends_to_sweep = available
-    else:
+    elif database_mode == common.DatabaseMode.SILICON.name:
         _ensure_backend_version_available(system, backend, backend_version)
         if decode_system != system:
             _ensure_backend_version_available(decode_system, backend, backend_version)
+    else:
+        supported = perf_database.get_supported_databases()
+        for role, sys_name in (("prefill", system), ("decode", decode_system)):
+            versions = supported.get(sys_name, {}).get(backend, [])
+            if backend_version is not None and versions and backend_version not in versions:
+                logger.warning(
+                    "No measured database version %s for %s system=%s backend=%s; using %s estimates.",
+                    backend_version,
+                    role,
+                    sys_name,
+                    backend,
+                    database_mode,
+                )
+            elif not versions:
+                logger.warning(
+                    "No measured database for %s system=%s backend=%s; using estimate-only version with %s mode.",
+                    role,
+                    sys_name,
+                    backend,
+                    database_mode,
+                )
 
     common_kwargs: dict[str, Any] = {
         "model_path": model_path,
@@ -785,6 +902,7 @@ def build_default_task_configs(
         "free_gpu_memory_fraction": free_gpu_memory_fraction,
         "max_seq_len": max_seq_len,
         "enable_wideep": enable_wideep,
+        "engine_step_backend": engine_step_backend,
     }
 
     # Auto-set moe_backend for SGLang wideep, matching webapp behavior
@@ -874,6 +992,7 @@ _EXPERIMENT_RESERVED_KEYS = {
     "enable_eplb",
     "total_gpus",
     "database_mode",
+    "engine_step_backend",
 }
 
 
@@ -896,6 +1015,7 @@ def _build_yaml_config(exp_config: dict, config_section: dict) -> dict | None:
 def build_experiment_task_configs(
     yaml_path: str | None = None,
     config: dict[str, Any] | None = None,
+    engine_step_backend: str | None = None,
 ) -> dict[str, TaskConfig]:
     """Build task configs from YAML file or config dict.
 
@@ -903,6 +1023,8 @@ def build_experiment_task_configs(
         yaml_path: Path to a YAML file containing experiment definitions.
         config: Dict containing experiment definitions (alternative to yaml_path).
             Keys are experiment names, values are experiment configs.
+        engine_step_backend: Optional global experimental static-latency backend.
+            Per-experiment ``engine_step_backend`` entries take precedence.
 
     Returns:
         Dict mapping experiment names to TaskConfig objects.
@@ -1011,6 +1133,9 @@ def build_experiment_task_configs(
             task_kwargs["enable_chunked_prefill"] = exp_config["enable_chunked_prefill"]
         if "database_mode" in exp_config:
             task_kwargs["database_mode"] = exp_config["database_mode"]
+        effective_engine_step_backend = exp_config.get("engine_step_backend", engine_step_backend)
+        if effective_engine_step_backend is not None:
+            task_kwargs["engine_step_backend"] = effective_engine_step_backend
 
         yaml_config = _build_yaml_config(exp_config, config_section)
         if yaml_config:
@@ -1231,28 +1356,24 @@ def _run_support_matrix_mode(args):
     matrix = common.get_support_matrix()
     systems = sorted(common.SupportedSystems) if args.system == "all" else [args.system]
     backends = [b.value for b in common.BackendName] if args.backend == "all" else [args.backend]
-    existing_combos = {(row["System"], row["Backend"]) for row in matrix}
+    existing_combos = {(row["System"].lower(), row["Backend"].lower()) for row in matrix}
 
     results: dict[tuple[str, str], common.SupportResult | None] = {}
     has_inferred = False
 
     for system in systems:
         for be in backends:
-            if (system, be) not in existing_combos:
+            if (system.lower(), be.lower()) not in existing_combos:
                 results[(system, be)] = None
                 continue
 
             if version_filter:
                 version = version_filter
             else:
-                versions = sorted(
-                    {r["Version"] for r in matrix if r["System"] == system and r["Backend"] == be},
-                    reverse=True,
-                )
-                if not versions:
+                version = _latest_support_matrix_version(matrix, system, be, model=model, architecture=architecture)
+                if version is None:
                     results[(system, be)] = None
                     continue
-                version = versions[0]
 
             result = common.check_support(
                 model=model, system=system, backend=be, version=version, architecture=architecture
@@ -1320,21 +1441,28 @@ def _run_support_mode(args):
     backend = args.backend
     version = args.backend_version
 
-    # If no version specified, find the latest version in the support matrix
-    if not version:
-        matrix = common.get_support_matrix()
-        versions_for_combo = [row["Version"] for row in matrix if row["System"] == system and row["Backend"] == backend]
-        if versions_for_combo:
-            version = sorted(set(versions_for_combo), reverse=True)[0]
-
-    logger.info("Checking support for model=%s, system=%s, backend=%s, version=%s", model, system, backend, version)
-
     # Resolve architecture for better check
     try:
         model_info = get_model_config_from_model_path(model)
         architecture = model_info["architecture"]
     except Exception:
         architecture = None
+
+    # If no version specified, find the latest model-relevant version in the support matrix
+    if not version:
+        matrix = common.get_support_matrix()
+        version = _latest_support_matrix_version(matrix, system, backend, model=model, architecture=architecture)
+        if version is None:
+            logger.info(
+                "No valid support-matrix backend version found for model=%s system=%s backend=%s",
+                model,
+                system,
+                backend,
+            )
+            print("\nNo valid support-matrix backend version found for this model/system/backend combination.\n")
+            return
+
+    logger.info("Checking support for model=%s, system=%s, backend=%s, version=%s", model, system, backend, version)
 
     result = common.check_support(
         model=model, system=system, backend=backend, version=version, architecture=architecture
@@ -1452,6 +1580,7 @@ def _run_estimate_mode(args):
         comm_quant_mode=args.comm_quant_mode,
         free_gpu_memory_fraction=args.free_gpu_memory_fraction,
         max_seq_len=args.max_seq_len,
+        engine_step_backend=args.engine_step_backend,
     )
 
     if estimate_mode == "disagg":
@@ -1601,11 +1730,15 @@ def main(args):
             enable_chunked_prefill=args.enable_chunked_prefill,
             free_gpu_memory_fraction=args.free_gpu_memory_fraction,
             max_seq_len=args.max_seq_len,
+            engine_step_backend=args.engine_step_backend,
             enable_wideep=getattr(args, "enable_wideep", False),
         )
     elif args.mode == "exp":
         try:
-            task_configs = build_experiment_task_configs(yaml_path=args.yaml_path)
+            build_kwargs: dict[str, Any] = {"yaml_path": args.yaml_path}
+            if args.engine_step_backend is not None:
+                build_kwargs["engine_step_backend"] = args.engine_step_backend
+            task_configs = build_experiment_task_configs(**build_kwargs)
         except (ValueError, TypeError) as exc:
             logger.exception("Failed to build experiment task configs")
             raise SystemExit(1) from exc

@@ -76,7 +76,7 @@ try:
 except Exception:
     pass
 
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import get_forward_context, set_forward_context
 
 from collector.common_test_cases import get_common_moe_test_cases
 from collector.helper import balanced_logits, benchmark_with_power, get_sm_version, log_perf, power_law_logits_v3
@@ -87,13 +87,18 @@ aic_debug = int(os.getenv("aic_moe_debug", "0"))  # noqa: SIM112
 def get_moe_test_cases():
     """Generate MoE test cases"""
 
+    sm = get_sm_version()
+
     # Quantization types supported by vLLM
     moe_list = ["bfloat16", "int4_wo"]
-    if get_sm_version() > 86:
+    if sm > 86:
         moe_list += ["fp8"]
-    if get_sm_version() >= 90 and per_block_cast_to_fp8 is not None:
+    if sm >= 90 and per_block_cast_to_fp8 is not None:
         moe_list += ["fp8_block"]
-    if get_sm_version() >= 100 and _nvfp4_available:
+    # vLLM 0.19.0's FlashInfer TRTLLM FP4 MoE path is not compiled for
+    # RTX PRO 6000 Blackwell Server (SM120); it fails before benchmarking
+    # with "No supported CUDA architectures found for major versions [10]."
+    if sm >= 100 and _nvfp4_available and not (sm >= 120 and vllm_version.startswith("0.19.0")):
         moe_list += ["nvfp4"]
     if _mxfp4_available:
         moe_list += ["w4a16_mxfp4"]
@@ -551,14 +556,23 @@ def run_moe_torch(
                 ),
             )
 
+        def _mxfp4_forward(hs, rl):
+            # vLLM's custom MoE op increments a per-context layer index on
+            # each forward call.  We only register one layer, so reset the
+            # counter before every call to avoid an index-out-of-range error.
+            fwd_ctx = get_forward_context()
+            if hasattr(fwd_ctx, "moe_layer_index"):
+                fwd_ctx.moe_layer_index = 0
+            moe_module.forward(hs, rl)
+
         def run_single_iteration():
             if use_mxfp4:
                 # FusedMoE.forward(hidden_states, router_logits) does routing internally.
                 if distributed == "power_law":
                     for logits in actual_logits_list:
-                        moe_module.forward(hidden_states[: logits.shape[0]], logits[: logits.shape[0]])
+                        _mxfp4_forward(hidden_states[: logits.shape[0]], logits[: logits.shape[0]])
                 else:
-                    moe_module.forward(hidden_states, actual_logits)
+                    _mxfp4_forward(hidden_states, actual_logits)
             elif use_nvfp4:
                 if distributed == "power_law":
                     for tw, ti in zip(topk_weights_list, topk_ids_list, strict=True):
@@ -568,6 +582,8 @@ def run_moe_torch(
             elif distributed == "power_law":
                 for i, (tw, ti) in enumerate(zip(topk_weights_list, topk_ids_list, strict=True)):
                     local_num_tokens = tw.shape[0]
+                    if use_int4_wo:
+                        tw = tw.float()
                     _ = fused_experts(
                         hidden_states[:local_num_tokens],
                         w1,
@@ -580,11 +596,12 @@ def run_moe_torch(
                         expert_map=expert_map,
                     )
             else:
+                routed_weights = topk_weights.float() if use_int4_wo else topk_weights
                 _ = fused_experts(
                     hidden_states,
                     w1,
                     w2,
-                    topk_weights,
+                    routed_weights,
                     topk_ids,
                     inplace=False,
                     quant_config=quant_config,

@@ -719,6 +719,9 @@ def parallel_run(tasks, func, num_processes, module_name="unknown", resume_optio
             # all tasks are dispatched, otherwise the new worker blocks
             # forever on queue.get().
             for i, p in enumerate(processes):
+                if p is None:
+                    continue
+
                 if not p.is_alive():
                     exit_code = p.exitcode
                     active_task_id = current_task_ids.get(i)
@@ -754,17 +757,18 @@ def parallel_run(tasks, func, num_processes, module_name="unknown", resume_optio
 
                     if process_stats[i]["restarts"] > 8192:
                         logger.error(f"Process {i} exceeded restart limit, not restarting")
+                        processes[i] = None
+                        continue
+
+                    if consumed_sentinel.get(i, False):
+                        processes[i] = None
                         continue
 
                     remaining = len(task_infos) - progress_value.value
                     if remaining > 0:
-                        need_sentinel = consumed_sentinel.get(i, False)
-                        consumed_sentinel[i] = False
                         processes[i] = start_process(i)
-                        if need_sentinel:
-                            queue.put(None)
                     else:
-                        processes[i] = p  # keep dead process ref, skip restart
+                        processes[i] = None
 
             current = progress_value.value
             if current > pbar.n:
@@ -782,6 +786,8 @@ def parallel_run(tasks, func, num_processes, module_name="unknown", resume_optio
 
     # Wait for processes
     for p in processes:
+        if p is None:
+            continue
         p.join(timeout=42)
         if p.is_alive():
             logger.warning(f"Process {p.pid} did not terminate, forcing...")
@@ -1174,13 +1180,14 @@ def main():
         os.environ["COLLECTOR_MODEL_PATH"] = args.model_path
 
         # V4-Flash special-case: when the model is V4-Flash and no explicit
-        # ``--ops`` is given, scope to the V4-Flash ops only (skip generic
-        # gemm / attention / mla / ... that aren't consumed by V4's perf
-        # model).  All other models keep the default behaviour: run every
-        # op and let each get_func's ``_filter_model_config_list`` filter
-        # cases at the test-case level.
-        if args.ops is None and args.model_path == "deepseek-ai/DeepSeek-V4-Flash":
-            ops = [name for name in _all_op_names() if name.startswith("dsv4_flash_")]
+        # ``--ops`` is given, scope to the ops consumed by the V4-Flash
+        # perf model: V4 Flash attention/sparse kernels plus generic GEMM,
+        # MoE, and mHC.  All other models keep the default behaviour: run
+        # every op and let each get_func's ``_filter_model_config_list``
+        # filter cases at the test-case level.
+        if args.ops is None and args.model_path == "sgl-project/DeepSeek-V4-Flash-FP8":
+            dsv4_flash_ops = [name for name in _all_op_names() if name.startswith("dsv4_flash_")]
+            ops = dsv4_flash_ops + ["gemm", "moe", "mhc_module"]
             _dsv4_auto_expand = True
     else:
         os.environ.pop("COLLECTOR_MODEL_PATH", None)
@@ -1188,8 +1195,8 @@ def main():
 
     # Setup logging - debug flag is handled inside setup_logging
     if logger is None:
-        # Use short label when V4-Flash auto-expanded ops to 8 names
-        # (the joined scope would exceed Linux filename length limit).
+        # Use short label when V4-Flash auto-expanded ops to several names
+        # (the joined scope may exceed Linux filename length limit).
         if _dsv4_auto_expand:
             log_scope = ["dsv4_flash"]
         else:

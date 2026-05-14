@@ -738,20 +738,8 @@ def get_common_gdn_test_cases() -> list[GdnCommonTestCase]:
 # Both backends re-export the relevant ``get_*`` functions so collect.py
 # can resolve them via getattr on each per-backend module.
 
-_DSV4_FLASH_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
-_DSV4_FLASH_SUPPORTED_MODELS = (
-    _DSV4_FLASH_DEFAULT_MODEL,
-    "sgl-project/DeepSeek-V4-Flash-FP8",
-)
+_DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_ATTN_KINDS = ("csa", "hca")
-
-
-def _dsv4_flash_model_path() -> str:
-    """Return the active V4-Flash model id for generated test cases."""
-    filt = _get_model_path_filter()
-    if filt in _DSV4_FLASH_SUPPORTED_MODELS:
-        return filt
-    return _DSV4_FLASH_DEFAULT_MODEL
 
 
 def _dsv4_flash_active() -> bool:
@@ -762,7 +750,13 @@ def _dsv4_flash_active() -> bool:
     cases so the collector skips it.
     """
     filt = _get_model_path_filter()
-    return filt is None or filt in _DSV4_FLASH_SUPPORTED_MODELS
+    return filt is None or filt == _DSV4_FLASH_MODEL_PATH
+
+
+def _dsv4_flash_model_path() -> str:
+    """Return the active V4-Flash model id for generated test cases."""
+    filt = _get_model_path_filter()
+    return filt if filt is not None else _DSV4_FLASH_MODEL_PATH
 
 
 # --- Module-level (full self_attn) sweep ---
@@ -806,6 +800,35 @@ _DSV4_FLASH_MODULE_SEQ_LENGTHS = [
 _DSV4_FLASH_MODULE_TP_SIZES = [1, 2, 4, 8]
 
 
+def _has_native_fp4_experts() -> bool:
+    """True when the device has native FP4 tensor cores (Blackwell sm_100+).
+
+    DSv4-Flash's checkpoint ships routed experts in FP4. When the collector
+    sets ``server_args.quantization="fp8"`` (our ``gemm_type="fp8_block"``
+    sweep) sglang's FusedMoE quant_method tries to materialize these
+    experts. The fork-specific check in ``sglang/srt/layers/quantization/
+    fp8.py:process_weights_after_loading_block_quant`` raises
+    ``NotImplementedError: DeepSeekV4 FP4 experts now require a native FP4
+    MoE backend.`` before any ``ignored_layers`` / ``is_layer_skipped``
+    logic gets a chance — both the upstream ``SGLANG_FP8_IGNORED_LAYERS``
+    env var and ``quantization_config.ignored_layers`` are bypassed by
+    that hard-coded check. The sglang error message suggests
+    ``--moe-runner-backend marlin``, but Marlin software-emulates FP4 with
+    INT4 unpack + bf16 compute, producing perf numbers that don't reflect
+    how DSv4-Flash actually deploys on Hopper. So we skip the fp8_block
+    sweep on pre-Blackwell entirely; the bfloat16 sweep still runs and
+    measures the projection path Hopper would deploy.
+    """
+    try:
+        import torch as _t
+
+        if not _t.cuda.is_available():
+            return False
+        return _t.cuda.get_device_capability(0)[0] >= 10
+    except Exception:
+        return False
+
+
 def _dsv4_flash_module_precision_combos(phase: str):
     """``(compute_dtype, kv_cache_dtype, gemm_type)`` triples.
 
@@ -814,12 +837,20 @@ def _dsv4_flash_module_precision_combos(phase: str):
       * ``bfloat16``  — projections through cuBLASLt nvjet kernels
       * ``fp8_block`` — fp8 block-quantised weights → DeepGEMM
                         ``sm90_fp8_gemm_1d2d_impl`` (matches production)
+
+    ``fp8_block`` is omitted on pre-Blackwell parts; see
+    ``_has_native_fp4_experts`` for the kernel-side rationale.
     """
     del phase
-    return [
-        ("bfloat16", "fp8", "bfloat16"),
-        ("bfloat16", "fp8", "fp8_block"),
-    ]
+    combos = [("bfloat16", "fp8", "bfloat16")]
+    if _has_native_fp4_experts():
+        combos.append(("bfloat16", "fp8", "fp8_block"))
+    else:
+        print(
+            "[dsv4-flash-test-cases] device lacks native FP4 experts (pre-Blackwell); "
+            "omitting fp8_block from gemm_type sweep"
+        )
+    return combos
 
 
 def _dsv4_flash_module_filter_pairs(mode: str, batch_sizes, seq_lens):
@@ -1006,8 +1037,8 @@ def _build_dsv4_flash_sparse_test_cases(
     past_kv_list = list(past_kv_list) if past_kv_list is not None else list(_DSV4_FLASH_SPARSE_PAST_KV_LIST)
     tp_list_attn = list(tp_list_attn) if tp_list_attn is not None else list(_DSV4_FLASH_SPARSE_TP_LIST_ATTN)
     tp_list_indexer = list(tp_list_indexer) if tp_list_indexer is not None else list(_DSV4_FLASH_SPARSE_TP_LIST_INDEXER)
-
     model_path = _dsv4_flash_model_path()
+
     cases = []
     for kernel in kernels:
         tp_list = tp_list_attn if kernel == "hca_attn" else tp_list_indexer

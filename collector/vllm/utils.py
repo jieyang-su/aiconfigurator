@@ -250,6 +250,10 @@ def create_vllm_config(
     hf_config_override: dict | None = None,
     use_fp8_kv_cache: bool = False,
     trust_remote_code: bool = False,
+    sliding_window: int | None = None,
+    head_dim: int | None = None,
+    num_heads: int | None = None,
+    num_kv_heads: int | None = None,
 ) -> VllmConfig:
     """Create a VllmConfig for testing with reasonable defaults."""
 
@@ -303,14 +307,40 @@ def create_vllm_config(
         import types
 
         model_config.get_num_layers = types.MethodType(lambda self: 1, model_config)
-        model_config.get_sliding_window_for_layer = types.MethodType(lambda self, i: None, model_config)
+        _sw = sliding_window
+        model_config.get_sliding_window_for_layer = types.MethodType(lambda self, i: _sw, model_config)
         model_config.get_logits_soft_cap_for_layer = types.MethodType(lambda self, i: 0.0, model_config)
         model_config.get_sm_scale_for_layer = types.MethodType(
             lambda self, i: 1.0 / model_config.get_head_size() ** 0.5, model_config
         )
 
+    if sliding_window is not None:
+        model_config.hf_text_config.sliding_window = sliding_window
+
     if hf_config_override:
         model_config.hf_config.update(hf_config_override)
+    if head_dim is not None:
+        model_config.hf_config.head_dim = head_dim
+        model_config.model_arch_config.head_size = head_dim
+    # ModelConfig.model_arch_config is built once from hf_config in __init__,
+    # so mutating hf_config alone leaves the cached arch values stale. Backends
+    # such as the V1 FA3 builder read num_heads/kv_heads via
+    # ModelConfig.get_num_attention_heads / get_num_kv_heads, which look at
+    # model_arch_config — without these overrides the AOT scheduler builds
+    # scheduler_metadata for the fake model's defaults (16 q-heads / 8 kv-heads)
+    # while the kernel call runs with the test's actual head counts, and FA3's
+    # shape check rejects the mismatched scheduler_metadata. The hasattr guards
+    # let this degrade gracefully on older vLLM where the attribute names may
+    # differ (the FA3 bug only exists from vllm>=0.19 anyway).
+    arch_cfg = getattr(model_config, "model_arch_config", None)
+    if num_heads is not None:
+        model_config.hf_config.num_attention_heads = num_heads
+        if arch_cfg is not None and hasattr(arch_cfg, "total_num_attention_heads"):
+            arch_cfg.total_num_attention_heads = num_heads
+    if num_kv_heads is not None:
+        model_config.hf_config.num_key_value_heads = num_kv_heads
+        if arch_cfg is not None and hasattr(arch_cfg, "total_num_kv_heads"):
+            arch_cfg.total_num_kv_heads = num_kv_heads
 
     return VllmConfig(
         model_config=model_config,

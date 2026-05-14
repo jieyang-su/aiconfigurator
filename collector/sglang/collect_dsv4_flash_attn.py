@@ -23,6 +23,10 @@ Manual CLI use::
         --batch-sizes 1,4 --seq-lens 128,1024
 """
 
+# Requires an SGLang build with DeepSeek-V4 support. Stock lmsysorg/sglang:v*
+# images may not include the required deepseek_v4 modules; use a
+# deepseek-v4-blackwell/deepseek-v4-grace-blackwell image or matching Dynamo
+# sglang-runtime:*deepseek-v4* image.
 from __future__ import annotations
 
 import argparse
@@ -31,7 +35,6 @@ import copy
 import gc
 import json
 import os
-import random
 import shutil
 import socket
 import subprocess
@@ -165,24 +168,45 @@ def _dsv4_fp4_experts_override(model_path: str) -> bool | None:
     return _DSV4_FP4_EXPERTS_OVERRIDES.get(model_path)
 
 
+_PORTS_PER_GPU = 1000
+_DSV4_FLASH_PORT_RETRIES = 5
+
+
+def _port_is_available(port: int) -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # TCPStore may listen on any local interface; check the same address
+        # family instead of only 127.0.0.1.
+        s.bind(("0.0.0.0", port))
+        s.listen(1)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _nccl_port_for_attempt(gpu_id: int, attempt: int) -> int:
+    """Use a deterministic, GPU-scoped TCPStore port."""
+    return 40000 + gpu_id * _PORTS_PER_GPU + attempt
+
+
 def _pick_free_port(gpu_id: int) -> int:
-    """Return a candidate TCP port from a ``gpu_id``-scoped 1000-port range.
+    """Return a free TCP port from a ``gpu_id``-scoped 1000-port range.
+
+    Used as ``nccl_port`` for the per-subprocess torch.distributed
+    rendezvous.  Kept as a fallback for direct/manual use; normal
+    collect.py entrypoints pass ``AIC_DSV4_FLASH_NCCL_PORT`` explicitly.
 
     The bind / close probe is only advisory: another process may still grab
     the port before torch.distributed binds it.  Callers should retry on
     ``EADDRINUSE`` during ModelRunner initialization.
     """
-    base = 40000 + gpu_id * 1000
-    for _ in range(100):
-        port = random.randint(base, base + 999)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.bind(("127.0.0.1", port))
-        except OSError:
-            s.close()
-            continue
-        s.close()
-        return port
+    base = _nccl_port_for_attempt(gpu_id, 0)
+    for offset in range(_PORTS_PER_GPU):
+        port = _nccl_port_for_attempt(gpu_id, offset)
+        if _port_is_available(port):
+            return port
     raise RuntimeError(f"no free port in [{base}, {base + 999}] for gpu_id={gpu_id}")
 
 
@@ -493,6 +517,10 @@ def _load_model_runner(
         gemm_type=gemm_type,
     )
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+    # CUDA_VISIBLE_DEVICES remaps every child to cuda:0; keep the physical GPU
+    # id for NCCL port sharding so parallel workers do not collide.
+    port_shard = int(os.environ.get("AIC_DSV4_FLASH_PORT_SHARD", gpu_id))
+    nccl_port = int(os.environ.get("AIC_DSV4_FLASH_NCCL_PORT") or _pick_free_port(port_shard))
 
     server_args = ServerArgs(
         model_path=local_model_path,
@@ -536,7 +564,7 @@ def _load_model_runner(
         f"max_total_tokens={max_total_tokens}, shrink_unused_moe={shrink_unused_moe}, "
         f"disable_weight_quant={disable_weight_quant}, gemm_type={gemm_type}, "
         f"quantization={server_args.quantization}, moe_runner_backend={server_args.moe_runner_backend}, "
-        f"tp_size={tp_size}"
+        f"tp_size={tp_size}, nccl_port={nccl_port}"
     )
     fp4_experts_override = _dsv4_fp4_experts_override(model_path)
     with contextlib.ExitStack() as stack:
@@ -552,9 +580,10 @@ def _load_model_runner(
         model_config = ModelConfig.from_server_args(server_args)
         with _tp_load_model_patch(tp_size):
             model_runner = None
-            max_port_attempts = 8
+            max_port_attempts = max(1, _DSV4_FLASH_PORT_RETRIES)
+            explicit_nccl_port = os.environ.get("AIC_DSV4_FLASH_NCCL_PORT")
             for port_attempt in range(max_port_attempts):
-                nccl_port = _pick_free_port(gpu_id)
+                attempt_nccl_port = nccl_port if port_attempt == 0 else _pick_free_port(port_shard)
                 try:
                     model_runner = ModelRunner(
                         model_config=model_config,
@@ -566,15 +595,17 @@ def _load_model_runner(
                         pp_size=1,
                         moe_ep_rank=0,
                         moe_ep_size=1,
-                        nccl_port=nccl_port,
+                        nccl_port=attempt_nccl_port,
                         server_args=server_args,
                     )
+                    nccl_port = attempt_nccl_port
                     break
                 except Exception as exc:
                     if not _is_port_in_use_error(exc) or port_attempt == max_port_attempts - 1:
                         raise
                     print(
-                        f"[dsv4-collector] nccl_port={nccl_port} busy during init; "
+                        f"[dsv4-collector] nccl_port={attempt_nccl_port} busy during init; "
+                        f"requested_via={'env' if port_attempt == 0 and explicit_nccl_port else 'fallback'}; "
                         f"retrying ({port_attempt + 1}/{max_port_attempts - 1})"
                     )
                     torch.cuda.empty_cache()
@@ -988,6 +1019,11 @@ def run_dsv4_mla_module(
     version = get_version("sglang")
     device_name = torch.cuda.get_device_name(device)
     results = []
+    # Per-shape failures are surfaced both inline (one [WARN] line per failure)
+    # and as a single [WARN] summary at the end of the worker, so partial-coverage
+    # gaps are visible to the user without having to dig through tracebacks.
+    skipped_shapes: list[tuple[int, int, str]] = []
+    sweep_label = f"kind={attn_kind} mode={mode} tp={tp_size} gemm={gemm_type}"
     try:
         for batch_size in batch_sizes:
             for seq_len in seq_lens:
@@ -1048,20 +1084,56 @@ def run_dsv4_mla_module(
                     )
                     results.append(stats)
                 except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):
-                    print(f"  OOM: batch_size={batch_size}, seq_len={seq_len}; skipping")
-                    torch.cuda.empty_cache()
-                except Exception:
+                    print(f"[WARN] dsv4-flash {sweep_label} bs={batch_size} sl={seq_len}: OOM; skipping this shape")
+                    skipped_shapes.append((batch_size, seq_len, "OOM"))
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                except Exception as exc:
                     traceback.print_exc()
-                    print("  failed; skipping this shape")
+                    print(
+                        f"[WARN] dsv4-flash {sweep_label} bs={batch_size} sl={seq_len}: "
+                        f"{type(exc).__name__}; skipping this shape"
+                    )
+                    skipped_shapes.append((batch_size, seq_len, type(exc).__name__))
                 finally:
-                    model_runner.req_to_token_pool.clear()
-                    model_runner.token_to_kv_pool_allocator.clear()
-                    torch.cuda.empty_cache()
-                    gc.collect()
+                    # When a kernel raises CUBLAS_STATUS_EXECUTION_FAILED or similar
+                    # the CUDA context can be poisoned. Subsequent allocator/empty_cache
+                    # calls then fail with cudaErrorIllegalAddress, which would propagate
+                    # out of the worker subprocess (exit=1) and discard data already
+                    # collected from earlier shapes in this same (bs, gemm, tp) sweep.
+                    # Swallow cleanup-time CUDA errors so the worker exits cleanly with
+                    # whatever shapes it already finished. Cleanup failures are logged
+                    # as a [WARN] line so the user knows the context is degraded.
+                    for _cleanup_label, _cleanup_step in (
+                        ("req_to_token_pool.clear", model_runner.req_to_token_pool.clear),
+                        ("token_to_kv_pool_allocator.clear", model_runner.token_to_kv_pool_allocator.clear),
+                        ("torch.cuda.empty_cache", torch.cuda.empty_cache),
+                        ("gc.collect", gc.collect),
+                    ):
+                        try:
+                            _cleanup_step()
+                        except Exception as _cleanup_exc:
+                            print(
+                                f"[WARN] dsv4-flash {sweep_label} bs={batch_size} sl={seq_len}: "
+                                f"cleanup step '{_cleanup_label}' failed with "
+                                f"{type(_cleanup_exc).__name__}; CUDA context likely poisoned, "
+                                "remaining shapes in this sweep may be unreliable"
+                            )
     finally:
-        del model_runner
-        torch.cuda.empty_cache()
-        gc.collect()
+        try:
+            del model_runner
+            torch.cuda.empty_cache()
+            gc.collect()
+        except Exception:
+            pass
+    if skipped_shapes:
+        skipped_str = ", ".join(f"(bs={b},sl={s},reason={r})" for b, s, r in skipped_shapes)
+        print(
+            f"[WARN] dsv4-flash {sweep_label}: SWEEP SUMMARY — {len(skipped_shapes)} of "
+            f"{len(skipped_shapes) + len(results)} shapes failed: {skipped_str}"
+        )
     return results
 
 
@@ -1090,6 +1162,7 @@ def _run_subprocess(
     """
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = resolve_subprocess_visible_device(gpu_id)
+    env["AIC_DSV4_FLASH_PORT_SHARD"] = str(gpu_id)
     env.setdefault("SGLANG_APPLY_CONFIG_BACKUP", "none")
     env.setdefault("SGLANG_LOAD_FORMAT", "dummy")
     # Hard-disable DeepGEMM bulk pre-compile.  First sl in this sweep
@@ -1112,30 +1185,65 @@ def _run_subprocess(
         f")\n"
     )
 
-    proc = subprocess.Popen(
-        [sys.executable, "-c", code],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        cwd=os.path.dirname(os.path.abspath(__file__)),
+    # Persist subprocess output to a per-task log so we can inspect failures
+    # even when the child dies before stdout is streamed (e.g. OOM kill).
+    log_dir = os.path.join(tempfile.gettempdir(), "dsv4_flash_subproc_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(
+        log_dir,
+        f"{attn_kind}_{mode}_bs{batch_size}_tp{tp_size}_{gemm_type}_gpu{gpu_id}.log",
     )
-    output_text = ""
-    try:
-        stdout, _ = proc.communicate(timeout=3600)  # up to 1 hour per (kind, tp, gemm, bs)
-        output_text = stdout.decode("utf-8", errors="replace") if stdout else ""
-        if output_text:
-            print(output_text)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, _ = proc.communicate()
-        output_text = stdout.decode("utf-8", errors="replace") if stdout else ""
 
-    if proc.returncode != 0:
-        output_tail = output_text[-4000:].strip()
+    def _run_once(nccl_port: int) -> tuple[int, str]:
+        attempt_env = env.copy()
+        attempt_env["AIC_DSV4_FLASH_NCCL_PORT"] = str(nccl_port)
+        with open(log_path, "wb") as logf:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", code],
+                env=attempt_env,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+            try:
+                proc.wait(timeout=3600)  # up to 1 hour per (kind, tp, gemm, bs)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as logf:
+                log_text = logf.read()
+        except OSError:
+            log_text = ""
+
+        # Echo the log so it shows up in the parent's collector log.
+        if log_text:
+            print(log_text)
+        return proc.returncode, log_text
+
+    max_attempts = max(1, _DSV4_FLASH_PORT_RETRIES)
+    for attempt in range(max_attempts):
+        nccl_port = _nccl_port_for_attempt(gpu_id, attempt)
+        returncode, log_text = _run_once(nccl_port)
+
+        if returncode == 0:
+            return
+
+        is_port_race = "EADDRINUSE" in log_text or "address already in use" in log_text.lower()
+        if is_port_race and attempt + 1 < max_attempts:
+            print(
+                f"[dsv4-collector] retrying after NCCL/TCPStore port collision "
+                f"on nccl_port={nccl_port} ({attempt + 1}/{max_attempts}); log: {log_path}"
+            )
+            continue
+
+        output_tail = log_text[-4000:].strip()
         detail = f"\n--- child output tail ---\n{output_tail}" if output_tail else ""
         raise RuntimeError(
             f"dsv4_flash_{attn_kind}_{mode} subprocess failed for "
-            f"(bs={batch_size}, tp={tp_size}, gemm={gemm_type}); exit={proc.returncode}"
+            f"(bs={batch_size}, tp={tp_size}, gemm={gemm_type}); "
+            f"exit={returncode}; log: {log_path}"
             f"{detail}"
         )
 

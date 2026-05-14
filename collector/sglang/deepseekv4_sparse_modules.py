@@ -27,9 +27,14 @@ shared): ``isl`` carries M, ``step`` carries past_kv, ``compress_ratio``
 distinguishes CSA(=4) / HCA(=128).
 """
 
+# Requires an SGLang build with DeepSeek-V4 support. Stock lmsysorg/sglang:v*
+# images may not include the required deepseek_v4 modules; use a
+# deepseek-v4-blackwell/deepseek-v4-grace-blackwell image or matching Dynamo
+# sglang-runtime:*deepseek-v4* image.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import sys
 import traceback
@@ -47,7 +52,7 @@ except ModuleNotFoundError:
 # module so collect.py's registry can resolve them via getattr on this module.
 try:
     from collector.common_test_cases import (
-        _DSV4_FLASH_DEFAULT_MODEL as DEFAULT_MODEL,
+        _DSV4_FLASH_MODEL_PATH as DEFAULT_MODEL,
     )
     from collector.common_test_cases import (
         _DSV4_FLASH_SPARSE_BS_LIST as DEFAULT_BS_LIST,
@@ -70,7 +75,7 @@ try:
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from common_test_cases import (
-        _DSV4_FLASH_DEFAULT_MODEL as DEFAULT_MODEL,
+        _DSV4_FLASH_MODEL_PATH as DEFAULT_MODEL,
     )
     from common_test_cases import (
         _DSV4_FLASH_SPARSE_BS_LIST as DEFAULT_BS_LIST,
@@ -95,12 +100,16 @@ except ModuleNotFoundError:
 def get_dsv4_flash_paged_mqa_logits_test_cases():
     from collector.common_test_cases import get_dsv4_flash_paged_mqa_logits_test_cases as _impl
 
+    if not _dsv4_sparse_kernel_supported("paged_mqa_logits"):
+        return []
     return _impl()
 
 
 def get_dsv4_flash_hca_attn_test_cases():
     from collector.common_test_cases import get_dsv4_flash_hca_attn_test_cases as _impl
 
+    if not _dsv4_sparse_kernel_supported("hca_attn"):
+        return []
     return _impl()
 
 
@@ -146,8 +155,10 @@ PAGE_SIZE_FULL = 64  # FlashMLA paged block_size
 DEFAULT_ARCHITECTURE = "DeepseekV4ForCausalLM"
 
 
-def _get_num_sms(device: str) -> int:
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+def _device_num_sms(device: str | torch.device) -> int:
+    """Return the actual SM count of ``device`` (the kernel sizes
+    ``schedule_meta`` from this and asserts ``_schedule_meta_size == num_sms + 1``)."""
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 # Two kernels are benched at the kernel level:
@@ -186,6 +197,24 @@ KERNEL_TO_DEFAULT_FILENAME = {
     "paged_mqa_logits": "dsv4_flash_paged_mqa_logits_module_perf.txt",
     "hca_attn": "dsv4_flash_hca_attn_module_perf.txt",
 }
+
+
+def _dsv4_sparse_kernel_supported(kernel: str) -> bool:
+    """Return True when the active runtime can execute a DSV4 sparse kernel."""
+    if os.environ.get("COLLECTOR_FORCE_DSV4_FLASH_SPARSE") == "1":
+        return True
+    if kernel == "hca_attn":
+        return importlib.util.find_spec("flash_mla") is not None
+    if kernel == "paged_mqa_logits":
+        if importlib.util.find_spec("deep_gemm") is None:
+            return False
+        if torch.cuda.is_available():
+            major, _minor = torch.cuda.get_device_capability()
+            if major >= 12:
+                return False
+        return True
+    raise ValueError(f"unknown DSV4 sparse kernel: {kernel}")
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Bench helper
@@ -302,8 +331,19 @@ def _quantize_k_cache_model1(k_bf16: torch.Tensor) -> torch.Tensor:
         scale_inv = scale_inv.unsqueeze(-1)
         nope[:, :, s:e] = (k[..., s:e].float() / scale_inv.float()).to(torch.float8_e4m3fn)
 
-    # Reshape sliced (unpadded) view to (num_blocks, block_size, 1, bytes_per_token)
-    return out_view.view(num_blocks, block_size, 1, bytes_per_token)
+    # Return a view whose stride(0) is the padded per-block size — FlashMLA's
+    # MODEL1 path asserts ``k_cache.stride(0) % TMA_K_STRIDE == 0`` (with
+    # TMA_K_STRIDE = D_NOPE + 2*D_ROPE = 576), and ``bytes_per_token * block_size``
+    # = 37376 is *not* a multiple of 576, so we need the per-block padding to be
+    # visible in the tensor's stride. ``.view`` collapses stride(0) to the
+    # contiguous value when num_blocks == 1, breaking the assertion for small
+    # shapes; ``as_strided`` lets us pin stride(0) to size_per_block_padded for
+    # any num_blocks.
+    return out.as_strided(
+        size=(num_blocks, block_size, 1, bytes_per_token),
+        stride=(size_per_block_padded, bytes_per_token, bytes_per_token, 1),
+        storage_offset=0,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -357,7 +397,7 @@ def _bench_paged_mqa_logits(M: int, past_kv: int, *, batch_size: int = 1, device
     block_table = torch.arange(blocks_per_req, dtype=torch.int32, device=device)
     block_table = block_table.unsqueeze(0).expand(b, blocks_per_req).contiguous()
 
-    schedule_meta = get_paged_mqa_logits_metadata(context_lens, block_kv, _get_num_sms(device))
+    schedule_meta = get_paged_mqa_logits_metadata(context_lens, block_kv, _device_num_sms(device))
 
     def kernel_fn():
         return fp8_paged_mqa_logits(q, kv_in, weights, context_lens, block_table, schedule_meta, int(full_c4), False)
@@ -657,9 +697,9 @@ def run_dsv4_sparse_kernel_worker(
         return
     except Exception:
         traceback.print_exc()
-        print(f"  failed at bs={bs} isl={isl} past_kv={past_kv}; skipping")
+        print(f"  failed at bs={bs} isl={isl} past_kv={past_kv}")
         torch.cuda.empty_cache()
-        return
+        raise
 
     latency_ms = float(bench_result["latency_ms"])
     power_stats = bench_result.get("power_stats")
