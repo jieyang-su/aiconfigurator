@@ -199,6 +199,24 @@ class PerfDataNotAvailableError(RuntimeError):
     """Raised when required performance data is missing or unsupported for a requested mode."""
 
 
+def has_perf_data_not_available_cause(error: BaseException) -> bool:
+    """Return True when an exception or chained cause is a structured perf-data miss."""
+    seen: set[int] = set()
+    stack: list[BaseException] = [error]
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        if isinstance(current, PerfDataNotAvailableError):
+            return True
+        seen.add(id(current))
+        if current.__cause__ is not None:
+            stack.append(current.__cause__)
+        if current.__context__ is not None:
+            stack.append(current.__context__)
+    return False
+
+
 @functools.cache
 def _load_op_kernel_source_manifest_entries(systems_root: str) -> dict[str, tuple[dict, ...]]:
     """Load `<systems_root>/op_kernel_source_manifest.yaml` and group entries by op_file.
@@ -4192,6 +4210,36 @@ class PerfDatabase:
         """Thin wrapper — delegates to ``interpolation.interp_dsa_context_topk_piecewise_from_raw``."""
         return interpolation.interp_dsa_context_topk_piecewise_from_raw(num_heads, full_s, b, dsa_dict, index_topk)
 
+    @staticmethod
+    def _is_dsa_interpolation_miss(error: Exception) -> bool:
+        message = str(error)
+        return isinstance(error, ValueError) and (
+            "x is not equal to the only value in the list" in message
+            or "x is less than the smallest value in the list" in message
+            or "x is greater than the largest value in the list" in message
+        )
+
+    @staticmethod
+    def _format_dsa_unavailable_message(
+        phase: str,
+        error: Exception,
+        *,
+        b: int,
+        s: int,
+        num_heads: int,
+        architecture: str,
+        index_n_heads: int,
+        index_head_dim: int,
+        index_topk: int,
+        prefix: int | None = None,
+    ) -> str:
+        prefix_part = "" if prefix is None else f", prefix={prefix}"
+        return (
+            f"{phase} DSA module perf data unavailable for candidate "
+            f"b={b}, s={s}{prefix_part}, num_heads={num_heads}, architecture={architecture}, "
+            f"index_n_heads={index_n_heads}, index_head_dim={index_head_dim}, index_topk={index_topk}: {error}"
+        )
+
     def _get_sample_leaf_value(self, data: dict):
         """Thin wrapper — delegates to ``interpolation.get_sample_leaf_value``."""
         return interpolation.get_sample_leaf_value(data)
@@ -7661,6 +7709,20 @@ class PerfDatabase:
                     latency = result["latency"]
                     energy = result.get("energy", 0.0)
                 except Exception as exc:
+                    if self._is_dsa_interpolation_miss(exc):
+                        message = self._format_dsa_unavailable_message(
+                            "Context",
+                            exc,
+                            b=b,
+                            s=s,
+                            prefix=prefix,
+                            num_heads=num_heads,
+                            architecture=architecture,
+                            index_n_heads=index_n_heads,
+                            index_head_dim=index_head_dim,
+                            index_topk=index_topk,
+                        )
+                        raise PerfDataNotAvailableError(message) from exc
                     raise missing_context_dsa_error() from exc
                 if prefix > 0:
                     base_sol = get_sol(b, full_s, 0, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
@@ -7831,15 +7893,41 @@ class PerfDatabase:
                     raise missing_generation_dsa_error() from exc
                 try:
                     result = self._interp_3d(num_heads, b, s, dsa_dict, "cubic")
-                except Exception:
+                except Exception as cubic_exc:
                     logger.debug(
                         "Failed cubic interpolation for generation DSA module; retrying with linear interpolation. "
                         f"{b=}, {s=}, {num_heads=}, {architecture=}, {kv_cache_dtype=}, {gemm_quant_mode=}."
                     )
                     try:
                         result = self._interp_3d(num_heads, b, s, dsa_dict, "linear")
-                    except Exception as exc:
-                        raise missing_generation_dsa_error() from exc
+                    except Exception as linear_exc:
+                        if self._is_dsa_interpolation_miss(cubic_exc):
+                            message = self._format_dsa_unavailable_message(
+                                "Generation",
+                                cubic_exc,
+                                b=b,
+                                s=s,
+                                num_heads=num_heads,
+                                architecture=architecture,
+                                index_n_heads=index_n_heads,
+                                index_head_dim=index_head_dim,
+                                index_topk=index_topk,
+                            )
+                            raise PerfDataNotAvailableError(message) from cubic_exc
+                        if self._is_dsa_interpolation_miss(linear_exc):
+                            message = self._format_dsa_unavailable_message(
+                                "Generation",
+                                linear_exc,
+                                b=b,
+                                s=s,
+                                num_heads=num_heads,
+                                architecture=architecture,
+                                index_n_heads=index_n_heads,
+                                index_head_dim=index_head_dim,
+                                index_topk=index_topk,
+                            )
+                            raise PerfDataNotAvailableError(message) from linear_exc
+                        raise missing_generation_dsa_error() from linear_exc
                 latency = result["latency"]
                 energy = result.get("energy", 0.0)
                 return PerformanceResult(latency, energy=energy)
