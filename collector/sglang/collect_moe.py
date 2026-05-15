@@ -21,12 +21,23 @@ if _server_args_module._global_server_args is None:
     )
     _server_args_module._global_server_args = _mock_server_args
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
-    get_config_dtype_str,
-    get_default_config,
-    get_moe_configs,
-)
+try:
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+except ImportError:
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+
+try:
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
+        get_config_dtype_str,
+        get_default_config,
+        get_moe_configs,
+    )
+except ImportError:
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+        get_config_dtype_str,
+        get_default_config,
+        get_moe_configs,
+    )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKConfig, select_experts
 from sglang.srt.utils import is_hip
@@ -36,7 +47,10 @@ from sglang.srt.utils import is_hip
 # during CUDA graph capture or in headless benchmark contexts.  Replace the compiled
 # function with an eager equivalent so benchmarks don't stall.
 try:
-    import sglang.srt.layers.moe.fused_moe_triton.fused_moe as _fmoe_mod
+    try:
+        import sglang.srt.layers.moe.fused_moe_triton.fused_moe as _fmoe_mod
+    except ImportError:
+        import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe as _fmoe_mod
 
     def _eager_moe_sum_reduce(x, out, routed_scaling_factor):
         torch.sum(x, dim=1, out=out)

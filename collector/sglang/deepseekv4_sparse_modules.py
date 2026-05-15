@@ -34,13 +34,17 @@ distinguishes CSA(=4) / HCA(=128).
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
+import logging
 import os
 import sys
 import traceback
 from collections.abc import Callable
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 try:
     from collector.sglang.helper import benchmark_with_power, log_perf
@@ -100,7 +104,9 @@ except ModuleNotFoundError:
 def get_dsv4_flash_paged_mqa_logits_test_cases():
     from collector.common_test_cases import get_dsv4_flash_paged_mqa_logits_test_cases as _impl
 
-    if not _dsv4_sparse_kernel_supported("paged_mqa_logits"):
+    supported, reason = _dsv4_sparse_kernel_support_status("paged_mqa_logits")
+    if not supported:
+        logger.warning("Skipping dsv4 sparse kernel paged_mqa_logits: %s", reason)
         return []
     return _impl()
 
@@ -108,7 +114,9 @@ def get_dsv4_flash_paged_mqa_logits_test_cases():
 def get_dsv4_flash_hca_attn_test_cases():
     from collector.common_test_cases import get_dsv4_flash_hca_attn_test_cases as _impl
 
-    if not _dsv4_sparse_kernel_supported("hca_attn"):
+    supported, reason = _dsv4_sparse_kernel_support_status("hca_attn")
+    if not supported:
+        logger.warning("Skipping dsv4 sparse kernel hca_attn: %s", reason)
         return []
     return _impl()
 
@@ -161,6 +169,45 @@ def _device_num_sms(device: str | torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+def _has_module(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
+
+
+def _sglang_is_sm120() -> bool:
+    try:
+        from sglang.srt.utils import is_sm120_supported
+    except Exception:
+        try:
+            from sglang.srt.utils.common import is_sm120_supported
+        except Exception:
+            return False
+
+    try:
+        return bool(is_sm120_supported())
+    except Exception:
+        return False
+
+
+def _has_sglang_sm120_paged_mqa_impl() -> bool:
+    return _has_module("sglang.srt.layers.attention.dsv4.indexer")
+
+
+def _has_sglang_sm120_flash_mla_impl() -> bool:
+    return _has_module("sglang.srt.layers.attention.flash_mla_sm120_fallback")
+
+
+def _import_dsv4_sm120_paged_mqa_impl() -> tuple[Callable, Callable]:
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.dsv4.indexer import fp8_paged_mqa_logits_torch
+
+    if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+        from sglang.srt.layers.attention.dsv4.tilelang_kernel import tilelang_fp8_paged_mqa_logits
+
+        return (lambda *_args, **_kwargs: None), tilelang_fp8_paged_mqa_logits
+
+    return (lambda *_args, **_kwargs: None), fp8_paged_mqa_logits_torch
+
+
 # Two kernels are benched at the kernel level:
 #   - paged_mqa_logits: CSA indexer scoring (TP-independent, accurate)
 #   - hca_attn:       HCA's flash_mla over c128 cache (TP-independent, accurate)
@@ -199,21 +246,38 @@ KERNEL_TO_DEFAULT_FILENAME = {
 }
 
 
-def _dsv4_sparse_kernel_supported(kernel: str) -> bool:
-    """Return True when the active runtime can execute a DSV4 sparse kernel."""
+def _dsv4_sparse_kernel_support_status(kernel: str) -> tuple[bool, str]:
+    """Return ``(supported, reason)`` for a DSV4 sparse kernel."""
     if os.environ.get("COLLECTOR_FORCE_DSV4_FLASH_SPARSE") == "1":
-        return True
+        return True, "forced by COLLECTOR_FORCE_DSV4_FLASH_SPARSE=1"
     if kernel == "hca_attn":
-        return importlib.util.find_spec("flash_mla") is not None
-    if kernel == "paged_mqa_logits":
-        if importlib.util.find_spec("deep_gemm") is None:
-            return False
         if torch.cuda.is_available():
             major, _minor = torch.cuda.get_device_capability()
             if major >= 12:
-                return False
-        return True
+                if _has_sglang_sm120_flash_mla_impl():
+                    return True, "supported via sglang SM120 flash_mla fallback"
+                return False, "SM120 requires sglang flash_mla SM120 fallback support in the installed runtime"
+            if major not in (9, 10, 11):
+                return False, f"flash_mla_with_kvcache requires Hopper/Blackwell-class GPU; got compute capability major={major}"
+        if importlib.util.find_spec("flash_mla") is None:
+            return False, "flash_mla package is not installed"
+        return True, "supported"
+    if kernel == "paged_mqa_logits":
+        if torch.cuda.is_available():
+            major, _minor = torch.cuda.get_device_capability()
+            if major >= 12:
+                if _has_sglang_sm120_paged_mqa_impl():
+                    return True, "supported via sglang SM120 paged_mqa fallback"
+                return False, "SM120 requires sglang paged_mqa SM120 fallback support in the installed runtime"
+        if importlib.util.find_spec("deep_gemm") is None:
+            return False, "deep_gemm package is not installed"
+        return True, "supported"
     raise ValueError(f"unknown DSV4 sparse kernel: {kernel}")
+
+
+def _dsv4_sparse_kernel_supported(kernel: str) -> bool:
+    """Return True when the active runtime can execute a DSV4 sparse kernel."""
+    return _dsv4_sparse_kernel_support_status(kernel)[0]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -361,7 +425,10 @@ def _bench_paged_mqa_logits(M: int, past_kv: int, *, batch_size: int = 1, device
     request grouping changes.  In real serving, sglang's
     ``fp8_paged_mqa_logits_chunked`` wraps the same idea (chunk along M).
     """
-    from deep_gemm import fp8_paged_mqa_logits, get_paged_mqa_logits_metadata
+    if _sglang_is_sm120():
+        get_paged_mqa_logits_metadata, fp8_paged_mqa_logits = _import_dsv4_sm120_paged_mqa_impl()
+    else:
+        from deep_gemm import fp8_paged_mqa_logits, get_paged_mqa_logits_metadata
 
     del batch_size  # ignored — we treat each new token as its own batch entry
     full_s = M + past_kv
@@ -481,7 +548,13 @@ def _bench_flash_mla_sparse(
          ``tp_slice`` is filled from ``q_local``; other heads are zeros.
       3. FlashMLA always receives h_q=64 (kernel only supports {64, 128}).
     """
-    from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+    if _sglang_is_sm120():
+        from sglang.srt.layers.attention.flash_mla_sm120_fallback import flash_mla_with_kvcache_entrypoint
+
+        flash_mla_with_kvcache = lambda **kwargs: flash_mla_with_kvcache_entrypoint(backend="kernel", **kwargs)
+        sched_meta = None
+    else:
+        from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
     # rank-local head count (what the upstream projection actually produces)
     n_local_heads = max(1, N_HEADS_Q // tp_size)
@@ -525,14 +598,15 @@ def _bench_flash_mla_sparse(
     extra_indices = extra_base.view(1, 1, extra_K).expand(batch_size, M_per_req, extra_K).contiguous()
     extra_topk_lengths = torch.full((batch_size,), K_per_query, dtype=torch.int32, device=device)
 
-    sched_meta, _ = get_mla_metadata(
-        cache_seqlens=cache_seqlens,
-        num_q_tokens_per_head_k=M_per_req * n_local_heads,
-        num_heads_k=1,
-        num_heads_q=n_local_heads,
-        is_fp8_kvcache=True,
-        topk=swa_indices.size(-1),
-    )
+    if not _sglang_is_sm120():
+        sched_meta, _ = get_mla_metadata(
+            cache_seqlens=cache_seqlens,
+            num_q_tokens_per_head_k=M_per_req * n_local_heads,
+            num_heads_k=1,
+            num_heads_q=n_local_heads,
+            is_fp8_kvcache=True,
+            topk=swa_indices.size(-1),
+        )
 
     softmax_scale = 1.0 / (FMLA_D_QK**0.5)
     attn_sink = torch.zeros(n_local_heads, dtype=torch.float32, device=device)

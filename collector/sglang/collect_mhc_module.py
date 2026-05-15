@@ -131,7 +131,13 @@ def _patched_model_dir(model_id: str) -> str:
 
     num_layers = int(os.environ.get("SGLANG_TEST_NUM_LAYERS", "2"))
     config["num_hidden_layers"] = num_layers  # shrink depth to speed up collector init
-    config["model_type"] = "deepseek_ref"
+    if config.get("architectures") != ["DeepseekV4ForCausalLM"]:
+        config["architectures"] = ["DeepseekV4ForCausalLM"]
+
+    # Keep the V4 architecture selection via ``architectures`` but rewrite
+    # ``model_type`` to a transformers-known key so AutoConfig succeeds under
+    # dummy load_format without requiring a forked transformers build.
+    config["model_type"] = "deepseek_v3"
 
     tmp_dir = os.path.join(
         tempfile.gettempdir(),
@@ -158,12 +164,14 @@ def _load_one_layer_runner(
     mem_fraction_static: float,
 ):
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.distributed.parallel_state import cleanup_dist_env_and_memory
     from sglang.srt.entrypoints.engine import _set_envs_and_config
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.utils import suppress_other_loggers
 
     suppress_other_loggers()
+    cleanup_dist_env_and_memory()
     device_obj = torch.device(device)
     torch.cuda.set_device(device_obj)
 
@@ -185,7 +193,7 @@ def _load_one_layer_runner(
         max_prefill_tokens=4096,
     )
     server_args.enable_piecewise_cuda_graph = False
-    server_args.attention_backend = "compressed"
+    server_args.attention_backend = "dsv4"
 
     print(f"[mhc-collector] model_path {model_path} -> {local_model_path}")
 
@@ -244,7 +252,7 @@ def _make_kernel(layer, op: str, residual: torch.Tensor):
         torch.cuda.synchronize()
 
         def kernel():
-            return [layer.hc_post(x, residual, post, comb) for x, post, comb in post_inputs]
+            return [layer.hc_post(x, residual, post, comb) for x, post, comb, _norm_fused in post_inputs]
 
         return kernel
 
@@ -325,6 +333,8 @@ def run_mhc_module(
     mem_fraction_static: float = 0.5,
     perf_filename: str | None = None,
 ) -> list[dict[str, float]]:
+    from sglang.srt.distributed.parallel_state import cleanup_dist_env_and_memory
+
     if num_iterations < 3:
         raise ValueError("num_iterations must be at least 3")
 
@@ -399,6 +409,7 @@ def run_mhc_module(
                 gc.collect()
     finally:
         del model_runner
+        cleanup_dist_env_and_memory()
         torch.cuda.empty_cache()
         gc.collect()
     return results

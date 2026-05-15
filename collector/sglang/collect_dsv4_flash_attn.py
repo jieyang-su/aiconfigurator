@@ -556,11 +556,11 @@ def _load_model_runner(
         elif is_sm90_supported():
             server_args.moe_runner_backend = "marlin"
     server_args.enable_piecewise_cuda_graph = False
-    server_args.attention_backend = "compressed"
+    server_args.attention_backend = "dsv4"
 
     print(
         f"[dsv4-collector] model_path {model_path} -> {local_model_path}; "
-        f"attn_kind={attn_kind}, backend=compressed, kv_cache_dtype={kv_cache_dtype}, "
+        f"attn_kind={attn_kind}, backend=dsv4, kv_cache_dtype={kv_cache_dtype}, "
         f"max_total_tokens={max_total_tokens}, shrink_unused_moe={shrink_unused_moe}, "
         f"disable_weight_quant={disable_weight_quant}, gemm_type={gemm_type}, "
         f"quantization={server_args.quantization}, moe_runner_backend={server_args.moe_runner_backend}, "
