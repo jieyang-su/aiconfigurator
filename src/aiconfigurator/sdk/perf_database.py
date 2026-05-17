@@ -4283,6 +4283,15 @@ class PerfDatabase:
             if callable(cache_clear):
                 cache_clear()
 
+    @staticmethod
+    def _interp_pr(latency: float, energy: float = 0.0) -> PerformanceResult:
+        """Build a PerformanceResult derived from silicon table data.
+
+        Silicon-table interpolation/extrapolation still uses silicon data; only
+        explicit formula fallbacks should be tagged as ``"empirical"``.
+        """
+        return PerformanceResult(latency, energy=energy, source="silicon")
+
     def _query_silicon_or_hybrid(
         self,
         get_silicon: Callable[[], PerformanceResult],
@@ -4509,21 +4518,26 @@ class PerfDatabase:
 
         # SOL and EMPIRICAL modes don't have power/energy data
         if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol(m, n, k, quant_mode)[0], energy=0.0)
+            return PerformanceResult(get_sol(m, n, k, quant_mode)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(m, n, k, quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(get_empirical(m, n, k, quant_mode), energy=0.0)
+            return PerformanceResult(get_empirical(m, n, k, quant_mode), energy=0.0, source="empirical")
 
         # TODO: remove "else" and unindent
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
-                def _to_performance_result(result):
-                    """Normalize GEMM table entries into a PerformanceResult."""
+                def _to_performance_result(result, *, source: str = "silicon"):
+                    """Normalize GEMM table entries into a PerformanceResult.
+
+                    Interpolated/extrapolated GEMM values are still derived from
+                    silicon table data; only explicit formula fallbacks are
+                    tagged as empirical.
+                    """
                     if isinstance(result, dict):
-                        return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
-                    return PerformanceResult(result, energy=0.0)
+                        return PerformanceResult(result["latency"], energy=result.get("energy", 0.0), source=source)
+                    return PerformanceResult(result, energy=0.0, source=source)
 
                 self._gemm_data.raise_if_not_loaded()
                 if table_quant_mode not in self._gemm_data:
@@ -4604,11 +4618,11 @@ class PerfDatabase:
         table_quant_mode = self._normalize_gemm_quant_mode_for_table(quant_mode)
 
         if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol(m, k)[0], energy=0.0)
+            return PerformanceResult(get_sol(m, k)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(m, k)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(get_empirical(m, k), energy=0.0)
+            return PerformanceResult(get_empirical(m, k), energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -4642,7 +4656,7 @@ class PerfDatabase:
                     k_i = max(k_min, min(k_i, k_max))
 
                 result = self._interp_2d_linear(m_i, k_i, table)
-                return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
+                return self._interp_pr(result["latency"], energy=result.get("energy", 0.0))
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -4696,11 +4710,11 @@ class PerfDatabase:
         table_quant_mode = self._normalize_gemm_quant_mode_for_table(quant_mode)
 
         if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol(m, k)[0], energy=0.0)
+            return PerformanceResult(get_sol(m, k)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(m, k)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(get_empirical(m, k), energy=0.0)
+            return PerformanceResult(get_empirical(m, k), energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -4734,7 +4748,7 @@ class PerfDatabase:
                     k_i = max(k_min, min(k_i, k_max))
 
                 result = self._interp_2d_linear(m_i, k_i, table)
-                return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
+                return self._interp_pr(result["latency"], energy=result.get("energy", 0.0))
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -4841,7 +4855,7 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(b, s, prefix, n, n_kv, head_size, window_size, kvcache_quant_mode, fmha_quant_mode)[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, prefix, n, n_kv, head_size, window_size, kvcache_quant_mode, fmha_quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
@@ -4856,7 +4870,7 @@ class PerfDatabase:
                 kvcache_quant_mode,
                 fmha_quant_mode,
             )
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -4871,7 +4885,7 @@ class PerfDatabase:
                 result = self._interp_3d(n, full_s, b, attention_dict, "cubic")
                 latency = result["latency"] * prefix_correction
                 energy = result.get("energy", 0.0) * prefix_correction
-                return PerformanceResult(latency, energy=energy)
+                return self._interp_pr(latency, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -4981,12 +4995,12 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(b, s, n, n_kv, head_size, window_size, kvcache_quant_mode)[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, n, n_kv, head_size, window_size, kvcache_quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(b, s, n, n_kv, head_size, window_size, kvcache_quant_mode)
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -5013,7 +5027,7 @@ class PerfDatabase:
 
                 latency = latency_sum / sample_cnt
                 energy = energy_sum / sample_cnt
-                return PerformanceResult(latency, energy=energy)
+                return self._interp_pr(latency, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -5096,12 +5110,12 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -5112,7 +5126,7 @@ class PerfDatabase:
                 result = self._interp_3d(num_heads, full_s, b, mla_dict, "cubic")
                 latency = result["latency"] * prefix_correction
                 energy = result.get("energy", 0.0) * prefix_correction
-                return PerformanceResult(latency, energy=energy)
+                return self._interp_pr(latency, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -5186,12 +5200,12 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(b, s, num_heads, kvcache_quant_mode)[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, num_heads, kvcache_quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(b, s, num_heads, kvcache_quant_mode)
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -5200,7 +5214,7 @@ class PerfDatabase:
                 result = self._interp_3d(num_heads, b, s, mla_dict, "bilinear")
                 latency = result["latency"]
                 energy = result.get("energy", 0.0)
-                return PerformanceResult(latency, energy=energy)
+                return self._interp_pr(latency, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -5274,12 +5288,12 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
 
             def get_silicon():
@@ -5290,7 +5304,7 @@ class PerfDatabase:
                 result = self._interp_3d(num_heads, full_s, b, mla_dict, "cubic")
                 latency = result["latency"] * prefix_correction
                 energy = result.get("energy", 0.0) * prefix_correction
-                return PerformanceResult(latency, energy=energy)
+                return self._interp_pr(latency, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -5367,12 +5381,12 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(b, s, num_heads, kv_cache_dtype)[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, num_heads, kv_cache_dtype)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(b, s, num_heads, kv_cache_dtype)
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
 
             def get_silicon():
@@ -5381,7 +5395,7 @@ class PerfDatabase:
                 result = self._interp_3d(num_heads, b, s, mla_dict, "cubic")
                 latency = result["latency"]
                 energy = result.get("energy", 0.0)
-                return PerformanceResult(latency, energy=energy)
+                return self._interp_pr(latency, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -5487,11 +5501,13 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_time = get_sol(b, s, tp_size, kvcache_quant_mode, fmha_quant_mode)[0]
-            return PerformanceResult(sol_time, energy=0.0)
+            return PerformanceResult(sol_time, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, tp_size, kvcache_quant_mode, fmha_quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(get_empirical(b, s, tp_size, kvcache_quant_mode, fmha_quant_mode), energy=0.0)
+            return PerformanceResult(
+                get_empirical(b, s, tp_size, kvcache_quant_mode, fmha_quant_mode), energy=0.0, source="empirical"
+            )
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -5509,7 +5525,7 @@ class PerfDatabase:
                 result = self._interp_3d(num_heads, b, s, mla_dict, "bilinear")
                 latency = result["latency"]
                 energy = result.get("energy", 0.0)
-                return PerformanceResult(latency, energy=energy)
+                return self._interp_pr(latency, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -5611,13 +5627,14 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_time = get_sol(b, s, prefix, tp_size, kvcache_quant_mode, fmha_quant_mode)[0]
-            return PerformanceResult(sol_time, energy=0.0)
+            return PerformanceResult(sol_time, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, prefix, tp_size, kvcache_quant_mode, fmha_quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             return PerformanceResult(
                 get_empirical(b, s, prefix, tp_size, kvcache_quant_mode, fmha_quant_mode),
                 energy=0.0,
+                source="empirical",
             )
         else:
             # SILICON or HYBRID mode - use database
@@ -5639,7 +5656,7 @@ class PerfDatabase:
                 result = self._interp_3d(num_heads, full_s, b, mla_dict, "cubic")
                 latency = result["latency"] * prefix_correction
                 energy = result.get("energy", 0.0) * prefix_correction
-                return PerformanceResult(latency, energy=energy)
+                return self._interp_pr(latency, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -5710,7 +5727,7 @@ class PerfDatabase:
                 source="sol",
                 latency_ms=f"{sol_latency:.6f}",
             )
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(quant_mode, tp_size, size)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
@@ -5724,7 +5741,7 @@ class PerfDatabase:
                 source="empirical",
                 latency_ms=f"{emp_latency:.6f}",
             )
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -5739,7 +5756,7 @@ class PerfDatabase:
                         effective_tp=1,
                         latency_ms="0.000000",
                     )
-                    return PerformanceResult(0.0, energy=0.0)
+                    return PerformanceResult(0.0, energy=0.0, source="empirical")
                 if _prefer_nccl_for_custom_allreduce_enabled():
                     _log_comm_debug(
                         "query_custom_allreduce",
@@ -5821,7 +5838,7 @@ class PerfDatabase:
                     latency_ms=f"{lat:.6f}",
                 )
 
-                return PerformanceResult(lat, energy=energy)
+                return self._interp_pr(lat, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -5899,7 +5916,7 @@ class PerfDatabase:
                 source="sol",
                 latency_ms=f"{sol_latency:.6f}",
             )
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(dtype, num_gpus, operation, message_size)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
@@ -5914,7 +5931,7 @@ class PerfDatabase:
                 source="empirical",
                 latency_ms=f"{emp_latency:.6f}",
             )
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -5930,7 +5947,7 @@ class PerfDatabase:
                         effective_num_gpus=1,
                         latency_ms="0.000000",
                     )
-                    return PerformanceResult(0.0, energy=0.0)
+                    return PerformanceResult(0.0, energy=0.0, source="empirical")
 
                 # Use oneCCL data as fallback when NCCL data is not available (e.g. XPU systems)
                 nccl_source = self._nccl_data
@@ -5987,7 +6004,7 @@ class PerfDatabase:
                     latency_ms=f"{lat:.6f}",
                 )
 
-                return PerformanceResult(lat, energy=energy)
+                return self._interp_pr(lat, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -6175,7 +6192,10 @@ class PerfDatabase:
             elif last_energy > 0:
                 est_energy = last_energy * (est_latency / last_latency)
 
-            return PerformanceResult(est_latency, energy=est_energy)
+            # Overflow estimate anchored on the last silicon point's utilization
+            # and scaled by SOL ratio. It is still silicon-derived, not a pure
+            # formula fallback, so keep the source tag aligned with _interp_pr.
+            return self._interp_pr(est_latency, energy=est_energy)
 
         def _require_moe_token_points(
             moe_dict: dict,
@@ -6209,7 +6229,7 @@ class PerfDatabase:
                 quant_mode,
                 workload_distribution,
             )[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(
                 num_tokens,
@@ -6234,7 +6254,7 @@ class PerfDatabase:
                 quant_mode,
                 workload_distribution,
             )
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -6292,7 +6312,7 @@ class PerfDatabase:
                     else:
                         lat = result
                         energy = 0.0
-                    return PerformanceResult(lat, energy=energy)
+                    return self._interp_pr(lat, energy=energy)
                 elif self.backend == common.BackendName.trtllm.value:
                     if self._moe_data is None and self._moe_low_latency_data is None:
                         raise PerfDataNotAvailableError(
@@ -6380,7 +6400,7 @@ class PerfDatabase:
                     else:
                         lat = result
                         energy = 0.0
-                    return PerformanceResult(lat, energy=energy)
+                    return self._interp_pr(lat, energy=energy)
                 elif self.backend == common.BackendName.vllm.value:
                     self._moe_data.raise_if_not_loaded()
                     used_workload_distribution = (
@@ -6415,7 +6435,7 @@ class PerfDatabase:
                     else:
                         latency = result
                         energy = 0.0
-                    return PerformanceResult(latency, energy=energy)
+                    return self._interp_pr(latency, energy=energy)
                 else:
                     raise NotImplementedError(f"backend {self.backend} not supported for moe")
 
@@ -6506,12 +6526,12 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(num_tokens, num_heads, quant_mode, if_pre)[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(num_tokens, num_heads, quant_mode, if_pre)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(num_tokens, num_heads, quant_mode, if_pre)
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -6536,7 +6556,7 @@ class PerfDatabase:
                 else:
                     lat = result
                     energy = 0.0
-                return PerformanceResult(lat, energy=energy)
+                return self._interp_pr(lat, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -6555,12 +6575,27 @@ class PerfDatabase:
             PerformanceResult acting as float (latency in ms); energy via ``.energy``.
             For SOL_FULL, returns a ``(sol_time, 0, sol_time)`` tuple.
         """
-        return interpolation.estimate_mem_op(
-            mem_bytes,
-            self.system_spec["gpu"],
-            database_mode=database_mode,
-            default_database_mode=self._default_database_mode,
-        )
+        gpu_spec = self.system_spec["gpu"]
+
+        def get_sol() -> tuple[float, float, float]:
+            sol_time = mem_bytes / gpu_spec["mem_bw"] * 1000
+            return sol_time, 0, sol_time
+
+        def get_empirical() -> float:
+            return (
+                mem_bytes / (gpu_spec["mem_bw"] * gpu_spec["mem_bw_empirical_scaling_factor"])
+                + gpu_spec["mem_empirical_constant_latency"]
+            ) * 1000
+
+        if database_mode is None:
+            database_mode = self._default_database_mode
+        if database_mode == common.DatabaseMode.SOL:
+            return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
+        if database_mode == common.DatabaseMode.SOL_FULL:
+            return get_sol()
+        # EMPIRICAL / SILICON / HYBRID share the same empirical formula. There is
+        # no silicon table for raw memory ops, so always tag as ``empirical``.
+        return PerformanceResult(get_empirical(), energy=0.0, source="empirical")
 
     def query_mamba2(
         self,
@@ -6609,36 +6644,36 @@ class PerfDatabase:
             return sol_mem, 0, sol_mem
 
         if not mamba2_data:
-            return PerformanceResult(get_sol()[0], energy=0.0)
+            return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
 
         model_key = (d_model, d_state, d_conv, nheads, head_dim, n_groups, chunk_size)
         try:
             by_phase = mamba2_data[kernel_source]
         except KeyError:
-            return PerformanceResult(get_sol()[0], energy=0.0)
+            return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
         try:
             by_key = by_phase[phase]
         except KeyError:
-            return PerformanceResult(get_sol()[0], energy=0.0)
+            return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
         if model_key not in by_key:
             # Nearest config by d_model
             keys_with_d_model = [k for k in by_key if k[0] == d_model]
             if keys_with_d_model:
                 model_key = keys_with_d_model[0]
             else:
-                return PerformanceResult(get_sol()[0], energy=0.0)
+                return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
 
         table = by_key[model_key]
 
         if phase == "context":
             if seq_len is None or seq_len <= 0:
-                return PerformanceResult(get_sol()[0], energy=0.0)
+                return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
             try:
                 result = self._interp_2d_linear(batch_size, seq_len, table)
             except (KeyError, ValueError):
-                return PerformanceResult(get_sol()[0], energy=0.0)
-            return PerformanceResult(
-                latency=result["latency"],
+                return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
+            return self._interp_pr(
+                result["latency"],
                 energy=result.get("energy", result.get("power", 0.0) * result["latency"]),
             )
         else:
@@ -6647,7 +6682,7 @@ class PerfDatabase:
                     batch_size, list(table.keys()), inner_only=False
                 )
             except (KeyError, ValueError):
-                return PerformanceResult(get_sol()[0], energy=0.0)
+                return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
 
             # Ensure we pass entry dicts {latency, power, energy}; handle legacy nested batch_size -> seq_len -> entry
             def _mamba2_gen_entry(val):
@@ -6662,7 +6697,7 @@ class PerfDatabase:
             y_left = _mamba2_gen_entry(table[batch_left])
             y_right = _mamba2_gen_entry(table[batch_right])
             if y_left is None or y_right is None:
-                return PerformanceResult(get_sol()[0], energy=0.0)
+                return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
             result = self._interp_1d(
                 [batch_left, batch_right],
                 [y_left, y_right],
@@ -6674,7 +6709,7 @@ class PerfDatabase:
             else:
                 lat = result
                 energy = 0.0
-            return PerformanceResult(lat, energy=energy)
+            return self._interp_pr(lat, energy=energy)
 
     def query_gdn(
         self,
@@ -6744,36 +6779,36 @@ class PerfDatabase:
             return sol_mem, 0, sol_mem
 
         if not gdn_data:
-            return PerformanceResult(get_sol()[0], energy=0.0)
+            return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
 
         model_key = (d_model, num_k_heads, head_k_dim, num_v_heads, head_v_dim, d_conv)
         try:
             by_phase = gdn_data[kernel_source]
         except KeyError:
-            return PerformanceResult(get_sol()[0], energy=0.0)
+            return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
         try:
             by_key = by_phase[phase]
         except KeyError:
-            return PerformanceResult(get_sol()[0], energy=0.0)
+            return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
         if model_key not in by_key:
             # Nearest config by d_model, then num_v_heads as secondary discriminator
             keys_same_d_model = [k for k in by_key if k[0] == d_model]
             if keys_same_d_model:
                 model_key = min(keys_same_d_model, key=lambda k: abs(k[3] - num_v_heads))
             else:
-                return PerformanceResult(get_sol()[0], energy=0.0)
+                return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
 
         table = by_key[model_key]
 
         if phase == "context":
             if seq_len is None or seq_len <= 0:
-                return PerformanceResult(get_sol()[0], energy=0.0)
+                return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
             try:
                 result = self._interp_2d_linear(batch_size, seq_len, table)
             except (KeyError, ValueError):
-                return PerformanceResult(get_sol()[0], energy=0.0)
-            return PerformanceResult(
-                latency=result["latency"],
+                return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
+            return self._interp_pr(
+                result["latency"],
                 energy=result.get("energy", result.get("power", 0.0) * result["latency"]),
             )
         else:
@@ -6782,7 +6817,7 @@ class PerfDatabase:
                     batch_size, list(table.keys()), inner_only=False
                 )
             except (KeyError, ValueError):
-                return PerformanceResult(get_sol()[0], energy=0.0)
+                return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
 
             def _gdn_gen_entry(val):
                 if isinstance(val, dict) and "latency" in val:
@@ -6796,7 +6831,7 @@ class PerfDatabase:
             y_left = _gdn_gen_entry(table[batch_left])
             y_right = _gdn_gen_entry(table[batch_right])
             if y_left is None or y_right is None:
-                return PerformanceResult(get_sol()[0], energy=0.0)
+                return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
             result = self._interp_1d(
                 [batch_left, batch_right],
                 [y_left, y_right],
@@ -6808,7 +6843,7 @@ class PerfDatabase:
             else:
                 lat = result
                 energy = 0.0
-            return PerformanceResult(lat, energy=energy)
+            return self._interp_pr(lat, energy=energy)
 
     @functools.lru_cache(maxsize=32768)
     def query_p2p(
@@ -6845,14 +6880,15 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol(message_bytes)[0], energy=0.0)
+            return PerformanceResult(get_sol(message_bytes)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(message_bytes)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(get_empirical(message_bytes), energy=0.0)
+            return PerformanceResult(get_empirical(message_bytes), energy=0.0, source="empirical")
         else:
-            # hybrid and silicon modes have same logic
-            return PerformanceResult(get_empirical(message_bytes), energy=0.0)
+            # No silicon table for P2P — even SILICON/HYBRID modes use the
+            # empirical formula here, so tag the source accordingly.
+            return PerformanceResult(get_empirical(message_bytes), energy=0.0, source="empirical")
 
     @functools.lru_cache(maxsize=32768)
     def query_wideep_deepep_ll(
@@ -6879,18 +6915,18 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol(num_tokens, topk, num_experts)[0], energy=0.0)
+            return PerformanceResult(get_sol(num_tokens, topk, num_experts)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(num_tokens, topk, num_experts)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(get_empirical(num_tokens, topk, num_experts), energy=0.0)
+            return PerformanceResult(get_empirical(num_tokens, topk, num_experts), energy=0.0, source="empirical")
         else:
             data = self._wideep_deepep_ll_data[node_num][hidden_size][topk][num_experts]
             num_left, num_right = self._nearest_1d_point_helper(num_tokens, list(data.keys()), inner_only=False)
             result = self._interp_1d([num_left, num_right], [data[num_left], data[num_right]], num_tokens)
             lat = result["latency"] if isinstance(result, dict) else result
             energy = result.get("energy", 0.0) if isinstance(result, dict) else 0.0
-            return self._apply_dsv4_operator_calibration(PerformanceResult(lat / 1000.0, energy=energy / 1000.0))
+            return self._apply_dsv4_operator_calibration(self._interp_pr(lat / 1000.0, energy=energy / 1000.0))
 
     @functools.lru_cache(maxsize=32768)
     def query_wideep_deepep_normal(
@@ -6918,11 +6954,13 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol(num_tokens, num_experts, topk, hidden_size)[0], energy=0.0)
+            return PerformanceResult(get_sol(num_tokens, num_experts, topk, hidden_size)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(num_tokens, num_experts, topk, hidden_size)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(get_empirical(num_tokens, num_experts, topk, hidden_size), energy=0.0)
+            return PerformanceResult(
+                get_empirical(num_tokens, num_experts, topk, hidden_size), energy=0.0, source="empirical"
+            )
         else:
             if node_num == 1 and sms == 20:  # only collect sm=20 for now
                 data = self._wideep_deepep_normal_data[node_num][hidden_size][topk][num_experts][sms]
@@ -6935,7 +6973,7 @@ class PerfDatabase:
                 result = self._interp_2d_linear(sms, num_tokens, data)
                 lat = result["latency"] if isinstance(result, dict) else result
                 energy = result.get("energy", 0.0) if isinstance(result, dict) else 0.0
-            return self._apply_dsv4_operator_calibration(PerformanceResult(lat / 1000.0, energy=energy / 1000.0))
+            return self._apply_dsv4_operator_calibration(self._interp_pr(lat / 1000.0, energy=energy / 1000.0))
 
     def _correct_data(self) -> None:
         """
@@ -7137,7 +7175,7 @@ class PerfDatabase:
                 quant_mode,
                 workload_distribution,
             )[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(
                 num_tokens,
@@ -7164,7 +7202,7 @@ class PerfDatabase:
                 quant_mode,
                 workload_distribution,
             )
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
 
         # Automatically select MoE kernel based on GPU architecture and quant mode
         kernel_source = self._select_moe_kernel(quant_mode)
@@ -7207,7 +7245,7 @@ class PerfDatabase:
                 lat = result
                 energy = 0.0
 
-            return PerformanceResult(lat, energy=energy)
+            return self._interp_pr(lat, energy=energy)
 
         def get_empirical() -> float:
             # Simple empirical fallback based on SOL
@@ -7393,7 +7431,7 @@ class PerfDatabase:
                 quant_mode,
                 node_num,
             )[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(
                 num_tokens,
@@ -7414,7 +7452,7 @@ class PerfDatabase:
                 quant_mode,
                 node_num,
             )
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
 
         kernel_source = self._select_alltoall_kernel(quant_mode, moe_ep_size, topk, moe_backend=moe_backend)
         logger.debug(
@@ -7424,7 +7462,7 @@ class PerfDatabase:
         if kernel_source == "NotEnabled":
             if database_mode == common.DatabaseMode.SOL_FULL:
                 return (0.0, 0.0, 0.0)
-            return PerformanceResult(0.0, energy=0.0)
+            return PerformanceResult(0.0, energy=0.0, source="empirical")
 
         # SILICON or HYBRID mode - use database
         def get_silicon():
@@ -7457,7 +7495,7 @@ class PerfDatabase:
                 lat = result
                 energy = 0.0
 
-            return PerformanceResult(lat, energy=energy)
+            return self._interp_pr(lat, energy=energy)
 
         def get_empirical() -> float:
             return get_empirical_from_sol(
@@ -7655,12 +7693,12 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             def missing_context_dsa_error() -> PerfDataNotAvailableError:
                 return PerfDataNotAvailableError(
@@ -7730,7 +7768,7 @@ class PerfDatabase:
                     correction = 1.0 if base_sol <= 0 else target_sol / base_sol
                     latency *= correction
                     energy *= correction
-                return PerformanceResult(latency, energy=energy)
+                return self._interp_pr(latency, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -7864,12 +7902,12 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(b, s, num_heads, kv_cache_dtype)[0]
-            return PerformanceResult(sol_latency, energy=0.0)
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(b, s, num_heads, kv_cache_dtype)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(b, s, num_heads, kv_cache_dtype)
-            return PerformanceResult(emp_latency, energy=0.0)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             def missing_generation_dsa_error() -> PerfDataNotAvailableError:
                 return PerfDataNotAvailableError(
@@ -7930,7 +7968,7 @@ class PerfDatabase:
                         raise missing_generation_dsa_error() from linear_exc
                 latency = result["latency"]
                 energy = result.get("energy", 0.0)
-                return PerformanceResult(latency, energy=energy)
+                return self._interp_pr(latency, energy=energy)
 
             return self._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
@@ -8034,11 +8072,11 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol()[0], energy=0.0)
+            return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
         if database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol()
         if database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(get_empirical(), energy=0.0)
+            return PerformanceResult(get_empirical(), energy=0.0, source="empirical")
 
         def get_silicon():
             mhc_data = getattr(self, "_mhc_module_data", None)
@@ -8069,7 +8107,7 @@ class PerfDatabase:
                 result = self._interp_1d([left, right], [mhc_dict[left], mhc_dict[right]], num_tokens)
                 latency = result["latency"] if isinstance(result, dict) else result
                 energy = result.get("energy", 0.0) if isinstance(result, dict) else 0.0
-                return PerformanceResult(latency, energy=energy)
+                return self._interp_pr(latency, energy=energy)
 
             # Silicon tables only store "pre" and "post" rows. For op=="both"
             # (still a supported input in operations.DeepSeekV4MHCModule),
@@ -8078,10 +8116,10 @@ class PerfDatabase:
             if op == "both":
                 pre_result = _lookup_single("pre")
                 post_result = _lookup_single("post")
-                return PerformanceResult(
-                    float(pre_result) + float(post_result),
-                    energy=pre_result.energy + post_result.energy,
-                )
+                # Use PerformanceResult's __add__ to merge sources correctly
+                # (silicon + silicon -> silicon, mismatch -> mixed) instead of
+                # constructing a new PR that would default-tag as silicon.
+                return pre_result + post_result
 
             return _lookup_single(op)
 
@@ -8453,11 +8491,11 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol()[0], energy=0.0)
+            return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
         if database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol()
         if database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(get_empirical(), energy=0.0)
+            return PerformanceResult(get_empirical(), energy=0.0, source="empirical")
 
         def get_silicon():
             data = getattr(self, "_context_deepseek_v4_attention_module_data", None)
@@ -8640,7 +8678,7 @@ class PerfDatabase:
                     correction = 1.0 if base_sol <= 0 else target_sol / base_sol
                     latency *= correction
                     energy *= correction
-            return PerformanceResult(latency, energy=energy)
+            return self._interp_pr(latency, energy=energy)
 
         return self._query_silicon_or_hybrid(
             get_silicon=get_silicon,
@@ -8707,11 +8745,11 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol()[0], energy=0.0)
+            return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
         if database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol()
         if database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(get_empirical(), energy=0.0)
+            return PerformanceResult(get_empirical(), energy=0.0, source="empirical")
 
         def get_silicon():
             data = getattr(self, "_generation_deepseek_v4_attention_module_data", None)
@@ -8759,7 +8797,7 @@ class PerfDatabase:
                     )
             latency = result["latency"]
             energy = result.get("energy", 0.0)
-            return PerformanceResult(latency, energy=energy)
+            return self._interp_pr(latency, energy=energy)
 
         return self._query_silicon_or_hybrid(
             get_silicon=get_silicon,
