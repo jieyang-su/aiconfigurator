@@ -38,13 +38,22 @@ _COLLECTOR_DIR = str(Path(__file__).resolve().parents[3] / "collector")
 if _COLLECTOR_DIR not in sys.path:
     sys.path.insert(0, _COLLECTOR_DIR)
 
-if "torch" not in sys.modules:
+_saved_torch = sys.modules.get("torch")
+_restore_real_torch = _saved_torch is not None and not isinstance(_saved_torch, MagicMock)
+_restore_missing_torch = _saved_torch is None
+
+if _restore_real_torch or _restore_missing_torch:
     _torch = MagicMock()
     _torch.AcceleratorError = type("AcceleratorError", (Exception,), {})
     sys.modules["torch"] = _torch
 
 import collect as _collect_mod
 from collect import parallel_run
+
+if _restore_real_torch:
+    sys.modules["torch"] = _saved_torch
+elif _restore_missing_torch:
+    sys.modules.pop("torch", None)
 
 _collect_mod.logger = logging.getLogger("test_parallel_run")
 _collect_mod.logger.setLevel(logging.DEBUG)
@@ -53,6 +62,14 @@ _collect_mod.logger.addHandler(logging.StreamHandler(sys.stderr))
 EXIT_CODE_RESTART = 10
 
 pytestmark = [pytest.mark.unit, pytestmark_fork]
+
+
+class _FakeDeviceModule:
+    def set_device(self, _device):
+        return None
+
+    def empty_cache(self):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +98,12 @@ def _fork_mp(monkeypatch):
     warnings.filterwarnings("ignore", message=".*fork.*", category=DeprecationWarning)
     ctx = mp.get_context("fork")
     monkeypatch.setattr(_collect_mod, "mp", ctx)
+
+
+@pytest.fixture(autouse=True)
+def _fake_device_backend(monkeypatch):
+    monkeypatch.setattr(_collect_mod, "get_device_module", lambda: _FakeDeviceModule())
+    monkeypatch.setattr(_collect_mod, "get_device_str", lambda: "cpu")
 
 
 @pytest.fixture(autouse=True)

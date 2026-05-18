@@ -49,10 +49,10 @@ import torch
 logger = logging.getLogger(__name__)
 
 try:
-    from collector.sglang.helper import benchmark_with_power, log_perf
+    from collector.sglang.helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from helper import benchmark_with_power, log_perf
+    from helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
 
 # Re-export test case generators from the centralised common_test_cases
 # module so collect.py's registry can resolve them via getattr on this module.
@@ -823,7 +823,10 @@ def _bench_hca_attn(M: int, past_kv: int, *, batch_size: int = 1, tp_size: int =
             past_kv,
             device,
         )
-        return _bench_hca_attn_torch_subprocess(M, past_kv, batch_size=batch_size, device=device)
+        result = _bench_hca_attn_torch_subprocess(M, past_kv, batch_size=batch_size, device=device)
+        # Keep restart intent explicit for callers/tests after illegal-access fallback.
+        result["restart_worker"] = True
+        return result
 
 
 _BENCH_FN = {
@@ -972,6 +975,8 @@ def run_dsv4_sparse_kernel_worker(
     power_str = f", power={power_stats['power']:.1f}W" if power_stats and power_stats.get("power") is not None else ""
     backend_str = f", backend={backend_name}" if backend_name else ""
     print(f"  latency={latency_ms:.4f} ms{power_str}{backend_str}")
+    if bench_result.get("restart_worker"):
+        sys.exit(EXIT_CODE_RESTART)
 
 
 # ═══════════════════════════════════════════════════════════════════════
