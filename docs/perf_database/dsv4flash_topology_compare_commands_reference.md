@@ -91,8 +91,8 @@ cat results/dsv4flash_topology_compare/compare_single_point.csv
 
 ```bash
 uv run --frozen python tools/plot_pareto_compare.py \
-  --scaleup-csv /path/to/scaleup_pareto.csv \
-  --scaleout-csv /path/to/scaleout_pareto.csv \
+  --scaleup-csv results/dsv4flash_topology_compare/scaleup/pareto.csv \
+  --scaleout-csv results/dsv4flash_topology_compare/scaleout/pareto.csv \
   --x-col "tokens/s/gpu" \
   --y-col "tokens/s/user" \
   --title "DS-V4 Flash Scale-up vs Scale-out Pareto" \
@@ -101,6 +101,14 @@ uv run --frozen python tools/plot_pareto_compare.py \
 
 说明：
 
+- 运行 `start` 后，脚本会把两组任务分别写到：
+  - `results/dsv4flash_topology_compare/scaleup/`
+  - `results/dsv4flash_topology_compare/scaleout/`
+- 如果 `pareto.csv` 文件名在你的 AIC 版本中不同，可用下面命令定位：
+  ```bash
+  find results/dsv4flash_topology_compare/scaleup -name "pareto.csv" -o -name "*pareto*.csv"
+  find results/dsv4flash_topology_compare/scaleout -name "pareto.csv" -o -name "*pareto*.csv"
+  ```
 - 脚本支持常见列名自动兼容，不一定必须严格叫 `tokens/s/gpu` 与 `tokens/s/user`。
 - 如果你导出的列名不同，先直接跑一次；若报列名错误，再按报错提示改 `--x-col/--y-col`。
 

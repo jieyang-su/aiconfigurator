@@ -24,6 +24,8 @@ run_case() {
   local system="$1"
   local log_file="$2"
   local pid_var="$3"
+  local case_output_dir="$4"
+  mkdir -p "$case_output_dir"
   cat <<CMD | tee -a "$CMD_LOG"
 nohup aiconfigurator cli default \\
   --systems-paths "$SYSTEMS_PATH" \\
@@ -38,6 +40,7 @@ nohup aiconfigurator cli default \\
   --database-mode "$DATABASE_MODE" \\
   --ttft "$TTFT" \\
   --tpot "$TPOT" \\
+  --output-dir "$case_output_dir" \\
   > "$log_file" 2>&1 &
 CMD
   nohup aiconfigurator cli default \
@@ -53,6 +56,7 @@ CMD
     --database-mode "$DATABASE_MODE" \
     --ttft "$TTFT" \
     --tpot "$TPOT" \
+    --output-dir "$case_output_dir" \
     > "$log_file" 2>&1 &
   local pid=$!
   echo "$pid_var=$pid" >> "$PID_FILE"
@@ -61,9 +65,12 @@ CMD
 start_runs() {
   : > "$CMD_LOG"
   : > "$PID_FILE"
-  run_case "rtx_pro_6000_scaleup_32" "$OUT_DIR/output_scaleup_32.log" "SCALEUP_PID"
-  run_case "rtx_pro_6000_scaleout_2x16" "$OUT_DIR/output_scaleout_2x16.log" "SCALEOUT_PID"
+  run_case "rtx_pro_6000_scaleup_32" "$OUT_DIR/output_scaleup_32.log" "SCALEUP_PID" "$OUT_DIR/scaleup"
+  run_case "rtx_pro_6000_scaleout_2x16" "$OUT_DIR/output_scaleout_2x16.log" "SCALEOUT_PID" "$OUT_DIR/scaleout"
   echo "Started both jobs. PID file: $PID_FILE"
+  echo "Expected pareto files:"
+  echo "  $OUT_DIR/scaleup/pareto.csv"
+  echo "  $OUT_DIR/scaleout/pareto.csv"
 }
 
 check_runs() {
@@ -105,6 +112,9 @@ wait_runs() {
       wait "$pid" || rc=$?
     fi
   done
+  echo "Runs completed. Try locating pareto files with:"
+  echo "  find \"$OUT_DIR/scaleup\" -name 'pareto.csv' -o -name '*pareto*.csv'"
+  echo "  find \"$OUT_DIR/scaleout\" -name 'pareto.csv' -o -name '*pareto*.csv'"
   return "$rc"
 }
 
