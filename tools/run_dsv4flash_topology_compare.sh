@@ -40,7 +40,7 @@ nohup aiconfigurator cli default \\
   --database-mode "$DATABASE_MODE" \\
   --ttft "$TTFT" \\
   --tpot "$TPOT" \\
-  --output-dir "$case_output_dir" \\
+  --save-dir "$case_output_dir" \\
   > "$log_file" 2>&1 &
 CMD
   nohup aiconfigurator cli default \
@@ -56,7 +56,7 @@ CMD
     --database-mode "$DATABASE_MODE" \
     --ttft "$TTFT" \
     --tpot "$TPOT" \
-    --output-dir "$case_output_dir" \
+    --save-dir "$case_output_dir" \
     > "$log_file" 2>&1 &
   local pid=$!
   echo "$pid_var=$pid" >> "$PID_FILE"
@@ -112,9 +112,22 @@ wait_runs() {
       wait "$pid" || rc=$?
     fi
   done
+  local scaleup_pareto
+  local scaleout_pareto
+  scaleup_pareto="$(find "$OUT_DIR/scaleup" -type f -name "pareto.csv" | head -n 1 || true)"
+  scaleout_pareto="$(find "$OUT_DIR/scaleout" -type f -name "pareto.csv" | head -n 1 || true)"
+  if [[ -n "$scaleup_pareto" ]]; then
+    cp "$scaleup_pareto" "$OUT_DIR/scaleup/pareto.csv"
+  fi
+  if [[ -n "$scaleout_pareto" ]]; then
+    cp "$scaleout_pareto" "$OUT_DIR/scaleout/pareto.csv"
+  fi
   echo "Runs completed. Try locating pareto files with:"
   echo "  find \"$OUT_DIR/scaleup\" -name 'pareto.csv' -o -name '*pareto*.csv'"
   echo "  find \"$OUT_DIR/scaleout\" -name 'pareto.csv' -o -name '*pareto*.csv'"
+  echo "Canonical paths for plotting:"
+  echo "  $OUT_DIR/scaleup/pareto.csv"
+  echo "  $OUT_DIR/scaleout/pareto.csv"
   return "$rc"
 }
 

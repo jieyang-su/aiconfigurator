@@ -104,6 +104,10 @@ uv run --frozen python tools/plot_pareto_compare.py \
 - 运行 `start` 后，脚本会把两组任务分别写到：
   - `results/dsv4flash_topology_compare/scaleup/`
   - `results/dsv4flash_topology_compare/scaleout/`
+- 脚本内部使用 `aiconfigurator cli default --save-dir ...`；AIC 会在该目录下生成随机结果子目录。
+- 执行 `wait` 后，脚本会自动把找到的 Pareto 文件复制为标准路径：
+  - `results/dsv4flash_topology_compare/scaleup/pareto.csv`
+  - `results/dsv4flash_topology_compare/scaleout/pareto.csv`
 - 如果 `pareto.csv` 文件名在你的 AIC 版本中不同，可用下面命令定位：
   ```bash
   find results/dsv4flash_topology_compare/scaleup -name "pareto.csv" -o -name "*pareto*.csv"
