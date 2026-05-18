@@ -7,7 +7,7 @@
 ForwardBatch is built directly from ScheduleBatch and model forwards require
 an active model_executor.forward_context.
 
-``current`` targets the newer adapted sglang tree used by AIC: ScheduleBatch
+``current`` targets the newer sglang-v0.5.12 style used by AIC: ScheduleBatch
 is converted to ModelWorkerBatch before constructing ForwardBatch, and the
 forward-context module may not exist.
 """
@@ -26,19 +26,18 @@ def sglang_version_branch() -> str:
     """Return ``legacy`` or ``current`` for SGLang API branching.
 
     ``auto`` detects the active API shape from ``ScheduleBatch``.  Explicit
-    aliases are accepted so command lines can say ``--sglang-version-branch
-    v0.5.10`` when running the old runtime.
+    version aliases are accepted so command lines can say
+    ``--sglang-version-branch v0.5.10`` or ``v0.5.12``.
     """
 
     raw = os.environ.get(_BRANCH_ENV, "auto").strip().lower().replace("_", "-")
     if raw in {"legacy", "old", "v0.5.10", "0.5.10", "sglang-v0.5.10"}:
         return "legacy"
-    if raw in {"current", "new", "main", "adapted"}:
+    if raw in {"current", "new", "v0.5.12", "0.5.12", "sglang-v0.5.12"}:
         return "current"
     if raw not in {"", "auto"}:
         raise ValueError(
-            f"Unsupported {_BRANCH_ENV}={raw!r}; expected auto, legacy, current, "
-            "v0.5.10, or main"
+            f"Unsupported {_BRANCH_ENV}={raw!r}; expected auto, v0.5.10, or v0.5.12"
         )
 
     try:
@@ -58,9 +57,9 @@ def build_forward_batch(batch, model_runner):
     if branch == "current":
         if not hasattr(batch, "get_model_worker_batch"):
             raise RuntimeError(
-                "COLLECTOR_SGLANG_VERSION_BRANCH=current requires "
+                "COLLECTOR_SGLANG_VERSION_BRANCH=v0.5.12 requires "
                 "ScheduleBatch.get_model_worker_batch(), but the active SGLang "
-                "runtime does not provide it. Use --sglang-version-branch legacy "
+                "runtime does not provide it. Use --sglang-version-branch v0.5.10 "
                 "for sglang-v0.5.10."
             )
         batch = batch.get_model_worker_batch()

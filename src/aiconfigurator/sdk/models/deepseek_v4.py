@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from collections import Counter
-import os
 from typing import ClassVar
 
 import aiconfigurator.sdk.operations as ops
@@ -88,23 +87,16 @@ class DeepSeekV4Model(BaseModel):
             else self.config.workload_distribution
         )
         local_heads = self._num_heads // tp_size
-        allow_unsupported_tp = os.environ.get("AIC_ALLOW_UNSUPPORTED_DSV4_TP") == "1"
-        unsupported_tp = tp_size > deepseek_v4_cfg.o_groups or deepseek_v4_cfg.o_groups % tp_size != 0
-        if unsupported_tp and not allow_unsupported_tp:
-            raise ValueError(
-                f"DeepSeek-V4 attention TP size {tp_size} is not supported by o_groups={deepseek_v4_cfg.o_groups}; "
-                "pick a TP size that evenly divides o_groups."
-            )
         local_o_groups = max(1, deepseek_v4_cfg.o_groups // tp_size)
         local_moe_inter_size = self._moe_inter_size // tp_size
 
         def _attention_ops(is_context: bool, scale_factor: float):
             ratio_counts = Counter(self._compress_ratios)
-            # DeepSeek-V4 Flash has a small number of pure SWA layers
-            # (compress_ratio=0). Approximate their module latency with HCA
-            # (compress_ratio=128) so the model reuses DeepSeek-V4 HCA perf data
-            # instead of requiring a dedicated SWA collector. KV cache capacity
-            # below still uses the real per-layer ratios.
+            # Some DeepSeek-V4 configs include pure SWA layers (compress_ratio=0).
+            # Approximate their module latency with HCA (compress_ratio=128) so
+            # the model reuses DeepSeek-V4 HCA perf data instead of requiring a
+            # dedicated SWA collector. KV cache capacity below still uses the
+            # real per-layer ratios.
             ratio_counts[128] += ratio_counts.pop(0, 0)
             op_cls = ops.ContextDeepSeekV4AttentionModule if is_context else ops.GenerationDeepSeekV4AttentionModule
             name = "context_attention" if is_context else "generation_attention"
@@ -113,6 +105,8 @@ class DeepSeekV4Model(BaseModel):
                     name,
                     count * scale_factor,
                     local_heads,
+                    self._num_heads,
+                    tp_size,
                     h,
                     deepseek_v4_cfg.q_lora_rank,
                     deepseek_v4_cfg.o_lora_rank,
@@ -128,7 +122,6 @@ class DeepSeekV4Model(BaseModel):
                     fmha_quant_mode,
                     gemm_quant_mode,
                     architecture=self.architecture,
-                    native_num_heads=self._num_heads,
                 )
                 for ratio, count in ratio_counts.items()
                 if count > 0

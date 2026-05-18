@@ -3,6 +3,7 @@
 import contextlib
 import functools
 import os
+import sys
 import warnings
 
 from helper import get_device_module, get_device_str
@@ -59,7 +60,6 @@ import io
 import json
 import multiprocessing as mp
 import pstats
-import re
 import signal
 import time
 import traceback
@@ -71,67 +71,6 @@ from helper import EXIT_CODE_RESTART, create_test_case_id, save_error_report, se
 logger = None
 RESUME_SCHEMA_VERSION = "collector-resume-v1"
 STALL_THRESHOLD = 30  # iterations (x 0.5 s sleep = 15 s) before stall bailout
-
-
-def _resolve_perf_filename(perf_filename: str) -> str:
-    """Resolve bare perf filenames into the active collector run directory."""
-    if os.path.isabs(perf_filename) or os.path.dirname(perf_filename):
-        return perf_filename
-
-    log_dir = os.environ.get("COLLECTOR_LOG_DIR", "").strip()
-    if not log_dir:
-        return perf_filename
-
-    collector_dir = os.path.dirname(os.path.abspath(__file__))
-    if not os.path.isabs(log_dir):
-        log_dir = os.path.join(collector_dir, log_dir)
-    return os.path.join(log_dir, perf_filename)
-
-
-def _normalize_model_token(value: str) -> str:
-    """Normalize a model name or path component for loose matching."""
-    return re.sub(r"[^a-z0-9]+", "", value.lower())
-
-
-def _infer_model_name_from_local_path(model_path: str, all_models: list[str]) -> str | None:
-    """Infer the canonical collector model name from a local model directory."""
-    path = Path(model_path).expanduser().resolve()
-    if not path.exists():
-        return None
-
-    path_tokens = {
-        _normalize_model_token(path.name),
-        _normalize_model_token(str(path)),
-    }
-    for model_name in all_models:
-        model_leaf = model_name.split("/")[-1]
-        if _normalize_model_token(model_leaf) in path_tokens:
-            return model_name
-
-    config_path = path / "config.json"
-    if not config_path.exists():
-        return None
-
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            config = json.load(f)
-    except Exception:
-        return None
-
-    model_type = str(config.get("model_type", "")).lower()
-    architectures = [str(arch).lower() for arch in config.get("architectures", [])]
-    normalized_path = _normalize_model_token(str(path))
-
-    if model_type == "deepseek_v32" or "deepseekv32forcausallm" in architectures:
-        return "deepseek-ai/DeepSeek-V3.2"
-    if model_type == "glm_moe_dsa" or "glmmoedsaforcausallm" in architectures:
-        return "zai-org/GLM-5"
-    if model_type == "deepseek_v3" or "deepseekv3forcausallm" in architectures:
-        if "deepseekv31" in normalized_path:
-            return "deepseek-ai/DeepSeek-V3.1"
-        return "deepseek-ai/DeepSeek-V3"
-
-    return None
 
 
 class ResumeCheckpoint:
@@ -421,8 +360,6 @@ def worker(
         if current_task_ids is not None:
             current_task_ids[device_id] = task_id
 
-        should_exit_after_cleanup = False
-
         try:
             worker_logger.debug(f"Starting task {task_id}")
             func(*task, device=device)
@@ -489,6 +426,17 @@ def worker(
                 # DSLCudaRuntimeError from CUTLASS DSL also corrupts CUDA
                 # context but isn't a torch.AcceleratorError subclass.
                 is_cuda_fatal = type(e).__name__ == "DSLCudaRuntimeError"
+            if not is_cuda_fatal and isinstance(e, RuntimeError):
+                message = str(e)
+                fatal_markers = (
+                    "illegal memory access",
+                    "unspecified launch failure",
+                    "CUDA_ERROR_LAUNCH_FAILED",
+                    "CUBLAS_STATUS_EXECUTION_FAILED",
+                    "CUBLAS_STATUS_INTERNAL_ERROR",
+                    "CUBLAS_STATUS_ALLOC_FAILED",
+                )
+                is_cuda_fatal = any(marker in message for marker in fatal_markers)
             if is_cuda_fatal:
                 worker_logger.warning(
                     f"Fatal {type(e).__name__} encountered on task {task_id}. "
@@ -498,9 +446,7 @@ def worker(
                 # Flush logs again after warning
                 for handler in worker_logger.handlers:
                     handler.flush()
-                # Exiting with non-zero code will add an additional error to the summary,
-                # which we don't want (error already reported above).
-                exit(0)
+                sys.exit(EXIT_CODE_RESTART)
         finally:
             with lock:
                 progress_value.value += 1
@@ -510,25 +456,7 @@ def worker(
                 import gc
 
                 gc.collect()
-                try:
-                    get_device_module().empty_cache()
-                except Exception as cleanup_exc:
-                    is_cuda_fatal_cleanup = isinstance(cleanup_exc, torch.AcceleratorError)
-                    if not is_cuda_fatal_cleanup:
-                        is_cuda_fatal_cleanup = type(cleanup_exc).__name__ == "DSLCudaRuntimeError"
-                    if not is_cuda_fatal_cleanup:
-                        raise
-
-                    worker_logger.warning(
-                        f"Worker {device_id} hit fatal {type(cleanup_exc).__name__} during empty_cache(); "
-                        "exiting cleanly so the parent can restart with a fresh CUDA context"
-                    )
-                    for handler in worker_logger.handlers:
-                        handler.flush()
-                    should_exit_after_cleanup = True
-
-        if should_exit_after_cleanup:
-            return
+                get_device_module().empty_cache()
 
 
 def parallel_run(tasks, func, num_processes, module_name="unknown", resume_options=None):
@@ -737,10 +665,11 @@ def parallel_run(tasks, func, num_processes, module_name="unknown", resume_optio
                 last_progress = progress_value.value
 
             # Check process health — only restart if there is still work
-            # remaining.  Workers that consumed a None sentinel or finished
-            # via sys.exit(EXIT_CODE_RESTART) should not be restarted once
-            # all tasks are dispatched, otherwise the new worker blocks
-            # forever on queue.get().
+            # remaining. Workers that consumed a None sentinel or requested
+            # restart via EXIT_CODE_RESTART (successful task cleanup or handled
+            # fatal CUDA error cleanup) should not be restarted once all tasks
+            # are dispatched, otherwise the new worker blocks forever on
+            # queue.get().
             for i, p in enumerate(processes):
                 if p is None:
                     continue
@@ -751,8 +680,8 @@ def parallel_run(tasks, func, num_processes, module_name="unknown", resume_optio
                     process_stats[i]["restarts"] += 1
                     if exit_code == EXIT_CODE_RESTART:
                         logger.debug(
-                            f"Process {i} completed task and exited normally for release gpu memory"
-                            f"(completed tasks: {process_stats[i]['restarts']})"
+                            f"Process {i} requested restart after task cleanup or handled fatal error "
+                            f"(restart count: {process_stats[i]['restarts']})"
                         )
                     else:
                         logger.warning(
@@ -889,10 +818,7 @@ def collect_ops(
 
             get_func = getattr(get_module, collection["get_func"])
             run_func = getattr(run_module, collection["run_func"])
-            run_func = functools.partial(
-                run_func,
-                perf_filename=_resolve_perf_filename(collection["perf_filename"]),
-            )
+            run_func = functools.partial(run_func, perf_filename=collection["perf_filename"])
 
             def get_func_with_limit(get_func=get_func):
                 cases = get_func()
@@ -943,11 +869,9 @@ def collect_sglang(
 
     try:
         from importlib.metadata import version as get_version
-        from collector.sglang.version_compat import sglang_version_branch
 
         version = get_version("sglang")
         logger.info(f"SGLang version: {version}")
-        logger.info(f"SGLang collector branch: {sglang_version_branch()}")
     except Exception:
         logger.exception("SGLang is not installed")
         return
@@ -1162,11 +1086,10 @@ def main():
         "--model-path",
         type=str,
         default=None,
-        help="Collect a single model, using either a canonical model ID "
-        "(e.g. 'MiniMaxAI/MiniMax-M2.5') or a local model directory "
-        "(e.g. '/opt/model/DeepSeek-V3.2'). When a local directory is given, "
-        "the collector infers the matching canonical model name and passes the "
-        "local path to runtime modules so they do not fetch configs from Hugging Face. "
+        help="Filter collection to a single model (e.g. 'MiniMaxAI/MiniMax-M2.5'). "
+        "Must match a model name in the test case config lists exactly. "
+        "Best used together with --ops to target a specific op, since a model "
+        "may only appear in one op's config list (e.g. MoE but not MLA). "
         "Default: collect all models.",
     )
     parser.add_argument(
@@ -1176,72 +1099,33 @@ def main():
     )
     parser.add_argument(
         "--sglang-version-branch",
-        choices=["auto", "legacy", "current", "v0.5.10", "0.5.10", "main", "adapted"],
+        choices=["auto", "v0.5.10", "0.5.10", "v0.5.12", "0.5.12"],
         default="auto",
-        help="SGLang API branch for AIC compatibility. Use 'legacy' or "
-        "'v0.5.10' for sglang-v0.5.10; use 'current' or 'main' for the "
-        "adapted sglang tree. Default: auto-detect.",
+        help=(
+            "SGLang API branch for collector compatibility. Use v0.5.10 for the "
+            "old compressed attention backend; use v0.5.12 for the dsv4 backend."
+        ),
     )
     args = parser.parse_args()
     ops = args.ops
-    _dsv4_auto_expand = False
-
     os.environ["COLLECTOR_SGLANG_VERSION_BRANCH"] = args.sglang_version_branch
 
     if args.model_path:
         from collector.common_test_cases import get_all_model_names
 
         all_models = get_all_model_names()
-        local_model_path = None
-        canonical_model_name = None
-        candidate_path = Path(args.model_path).expanduser()
-
-        if candidate_path.exists():
-            local_model_path = str(candidate_path.resolve())
-            canonical_model_name = _infer_model_name_from_local_path(local_model_path, all_models)
-            if canonical_model_name is None:
-                parser.error(
-                    f"Local model path '{args.model_path}' does not map to a known collector model. "
-                    "Please use a supported canonical model ID or a local directory whose name/config.json "
-                    "matches one of them:\n"
-                    + "\n".join(f"  - {m}" for m in all_models)
-                )
-        elif args.model_path in all_models:
-            canonical_model_name = args.model_path
-        else:
+        if args.model_path not in all_models:
             parser.error(
                 f"Model '{args.model_path}' not found. Available models:\n" + "\n".join(f"  - {m}" for m in all_models)
             )
         os.environ["COLLECTOR_MODEL_PATH"] = args.model_path
-
-        # V4-Flash special-case: when the model is V4-Flash and no explicit
-        # ``--ops`` is given, scope to the ops consumed by the V4-Flash
-        # perf model: V4 Flash attention/sparse kernels plus generic GEMM,
-        # MoE, and mHC.  All other models keep the default behaviour: run
-        # every op and let each get_func's ``_filter_model_config_list``
-        # filter cases at the test-case level.
-        if args.ops is None and args.model_path in {
-            "deepseek-ai/DeepSeek-V4-Flash",
-            "deepseek-ai/DeepSeek-V4-Pro",
-            "sgl-project/DeepSeek-V4-Flash-FP8",
-            "sgl-project/DeepSeek-V4-Pro-FP8",
-        }:
-            dsv4_prefix = "dsv4_pro_" if "Pro" in args.model_path else "dsv4_flash_"
-            dsv4_ops = [name for name in _all_op_names() if name.startswith(dsv4_prefix)]
-            ops = dsv4_ops + ["gemm", "moe", "mhc_module"]
-            _dsv4_auto_expand = True
     else:
         os.environ.pop("COLLECTOR_MODEL_PATH", None)
         os.environ.pop("COLLECTOR_LOCAL_MODEL_PATH", None)
 
     # Setup logging - debug flag is handled inside setup_logging
     if logger is None:
-        # Use short label when V4-Flash auto-expanded ops to several names
-        # (the joined scope may exceed Linux filename length limit).
-        if _dsv4_auto_expand:
-            log_scope = ["dsv4_pro" if args.model_path and "Pro" in args.model_path else "dsv4_flash"]
-        else:
-            log_scope = ops if ops else ["all"]
+        log_scope = ops if ops else ["all"]
         logger = setup_logging(scope=log_scope, debug=args.debug)
     elif args.debug:
         # Update log level if debug flag changed
@@ -1249,8 +1133,6 @@ def main():
 
     if args.model_path:
         logger.info(f"Model filter active: collecting only for '{args.model_path}'")
-        if ops and args.ops is None:
-            logger.info(f"  expanded to model-specific ops: {ops}")
 
     resume_options = {
         "resume": args.resume,

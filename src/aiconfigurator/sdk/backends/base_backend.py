@@ -66,7 +66,6 @@ class BaseBackend(ABC):
                 beam_width=1,
                 s=effective_isl,
                 prefix=prefix,
-                model_name=getattr(model, "model_name", ""),
                 seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
                 mock_moe_policy=getattr(model.config, "mock_moe_policy", None),
             )
@@ -109,7 +108,6 @@ class BaseBackend(ABC):
                     batch_size=batch_size,
                     beam_width=beam_width,
                     s=isl + i + 1,
-                    model_name=getattr(model, "model_name", ""),
                     gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
                     mock_moe_policy=getattr(model.config, "mock_moe_policy", None),
                 )

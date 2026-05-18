@@ -26,71 +26,6 @@ from aiconfigurator.sdk.system_spec import SystemSpec
 databases_cache = defaultdict(lambda: defaultdict(lambda: defaultdict()))
 logger = logging.getLogger(__name__)
 
-
-def _comm_debug_enabled() -> bool:
-    return os.environ.get("AIC_DEBUG_COMM_QUERIES", "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _prefer_nccl_for_custom_allreduce_enabled() -> bool:
-    return os.environ.get("AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _dsv4_attention_calibration_source() -> str | None:
-    value = os.environ.get("AIC_DSV4_ATTENTION_CALIBRATE_FROM", "").strip()
-    return value or None
-
-
-def _dsv4_attention_calibration_target_pattern() -> str:
-    return os.environ.get("AIC_DSV4_ATTENTION_CALIBRATE_SYSTEM_PATTERN", "PRO6000").strip()
-
-
-def _dsv4_calibration_mode() -> str:
-    return os.environ.get("AIC_DSV4_ATTENTION_CALIBRATE_MODE", "roofline").strip().lower()
-
-
-def _nccl_perf_filename_override(system_spec: dict) -> str | None:
-    filename = os.environ.get("AIC_NCCL_PERF_FILE") or system_spec.get("misc", {}).get("nccl_perf_file")
-    if filename is None:
-        return None
-    filename = filename.strip()
-    if not filename:
-        return None
-    if filename != os.path.basename(filename):
-        raise ValueError(
-            "NCCL perf filename override must be a file name under the selected nccl_version directory, "
-            f"got: {filename}"
-        )
-    return filename
-
-
-def _hybrid_shared_layer_enabled(database_mode: str | None) -> bool:
-    """Return whether HYBRID mode may inherit sibling backend/version rows.
-
-    Default behavior remains unchanged: HYBRID enables shared-layer inheritance.
-    Set ``AIC_DISABLE_HYBRID_SHARED_LAYER=1`` (or true/yes/on) to force
-    HYBRID to only use the active backend+version files.
-    """
-    if (database_mode or "").upper() != "HYBRID":
-        return False
-    return os.environ.get("AIC_DISABLE_HYBRID_SHARED_LAYER", "").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _log_comm_debug(event: str, **fields) -> None:
-    if not _comm_debug_enabled():
-        return
-    payload = " ".join(f"{key}={value}" for key, value in fields.items())
-    logger.info("[comm-debug] %s %s", event, payload)
-
 _SYSTEMS_PATHS: list[str] = [os.fspath(pkg_resources.files("aiconfigurator") / "systems")]
 _MISSING_SILICON_DATA_EXCEPTIONS = (KeyError, IndexError)
 
@@ -131,47 +66,6 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
 
 def get_systems_paths() -> list[str]:
     return list(_SYSTEMS_PATHS)
-
-
-def resolve_perf_data_source(
-    system: str,
-    backend: str,
-    version: str,
-    systems_paths: str | list[str] | None = None,
-) -> dict[str, str] | None:
-    """Resolve the first usable perf-data source directory for a database triple.
-
-    This mirrors ``get_database`` source selection logic enough for debug/reporting
-    so callers can print exactly which systems root and perf data dir are used.
-    """
-    if systems_paths is None:
-        systems_paths = get_systems_paths()
-    elif isinstance(systems_paths, str):
-        systems_paths = [systems_paths]
-
-    if not version:
-        return None
-
-    for systems_root in systems_paths:
-        system_yaml_path = os.path.join(systems_root, f"{system}.yaml")
-        if not os.path.isfile(system_yaml_path):
-            continue
-        try:
-            with open(system_yaml_path) as f:
-                system_spec = yaml.load(f, Loader=yaml.SafeLoader)
-            data_dir = system_spec["data_dir"]
-        except Exception:
-            continue
-
-        data_path = os.path.join(systems_root, data_dir, backend, version)
-        is_incomplete = os.path.isfile(os.path.join(data_path, "INCOMPLETE.txt"))
-        if os.path.exists(data_path) and not is_incomplete:
-            return {
-                "systems_root": systems_root,
-                "system_yaml_path": system_yaml_path,
-                "data_path": data_path,
-            }
-    return None
 
 
 def build_no_databases_message() -> str:
@@ -445,10 +339,9 @@ def get_database(
             backend/version data files are absent. This is intended for SOL/EMPIRICAL
             estimate-only modes, not SILICON mode.
         database_mode: the mode the caller will query under (`SILICON` / `HYBRID` /
-            `EMPIRICAL` / `SOL`). HYBRID enables the shared layer (sibling-row
-            inheritance, including `kernel_source=default` fallback rows) unless
-            disabled via ``AIC_DISABLE_HYBRID_SHARED_LAYER``; other modes keep it
-            off so predictions stay bit-identical to main.
+            `EMPIRICAL` / `SOL`). HYBRID auto-enables the shared layer (sibling-row
+            inheritance, including `kernel_source=default` fallback rows); other
+            modes keep it off so predictions stay bit-identical to main.
 
     Returns:
         PerfDatabase for the given system, backend, version.
@@ -462,22 +355,21 @@ def get_database(
         logger.error(f"No database version available for {system=}, {backend=}")
         return None
 
-    shared_flag = _hybrid_shared_layer_enabled(database_mode)
+    shared_flag = (database_mode or "").upper() == "HYBRID"
     missing_data_candidate = None
     for systems_root in systems_paths:
         system_yaml_path = os.path.join(systems_root, f"{system}.yaml")
         if not os.path.isfile(system_yaml_path):
             continue
+        cache_key = (systems_root, system, shared_flag)
         try:
             with open(system_yaml_path) as f:
                 system_spec = yaml.load(f, Loader=yaml.SafeLoader)
             data_dir = system_spec["data_dir"]
-            nccl_perf_filename = _nccl_perf_filename_override(system_spec)
         except Exception:
             logger.warning(f"failed to read system spec at {system_yaml_path}, continuing searching")
             continue
 
-        cache_key = (systems_root, system, shared_flag, nccl_perf_filename)
         data_path = os.path.join(systems_root, data_dir, backend, version)
         is_incomplete = os.path.isfile(os.path.join(data_path, "INCOMPLETE.txt"))
         if os.path.exists(data_path) and not is_incomplete:
@@ -667,7 +559,7 @@ def _store_loaded_database(
 ) -> None:
     system, backend, version, systems_root = ref
     database_dict[system][backend][version] = database
-    databases_cache[(systems_root, system, False, None)][backend][version] = database
+    databases_cache[(systems_root, system, False)][backend][version] = database
 
 
 def clear_database_runtime_caches(system: str, backend: str, version: str) -> None:
@@ -1649,8 +1541,11 @@ def load_generation_dsa_module_data(dsa_file: str):
 def load_mhc_module_data(mhc_file: str):
     """Load DeepSeek-V4 mHC pre/post module-level performance data.
 
-    CSV columns: framework, version, device, op_name, kernel_source, model,
+    CSV columns: framework, version, device, op_name, kernel_source,
     architecture, num_tokens, hc_mult, hidden_size, latency [, power]
+    Optional metadata columns: num_sites, sinkhorn_iters
+    Legacy rows may include a ``model`` column; it is ignored because mHC is
+    selected by compute shape.
 
     ``op_name`` is ``pre`` or ``post``, matching the ``op`` arg of
     ``query_mhc_module``.
@@ -1685,21 +1580,6 @@ def load_mhc_module_data(mhc_file: str):
     return mhc_data
 
 
-def load_context_deepseek_v4_attention_module_data(attn_file: str):
-    """Legacy single-file loader (kept for backwards compat with the old
-    combined ``deepseek_v4_context_module_perf.txt`` convention).  V4-Flash
-    data is now split across ``dsv4_flash_{csa,hca}_context_*`` files —
-    see ``load_context_dsv4_flash_kind_module_data``."""
-    logger.debug(f"DeepSeek-V4 context attention module data file {attn_file} not loaded.")
-    return None
-
-
-def load_generation_deepseek_v4_attention_module_data(attn_file: str):
-    """Legacy single-file loader; V4-Flash data is now split per attn_kind."""
-    logger.debug(f"DeepSeek-V4 generation attention module data file {attn_file} not loaded.")
-    return None
-
-
 _DSV4_DTYPE_ALIASES = {
     # CSV columns use sglang naming; aic_dev enums use canonical short names.
     "fp8_e4m3": "fp8",
@@ -1710,47 +1590,35 @@ def _dsv4_normalize_dtype(name: str) -> str:
     return _DSV4_DTYPE_ALIASES.get(name, name)
 
 
-# V4-Flash special-case for the data axis that distinguishes TP variants.
+# DeepSeek-V4 special-case for the data axis that distinguishes TP variants.
 #
-# The generic MLA convention in ``models.py:_make_*_attention_ops`` computes
+# The generic MLA convention in ``models/deepseek_v4.py`` computes
 # ``local_heads = self._num_heads // tp_size`` and passes it into the op as
 # ``num_heads``.  That math reflects real head sharding for DSv2/DSv3 — but
-# V4-Flash does NOT actually shard heads (sglang zero-pads Q to keep h_q=64;
-# see ``deepseek_v4.py:847``).  The kernel sees the same h_q on every rank.
+# DeepSeek-V4 attention backends may pad Q for sparse kernels; the persisted
+# rows use ``tp_size`` as the axis that differentiates TP variants.
 #
-# Rather than touch that generic math, the V4 path special-cases here:
-#   * The loader stores data keyed by ``tp_size`` (the column that actually
-#     differentiates rows for V4-Flash; see ``load_*_dsv4_flash_*`` below).
-#   * The query helper recovers ``tp_size`` from the incoming ``num_heads``
-#     argument as ``DSV4_FLASH_NATIVE_HEADS // num_heads`` and uses that
-#     for the data lookup.
-#
-# When sglang eventually adds real V4 head sharding, drop this special-case
-# and the generic ``local_heads`` axis will work directly.
-DSV4_FLASH_NATIVE_HEADS = 64
-DSV4_PRO_NATIVE_HEADS = 128
+# Rather than touch that generic math, the V4 operation passes both the local
+# head count for SOL math and the native-head/tp_size keys for silicon lookup.
+
+DEFAULT_DSV4_ARCHITECTURE = "DeepseekV4ForCausalLM"
 
 
-def _dsv4_tp_from_num_heads(num_heads: int, native_num_heads: int | None = None) -> int:
-    """Recover ``tp_size`` from the model layer's ``local_heads`` value."""
-    native_heads = native_num_heads or DSV4_FLASH_NATIVE_HEADS
-    return max(1, native_heads // max(num_heads, 1))
-
-
-def _dsv4_select_native_heads(data, native_num_heads: int | None):
-    """Select the native-head axis when split V4 Flash/Pro data is present."""
-    native_heads = native_num_heads or DSV4_FLASH_NATIVE_HEADS
-    if isinstance(data, dict) and native_heads in data:
-        return data[native_heads]
+def _dsv4_select_arch(data, architecture: str):
+    """Select the architecture bucket when generic DSV4 data carries one."""
+    if isinstance(data, dict) and architecture in data:
+        return data[architecture]
+    if isinstance(data, dict) and DEFAULT_DSV4_ARCHITECTURE in data:
+        return data[DEFAULT_DSV4_ARCHITECTURE]
     return data
 
 
-def _dsv4_flash_robust_3d_lookup(self, dict_, x, y, z, *, batch_axis: str = "z"):
-    """V4-Flash-only 3D lookup: exact, cubic, then sampled-batch fallback.
+def _dsv4_robust_3d_lookup(self, dict_, x, y, z, *, batch_axis: str = "z"):
+    """DeepSeek-V4 3D lookup: exact, cubic, then sampled-batch fallback.
 
     Generic ``_interp_3d`` raises ``QhullError`` when the point cloud has
-    a degenerate axis (e.g. our V4-Flash sweep caps b=1 at s=8192, so the
-    b axis is flat near that query point).  This helper:
+    a degenerate axis (e.g. the DSV4 sweep caps b=1 at s=8192, so the
+    b axis is flat near that query point).
 
       1. Try an exact ``dict[x][y][z]`` lookup — handles the common case
          of querying at a measured bench point.
@@ -1763,7 +1631,7 @@ def _dsv4_flash_robust_3d_lookup(self, dict_, x, y, z, *, batch_axis: str = "z")
     Caller swallows lower-level exceptions if all paths fail.
     """
     if batch_axis not in ("y", "z"):
-        raise ValueError(f"unsupported V4-Flash fallback {batch_axis=}; expected 'y' or 'z'")
+        raise ValueError(f"unsupported DeepSeek-V4 fallback {batch_axis=}; expected 'y' or 'z'")
 
     # Use .get() chain instead of [] indexing: dict_ may be a (nested)
     # defaultdict, so [] reads would create spurious empty branches that
@@ -1787,7 +1655,7 @@ def _dsv4_flash_robust_3d_lookup(self, dict_, x, y, z, *, batch_axis: str = "z")
     except Exception:
         pass
 
-    # Fallback: real V4-Flash data is sampled at batches like 1/2/4/8.
+    # Fallback: real DeepSeek-V4 data is sampled at batches like 1/2/4/8.
     # Prefer the largest batch <= query batch that covers the sequence length
     # (interpolation along s). Only extrapolate along s if none covers it.
     sub = dict_.get(x) if isinstance(dict_, dict) else None
@@ -1849,30 +1717,29 @@ def _dsv4_flash_robust_3d_lookup(self, dict_, x, y, z, *, batch_axis: str = "z")
                     continue
 
     if batch_axis == "y":
-        raise ValueError(f"V4-Flash robust lookup failed (tp={x}, b={y}, s={z})")
-    raise ValueError(f"V4-Flash robust lookup failed (tp={x}, s={y}, b={z})")
+        raise ValueError(f"DeepSeek-V4 robust lookup failed (tp={x}, b={y}, s={z})")
+    raise ValueError(f"DeepSeek-V4 robust lookup failed (tp={x}, s={y}, b={z})")
 
 
-def load_context_dsv4_flash_kind_module_data(file_path: str):
-    """Load ONE V4-Flash context CSV (single attn_kind / compress_ratio).
+def load_context_dsv4_kind_module_data(file_path: str):
+    """Load ONE DeepSeek-V4 context CSV (single attn_kind / compress_ratio).
 
-    Returns an 8-level nested dict:
-        data[fmha_quant][kv_quant][gemm_quant][arch][compress_ratio]
+    Returns a nested dict:
+        data[fmha_quant][kv_quant][gemm_quant][architecture][native_heads][compress_ratio]
             [tp_size][s][b] = {"latency": ms, "power": W, "energy": J}
 
-    ``tp_size`` is the data axis (V4-Flash doesn't shard heads — see top-of-
-    file note + ``_dsv4_flash_tp_from_num_heads``).  Query side recovers
-    tp_size from the ``num_heads`` argument the model layer passes.
+    ``tp_size`` is the data axis. The model layer passes it through the
+    attention operation for silicon lookup.
 
     Multiple files (csa/hca/swa) merge cleanly because compress_ratio is
     the differentiating leaf dimension.
     """
     rows = _read_filtered_rows(file_path)
     if rows is None:
-        logger.debug(f"DSV4-Flash module data file {file_path} not found.")
+        logger.debug(f"DSV4 module data file {file_path} not found.")
         return None
 
-    # 8-level nesting: fmha → kv → gemm → arch → cr → local_heads → s → b
+    # 8-level nesting: fmha → kv → gemm → native_heads → cr → tp → s → b
     def _make_nested(depth: int):
         if depth == 0:
             return defaultdict()
@@ -1888,22 +1755,20 @@ def load_context_dsv4_flash_kind_module_data(file_path: str):
             b = int(row["batch_size"])
             s = int(row["isl"])
             tp_size = int(row.get("tp_size", 1))
-            native_heads = int(row.get("num_heads", DSV4_FLASH_NATIVE_HEADS))
             cr = int(row["compress_ratio"])
             latency = float(row["latency"])
         except (TypeError, ValueError, KeyError):
             continue
         power = float(row.get("power", 0.0)) if has_power else 0.0
 
-        arch = row.get("architecture", "DeepseekV4ForCausalLM")
+        arch = row.get("architecture", DEFAULT_DSV4_ARCHITECTURE)
+        native_heads = int(row["num_heads"])
         gemm_mode = common.GEMMQuantMode[row["gemm_type"]]
         fmha_mode = common.FMHAQuantMode[_dsv4_normalize_dtype(row["mla_dtype"])]
         kv_dtype = common.KVCacheQuantMode[_dsv4_normalize_dtype(row["kv_cache_dtype"])]
 
-        # V4-Flash: TP doesn't shard heads (h_q=64 on every rank), so the
-        # row-distinguishing axis is ``tp_size`` itself.  Query side recovers
-        # this via ``_dsv4_flash_tp_from_num_heads``.  See top-of-file note.
-        data[fmha_mode][kv_dtype][gemm_mode][arch][cr][native_heads][tp_size][s][b] = {
+        # The row-distinguishing axis is ``tp_size`` itself.
+        data[fmha_mode][kv_dtype][gemm_mode][arch][native_heads][cr][tp_size][s][b] = {
             "latency": latency,
             "power": power,
             "energy": power * latency,
@@ -1911,23 +1776,22 @@ def load_context_dsv4_flash_kind_module_data(file_path: str):
     return data
 
 
-def load_generation_dsv4_flash_kind_module_data(file_path: str):
-    """Load ONE V4-Flash generation CSV.
+def load_generation_dsv4_kind_module_data(file_path: str):
+    """Load ONE DeepSeek-V4 generation CSV.
 
     Generation lookup uses absolute KV length ``s_total = isl + step`` (decode
     is q_len=1 with past_kv = step).  Dict shape:
-        data[kv_quant][gemm_quant][arch][compress_ratio]
+        data[kv_quant][gemm_quant][architecture][native_heads][compress_ratio]
             [tp_size][b][s_total]
 
-    ``tp_size`` is the data axis; query side recovers it from the model layer's
-    local-head ``num_heads`` value (see top-of-file V4-Flash note).
+    ``tp_size`` is passed by the attention operation for silicon lookup.
     """
     rows = _read_filtered_rows(file_path)
     if rows is None:
-        logger.debug(f"DSV4-Flash module data file {file_path} not found.")
+        logger.debug(f"DSV4 module data file {file_path} not found.")
         return None
 
-    # 7-level nesting: kv → gemm → arch → cr → tp_size → b → s_total
+    # 7-level nesting: kv → gemm → native_heads → cr → tp → b → s_total
     def _make_nested(depth: int):
         if depth == 0:
             return defaultdict()
@@ -1943,22 +1807,22 @@ def load_generation_dsv4_flash_kind_module_data(file_path: str):
             b = int(row["batch_size"])
             s_total = int(row["isl"]) + int(row["step"])
             tp_size = int(row.get("tp_size", 1))
-            native_heads = int(row.get("num_heads", DSV4_FLASH_NATIVE_HEADS))
             cr = int(row["compress_ratio"])
             latency = float(row["latency"])
         except (TypeError, ValueError, KeyError):
             continue
         power = float(row.get("power", 0.0)) if has_power else 0.0
 
-        arch = row.get("architecture", "DeepseekV4ForCausalLM")
+        arch = row.get("architecture", DEFAULT_DSV4_ARCHITECTURE)
+        native_heads = int(row["num_heads"])
         gemm_mode = common.GEMMQuantMode[row["gemm_type"]]
         kv_dtype = common.KVCacheQuantMode[_dsv4_normalize_dtype(row["kv_cache_dtype"])]
 
-        # V4-Flash: tp_size is the axis that differentiates rows.  See note
+        # DeepSeek-V4: tp_size is the axis that differentiates rows.  See note
         # at the top of the file.  Generation convention puts ``b`` before
         # ``s_total`` (matches existing ``_interp_3d(num_heads, b, s, ...)``
         # call order in ``query_generation_*``).
-        data[kv_dtype][gemm_mode][arch][cr][native_heads][tp_size][b][s_total] = {
+        data[kv_dtype][gemm_mode][arch][native_heads][cr][tp_size][b][s_total] = {
             "latency": latency,
             "power": power,
             "energy": power * latency,
@@ -1982,18 +1846,18 @@ def _deep_merge_dsv4_dicts(dest, src):
     return dest
 
 
-def load_dsv4_flash_sparse_kernel_data(file_path: str):
-    """Load V4-Flash sparse-kernel CSV (paged_mqa_logits or hca_attn).
+def load_dsv4_sparse_kernel_data(file_path: str):
+    """Load DeepSeek-V4 sparse-kernel CSV (paged_mqa_logits or hca_attn).
 
     Emitted by ``collector.sglang.deepseekv4_sparse_modules``.  Used for
     kernel-level past_kv Δ correction on top of the chunk-0 module baseline.
 
     Dict structure:
-        data[arch][tp_size][past_kv][isl][bs] = {"latency": ms}
+        data[architecture][native_heads][tp_size][past_kv][isl][bs] = {"latency": ms}
     """
     rows = _read_filtered_rows(file_path)
     if rows is None:
-        logger.debug(f"DSV4-Flash sparse-kernel data file {file_path} not found.")
+        logger.debug(f"DSV4 sparse-kernel data file {file_path} not found.")
         return None
 
     data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))))
@@ -2007,11 +1871,11 @@ def load_dsv4_flash_sparse_kernel_data(file_path: str):
             isl = int(row["isl"])
             past_kv = int(row["step"])
             tp_size = int(row.get("tp_size", 1))
-            native_heads = int(row.get("num_heads", DSV4_FLASH_NATIVE_HEADS))
             latency = float(row["latency"])
         except (TypeError, ValueError):
             continue
-        arch = row.get("architecture", "DeepseekV4ForCausalLM")
+        arch = row.get("architecture", DEFAULT_DSV4_ARCHITECTURE)
+        native_heads = int(row["num_heads"])
         data[arch][native_heads][tp_size][past_kv][isl][bs] = {"latency": latency}
 
     return data
@@ -2922,21 +2786,17 @@ class PerfDatabase:
         Args:
             database_mode: drives the shared-layer load behavior. `"HYBRID"` enables
                 sibling-row inheritance (including `kernel_source=default` fallback
-                rows) unless ``AIC_DISABLE_HYBRID_SHARED_LAYER`` is set; other modes
-                keep it off so predictions stay bit-identical to main. Doesn't
-                change which rows are interpolated at query time; that's controlled
-                by `set_default_database_mode`.
+                rows); other modes keep it off so predictions stay bit-identical to
+                main. Doesn't change which rows are interpolated at query time;
+                that's controlled by `set_default_database_mode`.
         """
         self.system = system
         self.backend = backend
         self.version = version
         self.systems_root = systems_root
-        self.enable_shared_layer = _hybrid_shared_layer_enabled(database_mode)
+        self.enable_shared_layer = (database_mode or "").upper() == "HYBRID"
         with open(os.path.join(systems_root, system + ".yaml")) as f:
             self.system_spec = SystemSpec(yaml.load(f, Loader=yaml.SafeLoader))
-        self._dsv4_operator_calibration_enabled = False
-        self._dsv4_operator_calibration_source = None
-        self._dsv4_operator_calibration_system_spec = None
         self._default_database_mode = common.DatabaseMode.SILICON  # default mode is SILICON
 
         # Cache for extracted metric data to avoid repeated extraction in _interp_3d
@@ -2948,42 +2808,15 @@ class PerfDatabase:
 
         system_data_root = os.path.join(systems_root, self.system_spec["data_dir"])
         data_dir = os.path.join(system_data_root, backend, version)
-        op_system_data_root = system_data_root
-        op_data_dir = data_dir
-        calibration_source = _dsv4_attention_calibration_source()
-        calibration_target_pattern = _dsv4_attention_calibration_target_pattern()
-        if calibration_source and calibration_target_pattern and calibration_target_pattern in self.system:
-            source_yaml_path = os.path.join(systems_root, calibration_source + ".yaml")
-            if os.path.isfile(source_yaml_path):
-                with open(source_yaml_path, encoding="utf-8") as f:
-                    self._dsv4_operator_calibration_system_spec = SystemSpec(yaml.load(f, Loader=yaml.SafeLoader))
-                self._dsv4_operator_calibration_enabled = True
-                self._dsv4_operator_calibration_source = calibration_source
-                op_system_data_root = os.path.join(systems_root, self._dsv4_operator_calibration_system_spec["data_dir"])
-                op_data_dir = os.path.join(op_system_data_root, backend, version)
-                logger.info(
-                    "Using DSV4 operator calibration source system='%s' version='%s' for target system='%s'",
-                    calibration_source,
-                    version,
-                    self.system,
-                )
-            else:
-                logger.warning("DSV4 operator calibration source system yaml not found: %s", source_yaml_path)
         nccl_data_dir = os.path.join(
             system_data_root,
             "nccl",
             self.system_spec["misc"]["nccl_version"],
         )
-        nccl_perf_filename = _nccl_perf_filename_override(self.system_spec)
         oneccl_version = self.system_spec.get("misc", {}).get("oneccl_version")
         oneccl_data_dir = os.path.join(system_data_root, "oneccl", oneccl_version) if oneccl_version else None
 
-        def _load_op_data(
-            op_filename_enum: PerfDataFilename,
-            *,
-            perf_data_dir_override: str | None = None,
-            system_data_root_override: str | None = None,
-        ) -> LoadedOpData | tuple[LoadedOpData, ...]:
+        def _load_op_data(op_filename_enum: PerfDataFilename) -> LoadedOpData | tuple[LoadedOpData, ...]:
             func_map = {
                 PerfDataFilename.gemm: load_gemm_data,
                 PerfDataFilename.context_attention: load_context_attention_data,
@@ -3012,41 +2845,27 @@ class PerfDatabase:
                 PerfDataFilename.dsa_context_module: load_context_dsa_module_data,
                 PerfDataFilename.dsa_generation_module: load_generation_dsa_module_data,
                 PerfDataFilename.mhc_module: load_mhc_module_data,
-                PerfDataFilename.deepseek_v4_context_module: load_context_deepseek_v4_attention_module_data,
-                PerfDataFilename.deepseek_v4_generation_module: load_generation_deepseek_v4_attention_module_data,
-                PerfDataFilename.dsv4_flash_csa_context_module: load_context_dsv4_flash_kind_module_data,
-                PerfDataFilename.dsv4_flash_hca_context_module: load_context_dsv4_flash_kind_module_data,
-                PerfDataFilename.dsv4_flash_csa_generation_module: load_generation_dsv4_flash_kind_module_data,
-                PerfDataFilename.dsv4_flash_hca_generation_module: load_generation_dsv4_flash_kind_module_data,
-                PerfDataFilename.dsv4_pro_csa_context_module: load_context_dsv4_flash_kind_module_data,
-                PerfDataFilename.dsv4_pro_hca_context_module: load_context_dsv4_flash_kind_module_data,
-                PerfDataFilename.dsv4_pro_csa_generation_module: load_generation_dsv4_flash_kind_module_data,
-                PerfDataFilename.dsv4_pro_hca_generation_module: load_generation_dsv4_flash_kind_module_data,
-                PerfDataFilename.dsv4_flash_paged_mqa_logits_module: load_dsv4_flash_sparse_kernel_data,
-                PerfDataFilename.dsv4_flash_hca_attn_module: load_dsv4_flash_sparse_kernel_data,
-                PerfDataFilename.dsv4_pro_paged_mqa_logits_module: load_dsv4_flash_sparse_kernel_data,
-                PerfDataFilename.dsv4_pro_hca_attn_module: load_dsv4_flash_sparse_kernel_data,
+                PerfDataFilename.dsv4_csa_context_module: load_context_dsv4_kind_module_data,
+                PerfDataFilename.dsv4_hca_context_module: load_context_dsv4_kind_module_data,
+                PerfDataFilename.dsv4_csa_generation_module: load_generation_dsv4_kind_module_data,
+                PerfDataFilename.dsv4_hca_generation_module: load_generation_dsv4_kind_module_data,
+                PerfDataFilename.dsv4_paged_mqa_logits_module: load_dsv4_sparse_kernel_data,
+                PerfDataFilename.dsv4_hca_attn_module: load_dsv4_sparse_kernel_data,
             }
-            perf_data_dir = perf_data_dir_override or op_data_dir
-            source_data_root = system_data_root_override or op_system_data_root
-            op_filename = op_filename_enum.value
+            perf_data_dir = data_dir
             if op_filename_enum == PerfDataFilename.nccl:
                 perf_data_dir = nccl_data_dir
-                source_data_root = system_data_root
-                if nccl_perf_filename:
-                    op_filename = nccl_perf_filename
             elif op_filename_enum == PerfDataFilename.oneccl:
                 perf_data_dir = oneccl_data_dir if oneccl_data_dir else data_dir
-                source_data_root = system_data_root
 
-            data_filepath = os.path.join(perf_data_dir, op_filename)
+            data_filepath = os.path.join(perf_data_dir, op_filename_enum.value)
             load_fn = func_map[op_filename_enum]
 
             # `sources` is a list of `(path, kernel_source_filter | None)` tuples in
             # priority order. Each loader walks them once and applies the existing
             # first-wins-on-key-conflict logic per row, so cross-version / cross-
             # backend inheritance falls out for free without a separate merge pass.
-            sources = self._build_op_sources(op_filename_enum, data_filepath, source_data_root)
+            sources = self._build_op_sources(op_filename_enum, data_filepath, system_data_root)
             result = load_fn(sources)
 
             def _wrap_data_dict(data_dict: Optional[dict]):
@@ -3089,11 +2908,11 @@ class PerfDatabase:
         self._generation_dsa_module_data = _load_op_data(PerfDataFilename.dsa_generation_module)
         self._mhc_module_data = _load_op_data(PerfDataFilename.mhc_module)
 
-        # V4-Flash module-level data — collected as 3 split files per mode
-        # (csa/hca/swa).  Each loader returns a nested dict scoped to one
-        # compress_ratio; we merge into the SAME attribute the legacy single-
-        # file loader fills, so downstream queries are unchanged.
-        def _load_dsv4_flash_split(loaded_list):
+        # DeepSeek-V4 module-level data — collected as split files per mode
+        # (csa/hca).  Each loader returns a nested dict scoped to one
+        # compress_ratio; we merge into one aggregate attribute so downstream
+        # queries do not need to know which attention kind produced each row.
+        def _load_dsv4_split(loaded_list):
             merged: dict = {}
             first_loaded = next((x for x in loaded_list if x is not None), None)
             if first_loaded is None:
@@ -3106,95 +2925,25 @@ class PerfDatabase:
                 return None
             return LoadedOpData(merged, first_loaded.op_name_enum, first_loaded.filepath)
 
-        def _load_dsv4_attention_calibration_split(op_names: list[PerfDataFilename]) -> LoadedOpData | None:
-            if self._dsv4_operator_calibration_enabled:
-                return None
-            source_system = _dsv4_attention_calibration_source()
-            target_pattern = _dsv4_attention_calibration_target_pattern()
-            if not source_system or not target_pattern or target_pattern not in self.system:
-                return None
-            source_yaml_path = os.path.join(systems_root, source_system + ".yaml")
-            if not os.path.isfile(source_yaml_path):
-                logger.warning("DSV4 attention calibration source system yaml not found: %s", source_yaml_path)
-                return None
-            with open(source_yaml_path, encoding="utf-8") as f:
-                self._dsv4_attention_calibration_system_spec = SystemSpec(yaml.load(f, Loader=yaml.SafeLoader))
-            source_system_data_root = os.path.join(systems_root, self._dsv4_attention_calibration_system_spec["data_dir"])
-            source_data_dir = os.path.join(source_system_data_root, backend, version)
-            loaded = [
-                _load_op_data(
-                    op_name,
-                    perf_data_dir_override=source_data_dir,
-                    system_data_root_override=source_system_data_root,
-                )
-                for op_name in op_names
-            ]
-            calibrated = _load_dsv4_flash_split(loaded)
-            if calibrated is not None:
-                logger.info(
-                    "Using DSV4 attention calibration source system='%s' version='%s' for target system='%s'",
-                    source_system,
-                    version,
-                    self.system,
-                )
-            return calibrated
-
         ctx_split = [
-            _load_op_data(PerfDataFilename.dsv4_flash_csa_context_module),
-            _load_op_data(PerfDataFilename.dsv4_flash_hca_context_module),
-            _load_op_data(PerfDataFilename.dsv4_pro_csa_context_module),
-            _load_op_data(PerfDataFilename.dsv4_pro_hca_context_module),
+            _load_op_data(PerfDataFilename.dsv4_csa_context_module),
+            _load_op_data(PerfDataFilename.dsv4_hca_context_module),
         ]
         gen_split = [
-            _load_op_data(PerfDataFilename.dsv4_flash_csa_generation_module),
-            _load_op_data(PerfDataFilename.dsv4_flash_hca_generation_module),
-            _load_op_data(PerfDataFilename.dsv4_pro_csa_generation_module),
-            _load_op_data(PerfDataFilename.dsv4_pro_hca_generation_module),
+            _load_op_data(PerfDataFilename.dsv4_csa_generation_module),
+            _load_op_data(PerfDataFilename.dsv4_hca_generation_module),
         ]
-        self._context_deepseek_v4_attention_module_data = _load_dsv4_flash_split(ctx_split) or _load_op_data(
-            PerfDataFilename.deepseek_v4_context_module
-        )
+        self._context_deepseek_v4_attention_module_data = _load_dsv4_split(ctx_split)
         self._raw_context_deepseek_v4_attention_module_data = copy.deepcopy(
             self._context_deepseek_v4_attention_module_data
         )
-        self._generation_deepseek_v4_attention_module_data = _load_dsv4_flash_split(gen_split) or _load_op_data(
-            PerfDataFilename.deepseek_v4_generation_module
-        )
-        self._context_deepseek_v4_attention_module_calibration_data = _load_dsv4_attention_calibration_split(
-            [
-                PerfDataFilename.dsv4_flash_csa_context_module,
-                PerfDataFilename.dsv4_flash_hca_context_module,
-                PerfDataFilename.dsv4_pro_csa_context_module,
-                PerfDataFilename.dsv4_pro_hca_context_module,
-            ]
-        )
-        self._generation_deepseek_v4_attention_module_calibration_data = _load_dsv4_attention_calibration_split(
-            [
-                PerfDataFilename.dsv4_flash_csa_generation_module,
-                PerfDataFilename.dsv4_flash_hca_generation_module,
-                PerfDataFilename.dsv4_pro_csa_generation_module,
-                PerfDataFilename.dsv4_pro_hca_generation_module,
-            ]
-        )
-        self._raw_context_deepseek_v4_attention_module_calibration_data = copy.deepcopy(
-            self._context_deepseek_v4_attention_module_calibration_data
-        )
+        self._generation_deepseek_v4_attention_module_data = _load_dsv4_split(gen_split)
 
-        # V4-Flash sparse-kernel data (kernel-level past_kv Δ correction).
+        # DeepSeek-V4 sparse-kernel data (kernel-level past_kv Δ correction).
         # Dict keyed by ``arch -> tp -> past_kv -> isl -> bs``.
-        self._dsv4_flash_sparse_kernel_data = {
-            "paged_mqa_logits": _load_dsv4_flash_split(
-                [
-                    _load_op_data(PerfDataFilename.dsv4_flash_paged_mqa_logits_module),
-                    _load_op_data(PerfDataFilename.dsv4_pro_paged_mqa_logits_module),
-                ]
-            ),
-            "hca_attn": _load_dsv4_flash_split(
-                [
-                    _load_op_data(PerfDataFilename.dsv4_flash_hca_attn_module),
-                    _load_op_data(PerfDataFilename.dsv4_pro_hca_attn_module),
-                ]
-            ),
+        self._dsv4_sparse_kernel_data = {
+            "paged_mqa_logits": _load_op_data(PerfDataFilename.dsv4_paged_mqa_logits_module),
+            "hca_attn": _load_op_data(PerfDataFilename.dsv4_hca_attn_module),
         }
 
         # sglang wideep path
@@ -3850,12 +3599,6 @@ class PerfDatabase:
                 "wideep_context_mla": list(wideep_context_mla_modes),
                 "wideep_generation_mla": list(wideep_generation_mla_modes),
             }
-            # `fp8_block` is a behavioral mode for sglang GEMMs that reuses
-            # the base `fp8` GEMM perf tables, while V4-Flash module tables may
-            # still carry explicit `fp8_block` rows.
-            gemm_modes = self.supported_quant_mode.get("gemm", []) or []
-            if common.GEMMQuantMode.fp8.name in gemm_modes and common.GEMMQuantMode.fp8_block.name not in gemm_modes:
-                gemm_modes.append(common.GEMMQuantMode.fp8_block.name)
         elif self.backend == "trtllm":
             self.supported_quant_mode = {
                 "gemm": _enum_key_names(getattr(self, "_gemm_data", None)),
@@ -3882,10 +3625,6 @@ class PerfDatabase:
             gemm_modes = self.supported_quant_mode.get("gemm", []) or []
             if common.GEMMQuantMode.fp8.name in gemm_modes and common.GEMMQuantMode.fp8_static.name not in gemm_modes:
                 gemm_modes.append(common.GEMMQuantMode.fp8_static.name)
-            # `fp8_block` is a behavioral mode that reuses `fp8` TRT-LLM MoE perf tables.
-            moe_modes = self.supported_quant_mode.get("moe", []) or []
-            if common.MoEQuantMode.fp8.name in moe_modes and common.MoEQuantMode.fp8_block.name not in moe_modes:
-                moe_modes.append(common.MoEQuantMode.fp8_block.name)
         elif self.backend == "vllm":
             self.supported_quant_mode = {
                 "gemm": _enum_key_names(getattr(self, "_gemm_data", None)),
@@ -4298,11 +4037,6 @@ class PerfDatabase:
         get_empirical: Callable[[], float],
         database_mode: common.DatabaseMode,
         error_msg: str,
-        fallback_source: str = "empirical",
-        fallback_debug_event: str | None = None,
-        fallback_debug_fields: dict | None = None,
-        apply_dsv4_operator_calibration: bool = True,
-        dsv4_operator_roofline_scale: Callable[[], float] | None = None,
     ) -> PerformanceResult:
         """
         Helper method to query database (SILICON mode) with optional fallback to empirical mode.
@@ -4321,27 +4055,13 @@ class PerfDatabase:
             error_msg += "."
 
         try:
-            result = get_silicon()
-            if apply_dsv4_operator_calibration:
-                result = self._apply_dsv4_operator_calibration(
-                    result,
-                    roofline_scale=dsv4_operator_roofline_scale,
-                )
-            return result
+            return get_silicon()
 
         except Exception as e:
             if database_mode == common.DatabaseMode.HYBRID:
                 debug_msg = error_msg + " Will try empirical mode."
                 logger.debug(debug_msg)
-                emp_latency = get_empirical()
-                if fallback_debug_event is not None:
-                    fields = dict(fallback_debug_fields or {})
-                    fields.setdefault("source", fallback_source)
-                    fields["fallback_reason"] = type(e).__name__
-                    fields["fallback_detail"] = str(e)
-                    fields["latency_ms"] = f"{emp_latency:.6f}"
-                    _log_comm_debug(fallback_debug_event, **fields)
-                return PerformanceResult(emp_latency, energy=0.0, source=fallback_source)
+                return PerformanceResult(get_empirical(), energy=0.0, source="empirical")
 
             exception_msg = error_msg + " Consider using HYBRID mode."
             # PerfDataNotAvailableError is a structured signal that callers (e.g.
@@ -4366,76 +4086,6 @@ class PerfDatabase:
                 e.args = (exception_msg,)
             raise
 
-    def _dsv4_operator_calibration_scale(self, roofline_scale: Callable[[], float] | None = None) -> float:
-        mode = _dsv4_calibration_mode()
-        try:
-            return float(mode)
-        except ValueError:
-            pass
-
-        source_spec = getattr(self, "_dsv4_operator_calibration_system_spec", None)
-        if source_spec is None:
-            return 1.0
-
-        source_gpu = source_spec["gpu"]
-        target_gpu = self.system_spec["gpu"]
-        mem_scale = source_gpu["mem_bw"] / target_gpu["mem_bw"]
-
-        def _gpu_flops(gpu: dict, key: str) -> float | None:
-            value = gpu.get(key)
-            return float(value) if value else None
-
-        source_compute = _gpu_flops(source_gpu, "fp8_tc_flops") or _gpu_flops(source_gpu, "bfloat16_tc_flops")
-        target_compute = _gpu_flops(target_gpu, "fp8_tc_flops") or _gpu_flops(target_gpu, "bfloat16_tc_flops")
-        compute_scale = source_compute / target_compute if source_compute and target_compute else 1.0
-
-        if mode == "roofline" and roofline_scale is not None:
-            try:
-                return roofline_scale()
-            except Exception:
-                logger.debug("DSV4 per-op roofline calibration failed; using global roofline scale", exc_info=True)
-        if mode == "memory":
-            return mem_scale
-        if mode == "compute":
-            return compute_scale
-        if mode == "min":
-            return min(mem_scale, compute_scale)
-        return max(mem_scale, compute_scale)
-
-    def _dsv4_operator_roofline_scale(self, get_sol: Callable[[], tuple[float, float, float]]) -> float:
-        """Scale source silicon latency by the target/source SOL ratio for one op."""
-        source_spec = getattr(self, "_dsv4_operator_calibration_system_spec", None)
-        if source_spec is None:
-            return 1.0
-
-        target_spec = self.system_spec
-
-        def _sol_time(spec: SystemSpec) -> float:
-            original_spec = self.system_spec
-            self.system_spec = spec
-            try:
-                result = get_sol()
-            finally:
-                self.system_spec = original_spec
-            return float(result[0] if isinstance(result, tuple) else result)
-
-        source_sol = _sol_time(source_spec)
-        target_sol = _sol_time(target_spec)
-        if source_sol <= 0 or target_sol <= 0:
-            return 1.0
-        return target_sol / source_sol
-
-    def _apply_dsv4_operator_calibration(
-        self,
-        result: PerformanceResult,
-        roofline_scale: Callable[[], float] | None = None,
-    ) -> PerformanceResult:
-        if not self._dsv4_operator_calibration_enabled:
-            return result
-        scale = self._dsv4_operator_calibration_scale(roofline_scale=roofline_scale)
-        source = f"{result.source}:dsv4_calibrated_from_{self._dsv4_operator_calibration_source}"
-        return PerformanceResult(float(result) * scale, energy=result.energy * scale, source=source)
-
     def _get_quant_tc_flops(self, quant_mode) -> float:
         """Resolve actual tensor-core FLOPS for a given quant mode.
 
@@ -4455,10 +4105,9 @@ class PerfDatabase:
         """
         Normalize GEMM quant modes for perf table lookup.
 
-        `fp8_static` and `fp8_block` are behavioral modes that reuse `fp8`
-        perf tables for the generic GEMM-family ops.
+        `fp8_static` is a behavioral mode that reuses `fp8` perf tables.
         """
-        if quant_mode in (common.GEMMQuantMode.fp8_static, common.GEMMQuantMode.fp8_block):
+        if quant_mode == common.GEMMQuantMode.fp8_static:
             return common.GEMMQuantMode.fp8
         return quant_mode
 
@@ -4569,9 +4218,6 @@ class PerfDatabase:
                 get_empirical=lambda: get_empirical(m, n, k, quant_mode),
                 database_mode=database_mode,
                 error_msg=f"Failed to query gemm data for {m=}, {n=}, {k=}, {quant_mode=}",
-                dsv4_operator_roofline_scale=lambda: self._dsv4_operator_roofline_scale(
-                    lambda: get_sol(m, n, k, quant_mode)
-                ),
             )
 
     @functools.lru_cache(maxsize=32768)
@@ -4663,7 +4309,6 @@ class PerfDatabase:
                 get_empirical=lambda: get_empirical(m, k),
                 database_mode=database_mode,
                 error_msg=f"Failed to query compute_scale data for {m=}, {k=}, {quant_mode=}",
-                dsv4_operator_roofline_scale=lambda: self._dsv4_operator_roofline_scale(lambda: get_sol(m, k)),
             )
 
     @functools.lru_cache(maxsize=32768)
@@ -4755,7 +4400,6 @@ class PerfDatabase:
                 get_empirical=lambda: get_empirical(m, k),
                 database_mode=database_mode,
                 error_msg=f"Failed to query scale_matrix data for {m=}, {k=}, {quant_mode=}",
-                dsv4_operator_roofline_scale=lambda: self._dsv4_operator_roofline_scale(lambda: get_sol(m, k)),
             )
 
     @functools.lru_cache(maxsize=32768)
@@ -5234,6 +4878,8 @@ class PerfDatabase:
         fmha_quant_mode: common.FMHAQuantMode,
         gemm_quant_mode: common.GEMMQuantMode = common.GEMMQuantMode.bfloat16,
         database_mode: common.DatabaseMode | None = None,
+        *,
+        architecture: str = DEFAULT_DSV4_ARCHITECTURE,
     ) -> PerformanceResult | tuple[float, float, float]:
         """
         Query context MLA module-level latency and energy.
@@ -5718,65 +5364,19 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(quant_mode, tp_size, size)[0]
-            _log_comm_debug(
-                "query_custom_allreduce",
-                mode=database_mode.name,
-                quant_mode=quant_mode.name,
-                requested_tp=tp_size,
-                message_size=size,
-                source="sol",
-                latency_ms=f"{sol_latency:.6f}",
-            )
             return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(quant_mode, tp_size, size)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(quant_mode, tp_size, size)
-            _log_comm_debug(
-                "query_custom_allreduce",
-                mode=database_mode.name,
-                quant_mode=quant_mode.name,
-                requested_tp=tp_size,
-                message_size=size,
-                source="empirical",
-                latency_ms=f"{emp_latency:.6f}",
-            )
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
                 if tp_size == 1:
-                    _log_comm_debug(
-                        "query_custom_allreduce",
-                        mode=database_mode.name,
-                        quant_mode=quant_mode.name,
-                        requested_tp=tp_size,
-                        message_size=size,
-                        source="custom_allreduce",
-                        effective_tp=1,
-                        latency_ms="0.000000",
-                    )
                     return PerformanceResult(0.0, energy=0.0, source="empirical")
-                if _prefer_nccl_for_custom_allreduce_enabled():
-                    _log_comm_debug(
-                        "query_custom_allreduce",
-                        mode=database_mode.name,
-                        quant_mode=quant_mode.name,
-                        requested_tp=tp_size,
-                        message_size=size,
-                        source="prefer_nccl_substitute",
-                    )
-                    return self.query_nccl(quant_mode, tp_size, "all_reduce", size, database_mode=database_mode)
                 if self.system_spec["node"]["num_gpus_per_node"] == 72 and tp_size > 4:
                     # on GB200, we only have custom all reduce for up to tp4.
-                    _log_comm_debug(
-                        "query_custom_allreduce",
-                        mode=database_mode.name,
-                        quant_mode=quant_mode.name,
-                        requested_tp=tp_size,
-                        message_size=size,
-                        source="fallback_to_nccl",
-                    )
                     return self.query_nccl(quant_mode, tp_size, "all_reduce", size)
 
                 self._custom_allreduce_data.raise_if_not_loaded()
@@ -5822,21 +5422,6 @@ class PerfDatabase:
                     )
                     lat = lat * scale_factor
                     energy = energy * scale_factor
-
-                _log_comm_debug(
-                    "query_custom_allreduce",
-                    mode=database_mode.name,
-                    quant_mode=quant_mode.name,
-                    requested_tp=tp_size,
-                    effective_tp=effective_tp,
-                    message_size=size,
-                    bucket_left=size_left,
-                    bucket_right=size_right,
-                    scaled=int(tp_size > self.system_spec["node"]["num_gpus_per_node"]),
-                    source="custom_allreduce",
-                    data_file=self._custom_allreduce_data.filepath,
-                    latency_ms=f"{lat:.6f}",
-                )
 
                 return self._interp_pr(lat, energy=energy)
 
@@ -5905,48 +5490,17 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            sol_latency = get_sol(dtype, num_gpus, operation, message_size)[0]
-            _log_comm_debug(
-                "query_nccl",
-                mode=database_mode.name,
-                dtype=dtype.name,
-                operation=operation,
-                requested_num_gpus=num_gpus,
-                message_size=message_size,
-                source="sol",
-                latency_ms=f"{sol_latency:.6f}",
-            )
-            return PerformanceResult(sol_latency, energy=0.0, source="sol")
+            return PerformanceResult(get_sol(dtype, num_gpus, operation, message_size)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(dtype, num_gpus, operation, message_size)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
-            emp_latency = get_empirical(dtype, num_gpus, operation, message_size)
-            _log_comm_debug(
-                "query_nccl",
-                mode=database_mode.name,
-                dtype=dtype.name,
-                operation=operation,
-                requested_num_gpus=num_gpus,
-                message_size=message_size,
-                source="empirical",
-                latency_ms=f"{emp_latency:.6f}",
+            return PerformanceResult(
+                get_empirical(dtype, num_gpus, operation, message_size), energy=0.0, source="empirical"
             )
-            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
                 if num_gpus == 1:
-                    _log_comm_debug(
-                        "query_nccl",
-                        mode=database_mode.name,
-                        dtype=dtype.name,
-                        operation=operation,
-                        requested_num_gpus=num_gpus,
-                        message_size=message_size,
-                        source="nccl",
-                        effective_num_gpus=1,
-                        latency_ms="0.000000",
-                    )
                     return PerformanceResult(0.0, energy=0.0, source="empirical")
 
                 # Use oneCCL data as fallback when NCCL data is not available (e.g. XPU systems)
@@ -5956,8 +5510,7 @@ class PerfDatabase:
                 nccl_source.raise_if_not_loaded()
 
                 max_num_gpus = max(nccl_source[dtype][operation].keys())
-                effective_num_gpus = min(num_gpus, max_num_gpus)
-                nccl_dict = nccl_source[dtype][operation][effective_num_gpus]
+                nccl_dict = nccl_source[dtype][operation][min(num_gpus, max_num_gpus)]
                 size_left, size_right = self._nearest_1d_point_helper(
                     message_size,
                     list(nccl_dict.keys()),
@@ -5988,22 +5541,6 @@ class PerfDatabase:
                     lat = lat * scaling_formula
                     energy = energy * scaling_formula
 
-                _log_comm_debug(
-                    "query_nccl",
-                    mode=database_mode.name,
-                    dtype=dtype.name,
-                    operation=operation,
-                    requested_num_gpus=num_gpus,
-                    effective_num_gpus=effective_num_gpus,
-                    message_size=message_size,
-                    bucket_left=size_left,
-                    bucket_right=size_right,
-                    scaled=int(num_gpus > max_num_gpus),
-                    source=("oneccl" if nccl_source is self._oneccl_data else "nccl"),
-                    data_file=nccl_source.filepath,
-                    latency_ms=f"{lat:.6f}",
-                )
-
                 return self._interp_pr(lat, energy=energy)
 
             return self._query_silicon_or_hybrid(
@@ -6011,18 +5548,6 @@ class PerfDatabase:
                 get_empirical=lambda: get_empirical(dtype, num_gpus, operation, message_size),
                 database_mode=database_mode,
                 error_msg=f"Failed to query nccl data for {dtype=}, {num_gpus=}, {operation=}, {message_size=}",
-                fallback_source="empirical_fallback",
-                fallback_debug_event="query_nccl",
-                fallback_debug_fields={
-                    "mode": database_mode.name,
-                    "dtype": dtype.name,
-                    "operation": operation,
-                    "requested_num_gpus": num_gpus,
-                    "message_size": message_size,
-                    "data_file": self._nccl_data.filepath,
-                    "oneccl_file": self._oneccl_data.filepath if self._oneccl_data is not None else None,
-                },
-                apply_dsv4_operator_calibration=False,
             )
 
     @functools.lru_cache(maxsize=32768)
@@ -6320,9 +5845,6 @@ class PerfDatabase:
                             f"backend='{self.backend}', version='{self.version}'. "
                             "Please use HYBRID or EMPIRICAL database mode, or provide the data file."
                         )
-                    table_quant_mode = (
-                        common.MoEQuantMode.fp8 if quant_mode == common.MoEQuantMode.fp8_block else quant_mode
-                    )
                     # aligned with trtllm, kernel source selection.
                     # Low-latency kernel only available for gated MoE (SwiGLU), not for Relu2
                     if (
@@ -6334,10 +5856,10 @@ class PerfDatabase:
                         try:
                             used_workload_distribution = (
                                 workload_distribution
-                                if workload_distribution in self._moe_low_latency_data[table_quant_mode]
+                                if workload_distribution in self._moe_low_latency_data[quant_mode]
                                 else "uniform"
                             )
-                            moe_dict = self._moe_low_latency_data[table_quant_mode][used_workload_distribution][topk][
+                            moe_dict = self._moe_low_latency_data[quant_mode][used_workload_distribution][topk][
                                 num_experts
                             ][hidden_size][inter_size][moe_tp_size][moe_ep_size]
                             if not moe_dict:
@@ -6355,19 +5877,17 @@ class PerfDatabase:
                         except:
                             used_workload_distribution = (
                                 workload_distribution
-                                if workload_distribution in self._moe_data[table_quant_mode]
+                                if workload_distribution in self._moe_data[quant_mode]
                                 else "uniform"
                             )
-                            moe_dict = self._moe_data[table_quant_mode][used_workload_distribution][topk][num_experts][
+                            moe_dict = self._moe_data[quant_mode][used_workload_distribution][topk][num_experts][
                                 hidden_size
                             ][inter_size][moe_tp_size][moe_ep_size]
                     else:
                         used_workload_distribution = (
-                            workload_distribution
-                            if workload_distribution in self._moe_data[table_quant_mode]
-                            else "uniform"
+                            workload_distribution if workload_distribution in self._moe_data[quant_mode] else "uniform"
                         )
-                        moe_dict = self._moe_data[table_quant_mode][used_workload_distribution][topk][num_experts][
+                        moe_dict = self._moe_data[quant_mode][used_workload_distribution][topk][num_experts][
                             hidden_size
                         ][inter_size][moe_tp_size][moe_ep_size]
                     token_points = _require_moe_token_points(moe_dict, num_tokens, used_workload_distribution)
@@ -6456,19 +5976,6 @@ class PerfDatabase:
                 error_msg=(
                     f"Failed to query moe data for {num_tokens=}, {hidden_size=}, {inter_size=}, {topk=}, "
                     f"{num_experts=}, {moe_tp_size=}, {moe_ep_size=}, {quant_mode=}, {workload_distribution=}"
-                ),
-                dsv4_operator_roofline_scale=lambda: self._dsv4_operator_roofline_scale(
-                    lambda: get_sol(
-                        num_tokens,
-                        hidden_size,
-                        inter_size,
-                        topk,
-                        num_experts,
-                        moe_tp_size,
-                        moe_ep_size,
-                        quant_mode,
-                        workload_distribution,
-                    )
                 ),
             )
 
@@ -6926,7 +6433,7 @@ class PerfDatabase:
             result = self._interp_1d([num_left, num_right], [data[num_left], data[num_right]], num_tokens)
             lat = result["latency"] if isinstance(result, dict) else result
             energy = result.get("energy", 0.0) if isinstance(result, dict) else 0.0
-            return self._apply_dsv4_operator_calibration(self._interp_pr(lat / 1000.0, energy=energy / 1000.0))
+            return self._interp_pr(lat / 1000.0, energy=energy / 1000.0)
 
     @functools.lru_cache(maxsize=32768)
     def query_wideep_deepep_normal(
@@ -6973,7 +6480,7 @@ class PerfDatabase:
                 result = self._interp_2d_linear(sms, num_tokens, data)
                 lat = result["latency"] if isinstance(result, dict) else result
                 energy = result.get("energy", 0.0) if isinstance(result, dict) else 0.0
-            return self._apply_dsv4_operator_calibration(self._interp_pr(lat / 1000.0, energy=energy / 1000.0))
+            return self._interp_pr(lat / 1000.0, energy=energy / 1000.0)
 
     def _correct_data(self) -> None:
         """
@@ -7262,20 +6769,6 @@ class PerfDatabase:
                 f"Failed to query wideep moe compute data (kernel={kernel_source}) for "
                 f"{num_tokens=}, {hidden_size=}, {inter_size=}, {topk=}, {num_experts=}, "
                 f"{num_slots=}, {moe_tp_size=}, {moe_ep_size=}, {quant_mode=}, {workload_distribution=}"
-            ),
-            dsv4_operator_roofline_scale=lambda: self._dsv4_operator_roofline_scale(
-                lambda: get_sol(
-                    num_tokens,
-                    hidden_size,
-                    inter_size,
-                    topk,
-                    num_experts,
-                    num_slots,
-                    moe_tp_size,
-                    moe_ep_size,
-                    quant_mode,
-                    workload_distribution,
-                )
             ),
         )
 
@@ -7700,6 +7193,7 @@ class PerfDatabase:
             emp_latency = get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
+
             def missing_context_dsa_error() -> PerfDataNotAvailableError:
                 return PerfDataNotAvailableError(
                     f"Context DSA module data not available for system='{self.system}', "
@@ -7709,7 +7203,7 @@ class PerfDatabase:
                     "Missing silicon data for the requested lookup."
                 )
 
-            def get_silicon() -> PerformanceResult:
+            try:
                 dsa_module_data = getattr(self, "_context_dsa_module_data", None)
                 if dsa_module_data is None:
                     raise PerfDataNotAvailableError(
@@ -7735,32 +7229,10 @@ class PerfDatabase:
                         num_heads, full_s, b, raw_dsa_dict, index_topk
                     )
                     if result is None:
-                        try:
-                            result = self._interp_3d(num_heads, full_s, b, dsa_dict, "cubic")
-                        except Exception:
-                            logger.debug(
-                                "Failed cubic interpolation for context DSA module; retrying with linear interpolation. "
-                                f"{b=}, {s=}, {prefix=}, {num_heads=}, {architecture=}, "
-                                f"{kvcache_quant_mode=}, {fmha_quant_mode=}, {gemm_quant_mode=}."
-                            )
-                            result = self._interp_3d(num_heads, full_s, b, dsa_dict, "linear")
+                        result = self._interp_3d(num_heads, full_s, b, dsa_dict, "cubic")
                     latency = result["latency"]
                     energy = result.get("energy", 0.0)
-                except Exception as exc:
-                    if self._is_dsa_interpolation_miss(exc):
-                        message = self._format_dsa_unavailable_message(
-                            "Context",
-                            exc,
-                            b=b,
-                            s=s,
-                            prefix=prefix,
-                            num_heads=num_heads,
-                            architecture=architecture,
-                            index_n_heads=index_n_heads,
-                            index_head_dim=index_head_dim,
-                            index_topk=index_topk,
-                        )
-                        raise PerfDataNotAvailableError(message) from exc
+                except (KeyError, TypeError, ValueError, AssertionError) as exc:
                     raise missing_context_dsa_error() from exc
                 if prefix > 0:
                     base_sol = get_sol(b, full_s, 0, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
@@ -7769,17 +7241,39 @@ class PerfDatabase:
                     latency *= correction
                     energy *= correction
                 return self._interp_pr(latency, energy=energy)
-
-            return self._query_silicon_or_hybrid(
-                get_silicon=get_silicon,
-                get_empirical=lambda: get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode),
-                database_mode=database_mode,
-                error_msg=(
-                    f"Failed to query context DSA module for {b=}, {s=}, {prefix=}, {num_heads=}, "
-                    f"{index_n_heads=}, {index_head_dim=}, {index_topk=}, "
-                    f"{kvcache_quant_mode=}, {fmha_quant_mode=}, {gemm_quant_mode=}, {architecture=}, {database_mode=}"
-                ),
-            )
+            except Exception as e:
+                if database_mode == common.DatabaseMode.HYBRID:
+                    logger.debug(
+                        f"Failed to query context DSA module for {b=}, {s=}, {prefix=}, {num_heads=}, "
+                        f"{index_n_heads=}, {index_head_dim=}, {index_topk=}; using empirical"
+                    )
+                    latency = get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
+                    return PerformanceResult(latency, energy=0.0, source="empirical")
+                if isinstance(e, PerfDataNotAvailableError):
+                    logger.warning(str(e))
+                    raise
+                if self._is_dsa_interpolation_miss(e):
+                    message = self._format_dsa_unavailable_message(
+                        "Context",
+                        e,
+                        b=b,
+                        s=s,
+                        prefix=prefix,
+                        num_heads=num_heads,
+                        architecture=architecture,
+                        index_n_heads=index_n_heads,
+                        index_head_dim=index_head_dim,
+                        index_topk=index_topk,
+                    )
+                    logger.warning(message)
+                    raise PerfDataNotAvailableError(message) from None
+                else:
+                    logger.exception(
+                        f"Failed to query context DSA module for {b=}, {s=}, {prefix=}, {num_heads=}, "
+                        f"{index_n_heads=}, {index_head_dim=}, {index_topk=}, "
+                        f"{kvcache_quant_mode=}, {fmha_quant_mode=}, {database_mode=}."
+                    )
+                    raise
 
     @functools.lru_cache(maxsize=32768)
     def query_generation_dsa_module(
@@ -7909,6 +7403,7 @@ class PerfDatabase:
             emp_latency = get_empirical(b, s, num_heads, kv_cache_dtype)
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         else:
+
             def missing_generation_dsa_error() -> PerfDataNotAvailableError:
                 return PerfDataNotAvailableError(
                     f"Generation DSA module data not available for system='{self.system}', "
@@ -7918,7 +7413,7 @@ class PerfDatabase:
                     "Missing silicon data for the requested lookup."
                 )
 
-            def get_silicon() -> PerformanceResult:
+            try:
                 dsa_module_data = getattr(self, "_generation_dsa_module_data", None)
                 if dsa_module_data is None:
                     raise PerfDataNotAvailableError(
@@ -7927,59 +7422,44 @@ class PerfDatabase:
                     )
                 try:
                     dsa_dict = dsa_module_data[kv_cache_dtype][gemm_quant_mode][architecture]
-                except (KeyError, TypeError) as exc:
-                    raise missing_generation_dsa_error() from exc
-                try:
                     result = self._interp_3d(num_heads, b, s, dsa_dict, "cubic")
-                except Exception as cubic_exc:
-                    logger.debug(
-                        "Failed cubic interpolation for generation DSA module; retrying with linear interpolation. "
-                        f"{b=}, {s=}, {num_heads=}, {architecture=}, {kv_cache_dtype=}, {gemm_quant_mode=}."
-                    )
-                    try:
-                        result = self._interp_3d(num_heads, b, s, dsa_dict, "linear")
-                    except Exception as linear_exc:
-                        if self._is_dsa_interpolation_miss(cubic_exc):
-                            message = self._format_dsa_unavailable_message(
-                                "Generation",
-                                cubic_exc,
-                                b=b,
-                                s=s,
-                                num_heads=num_heads,
-                                architecture=architecture,
-                                index_n_heads=index_n_heads,
-                                index_head_dim=index_head_dim,
-                                index_topk=index_topk,
-                            )
-                            raise PerfDataNotAvailableError(message) from cubic_exc
-                        if self._is_dsa_interpolation_miss(linear_exc):
-                            message = self._format_dsa_unavailable_message(
-                                "Generation",
-                                linear_exc,
-                                b=b,
-                                s=s,
-                                num_heads=num_heads,
-                                architecture=architecture,
-                                index_n_heads=index_n_heads,
-                                index_head_dim=index_head_dim,
-                                index_topk=index_topk,
-                            )
-                            raise PerfDataNotAvailableError(message) from linear_exc
-                        raise missing_generation_dsa_error() from linear_exc
-                latency = result["latency"]
-                energy = result.get("energy", 0.0)
+                    latency = result["latency"]
+                    energy = result.get("energy", 0.0)
+                except (KeyError, TypeError, ValueError, AssertionError) as exc:
+                    raise missing_generation_dsa_error() from exc
                 return self._interp_pr(latency, energy=energy)
-
-            return self._query_silicon_or_hybrid(
-                get_silicon=get_silicon,
-                get_empirical=lambda: get_empirical(b, s, num_heads, kv_cache_dtype),
-                database_mode=database_mode,
-                error_msg=(
-                    f"Failed to query generation DSA module for {b=}, {s=}, {num_heads=}, "
-                    f"{index_n_heads=}, {index_head_dim=}, {index_topk=}, "
-                    f"{kv_cache_dtype=}, {gemm_quant_mode=}, {architecture=}, {database_mode=}"
-                ),
-            )
+            except Exception as e:
+                if database_mode == common.DatabaseMode.HYBRID:
+                    logger.debug(
+                        f"Failed to query generation DSA module for {b=}, {s=}, {num_heads=}, "
+                        f"{index_n_heads=}, {index_head_dim=}, {index_topk=}; using empirical"
+                    )
+                    latency = get_empirical(b, s, num_heads, kv_cache_dtype)
+                    return PerformanceResult(latency, energy=0.0, source="empirical")
+                if isinstance(e, PerfDataNotAvailableError):
+                    logger.warning(str(e))
+                    raise
+                if self._is_dsa_interpolation_miss(e):
+                    message = self._format_dsa_unavailable_message(
+                        "Generation",
+                        e,
+                        b=b,
+                        s=s,
+                        num_heads=num_heads,
+                        architecture=architecture,
+                        index_n_heads=index_n_heads,
+                        index_head_dim=index_head_dim,
+                        index_topk=index_topk,
+                    )
+                    logger.warning(message)
+                    raise PerfDataNotAvailableError(message) from None
+                else:
+                    logger.exception(
+                        f"Failed to query generation DSA module for {b=}, {s=}, {num_heads=}, "
+                        f"{index_n_heads=}, {index_head_dim=}, {index_topk=}, "
+                        f"{kv_cache_dtype=}, {database_mode=}."
+                    )
+                    raise
 
     @staticmethod
     def _causal_limited_pairs(batch_size: int, query_len: int, prefix: int, limit: int) -> int:
@@ -8131,18 +7611,17 @@ class PerfDatabase:
                 f"Failed to query DeepSeek-V4 mHC module for {num_tokens=}, {hidden_size=}, "
                 f"{hc_mult=}, {sinkhorn_iters=}, {op=}"
             ),
-            dsv4_operator_roofline_scale=lambda: self._dsv4_operator_roofline_scale(get_sol),
         )
 
-    def _lookup_dsv4_flash_sparse_kernel(
+    def _lookup_dsv4_sparse_kernel(
         self,
         kernel: str,
         bs: int,
         isl: int,
         past_kv: int,
         tp_size: int,
-        architecture: str = "DeepseekV4ForCausalLM",
-        native_num_heads: int | None = None,
+        native_heads: int,
+        architecture: str = DEFAULT_DSV4_ARCHITECTURE,
     ) -> Optional[float]:
         """Look up a sparse-kernel latency at (kernel, bs, isl, past_kv, tp).
 
@@ -8153,17 +7632,16 @@ class PerfDatabase:
              batch that covers isl, interpolate on (past_kv, isl), then scale by batch.
         Returns None if the kernel CSV is not loaded.
         """
-        all_data = getattr(self, "_dsv4_flash_sparse_kernel_data", None)
+        all_data = getattr(self, "_dsv4_sparse_kernel_data", None)
         if all_data is None or kernel not in all_data:
             return None
         loaded = all_data[kernel]
         if loaded is None or loaded.data is None:
             return None
-        per_arch = loaded.data
-        if architecture not in per_arch:
+        per_arch = _dsv4_select_arch(loaded.data, architecture)
+        per_tp = per_arch.get(native_heads) if isinstance(per_arch, dict) else None
+        if per_tp is None:
             return None
-        per_native = per_arch[architecture]
-        per_tp = _dsv4_select_native_heads(per_native, native_num_heads)
         if tp_size in per_tp:
             per_tp_dict = per_tp[tp_size]
         elif 1 in per_tp:
@@ -8393,55 +7871,14 @@ class PerfDatabase:
         )
         return max(sol_math, sol_mem), sol_math, sol_mem
 
-    def _dsv4_attention_calibration_scale(
-        self,
-        *,
-        fmha_quant_mode: common.FMHAQuantMode,
-        gemm_quant_mode: common.GEMMQuantMode,
-    ) -> float:
-        mode = _dsv4_calibration_mode()
-        try:
-            return float(mode)
-        except ValueError:
-            pass
-
-        source_spec = getattr(self, "_dsv4_attention_calibration_system_spec", None)
-        if source_spec is None:
-            return 1.0
-
-        source_gpu = source_spec["gpu"]
-        target_gpu = self.system_spec["gpu"]
-        mem_scale = source_gpu["mem_bw"] / target_gpu["mem_bw"]
-
-        def _flops(spec: dict, quant_mode) -> float:
-            compute_to_flops_key = {1: "bfloat16_tc_flops", 2: "fp8_tc_flops", 4: "fp4_tc_flops"}
-            key = compute_to_flops_key.get(quant_mode.value.compute)
-            if key is not None and key in spec:
-                return spec[key]
-            return spec["bfloat16_tc_flops"] * quant_mode.value.compute
-
-        # DSV4 attention module includes bf16 attention/index pieces and
-        # projection GEMMs. Use the slower of those compute ratios.
-        compute_scale = max(
-            _flops(source_gpu, common.GEMMQuantMode.bfloat16) / _flops(target_gpu, common.GEMMQuantMode.bfloat16),
-            _flops(source_gpu, gemm_quant_mode) / _flops(target_gpu, gemm_quant_mode),
-            _flops(source_gpu, fmha_quant_mode) / _flops(target_gpu, fmha_quant_mode),
-        )
-        if mode == "memory":
-            return mem_scale
-        if mode == "compute":
-            return compute_scale
-        if mode == "min":
-            return min(mem_scale, compute_scale)
-        # Conservative roofline-style scaling from trusted source latency.
-        return max(mem_scale, compute_scale)
-
     @functools.lru_cache(maxsize=32768)
     def query_context_deepseek_v4_attention_module(
         self,
         b: int,
         s: int,
         num_heads: int,
+        native_heads: int,
+        tp_size: int,
         hidden_size: int,
         q_lora_rank: int,
         o_lora_rank: int,
@@ -8459,8 +7896,7 @@ class PerfDatabase:
         database_mode: common.DatabaseMode | None = None,
         *,
         prefix: int = 0,
-        architecture: str = "DeepseekV4ForCausalLM",
-        native_num_heads: int | None = None,
+        architecture: str = DEFAULT_DSV4_ARCHITECTURE,
     ) -> PerformanceResult | tuple[float, float, float]:
         def get_sol() -> tuple[float, float, float]:
             return self._deepseek_v4_attention_sol(
@@ -8504,18 +7940,14 @@ class PerfDatabase:
                     f"DeepSeek-V4 context attention module data not loaded for system='{self.system}', "
                     f"backend='{self.backend}', version='{self.version}'."
                 )
-            native_axis = native_num_heads or DSV4_FLASH_NATIVE_HEADS
-            deepseek_v4_dict = _dsv4_select_native_heads(
-                data[fmha_quant_mode][kvcache_quant_mode][gemm_quant_mode][architecture][compress_ratio], native_axis
-            )
-            # V4-Flash special-case: data is keyed by ``tp_size`` (sglang
-            # never splits attention heads, so the "post-TP local_heads"
-            # value the model layer passes here is just a label — recover
-            # the actual tp_size for the lookup).  Other architectures are
-            # unaffected; this branch only fires for DeepseekV4ForCausalLM.
-            head_axis = (
-                _dsv4_tp_from_num_heads(num_heads, native_num_heads) if architecture == "DeepseekV4ForCausalLM" else num_heads
-            )
+            arch_dict = _dsv4_select_arch(data[fmha_quant_mode][kvcache_quant_mode][gemm_quant_mode], architecture)
+            native_dict = arch_dict.get(native_heads) if isinstance(arch_dict, dict) else None
+            if native_dict is None:
+                raise PerfDataNotAvailableError(
+                    f"No DeepSeek-V4 context attention silicon data for architecture={architecture}, "
+                    f"native_heads={native_heads}, loaded keys={list(arch_dict.keys()) if isinstance(arch_dict, dict) else []}."
+                )
+            deepseek_v4_dict = native_dict[compress_ratio]
 
             # Pick correction strategy up-front because it changes the lookup
             # point: kernel-Δ uses chunk-0 baseline at (b, s); SOL ratio uses
@@ -8523,33 +7955,33 @@ class PerfDatabase:
             kernel = {4: "paged_mqa_logits", 128: "hca_attn"}.get(compress_ratio) if prefix > 0 else None
             t_with = t_without = None
             if kernel is not None:
-                # Use the recovered tp_size for sparse-kernel lookup.
+                # Use the operation tp_size for sparse-kernel lookup.
                 # paged_mqa_logits is collected only at tp=1 (kernel is replicated)
-                # — ``_lookup_dsv4_flash_sparse_kernel`` falls back to tp=1 when
-                # the requested tp isn't present, so passing ``head_axis`` works
+                # — ``_lookup_dsv4_sparse_kernel`` falls back to tp=1 when
+                # the requested tp isn't present, so passing ``tp_size`` works
                 # for both kernels.
-                t_with = self._lookup_dsv4_flash_sparse_kernel(
+                t_with = self._lookup_dsv4_sparse_kernel(
                     kernel=kernel,
                     bs=b,
                     isl=s,
                     past_kv=prefix,
-                    tp_size=head_axis,
+                    tp_size=tp_size,
+                    native_heads=native_heads,
                     architecture=architecture,
-                    native_num_heads=native_axis,
                 )
-                t_without = self._lookup_dsv4_flash_sparse_kernel(
+                t_without = self._lookup_dsv4_sparse_kernel(
                     kernel=kernel,
                     bs=b,
                     isl=s,
                     past_kv=0,
-                    tp_size=head_axis,
+                    tp_size=tp_size,
+                    native_heads=native_heads,
                     architecture=architecture,
-                    native_num_heads=native_axis,
                 )
                 if t_with is None or t_without is None:
                     raise PerfDataNotAvailableError(
                         f"DeepSeek-V4 {kernel} sparse-kernel correction data not available for "
-                        f"{b=}, {s=}, {prefix=}, {head_axis=}, {architecture=}. "
+                        f"{b=}, {s=}, {prefix=}, {native_heads=}, {tp_size=}. "
                         "Cannot query prefix context attention in SILICON mode without kernel delta."
                     )
             use_kernel_delta = kernel is not None
@@ -8561,80 +7993,21 @@ class PerfDatabase:
                 raw_dict = None
                 if raw_data is not None and getattr(raw_data, "loaded", True):
                     try:
-                        raw_dict = raw_data[fmha_quant_mode][kvcache_quant_mode][gemm_quant_mode][architecture][
-                            compress_ratio
-                        ]
-                        raw_dict = _dsv4_select_native_heads(raw_dict, native_axis)
+                        raw_arch_dict = _dsv4_select_arch(
+                            raw_data[fmha_quant_mode][kvcache_quant_mode][gemm_quant_mode],
+                            architecture,
+                        )
+                        raw_native_dict = raw_arch_dict.get(native_heads) if isinstance(raw_arch_dict, dict) else None
+                        raw_dict = None if raw_native_dict is None else raw_native_dict[compress_ratio]
                     except KeyError:
                         raw_dict = None
                 result = self._interp_context_topk_piecewise_from_raw(
-                    head_axis, lookup_s, b, raw_dict, index_topk * compress_ratio
+                    tp_size, lookup_s, b, raw_dict, index_topk * compress_ratio
                 )
             if result is None:
-                # V4-Flash uses a robust lookup (exact -> cubic ->
-                # sampled-batch fallback) to avoid qhull crashes on the
-                # caps-driven flat b axis. Generic ``_interp_3d`` is left
-                # untouched for other architectures.
-                result = (
-                    _dsv4_flash_robust_3d_lookup(
-                        self,
-                        deepseek_v4_dict,
-                        head_axis,
-                        lookup_s,
-                        b,
-                    )
-                    if architecture == "DeepseekV4ForCausalLM"
-                    else self._interp_3d(head_axis, lookup_s, b, deepseek_v4_dict, "cubic")
-                )
-
-            calibration_data = getattr(self, "_context_deepseek_v4_attention_module_calibration_data", None)
-            if calibration_data is not None and getattr(calibration_data, "loaded", False) and prefix == 0:
-                try:
-                    calibration_dict = _dsv4_select_native_heads(
-                        calibration_data[fmha_quant_mode][kvcache_quant_mode][gemm_quant_mode][architecture][
-                            compress_ratio
-                        ],
-                        native_axis,
-                    )
-                    calibration_result = None
-                    if compress_ratio == 4:
-                        calibration_raw_data = getattr(
-                            self, "_raw_context_deepseek_v4_attention_module_calibration_data", None
-                        )
-                        calibration_raw_dict = None
-                        if calibration_raw_data is not None and getattr(calibration_raw_data, "loaded", True):
-                            try:
-                                calibration_raw_dict = calibration_raw_data[fmha_quant_mode][kvcache_quant_mode][
-                                    gemm_quant_mode
-                                ][architecture][compress_ratio]
-                                calibration_raw_dict = _dsv4_select_native_heads(calibration_raw_dict, native_axis)
-                            except KeyError:
-                                calibration_raw_dict = None
-                        calibration_result = self._interp_context_topk_piecewise_from_raw(
-                            head_axis, lookup_s, b, calibration_raw_dict, index_topk * compress_ratio
-                        )
-                    if calibration_result is None:
-                        calibration_result = (
-                            _dsv4_flash_robust_3d_lookup(
-                                self,
-                                calibration_dict,
-                                head_axis,
-                                lookup_s,
-                                b,
-                            )
-                            if architecture == "DeepseekV4ForCausalLM"
-                            else self._interp_3d(head_axis, lookup_s, b, calibration_dict, "cubic")
-                        )
-                    scale = self._dsv4_attention_calibration_scale(
-                        fmha_quant_mode=fmha_quant_mode,
-                        gemm_quant_mode=gemm_quant_mode,
-                    )
-                    result = {"latency": calibration_result["latency"] * scale, "energy": 0.0}
-                except Exception as exc:
-                    logger.debug(
-                        "DSV4 context attention calibration lookup failed; using target silicon data: %s",
-                        exc,
-                    )
+                # Exact → cubic → linear to avoid qhull crashes on the
+                # caps-driven flat b axis.
+                result = _dsv4_robust_3d_lookup(self, deepseek_v4_dict, tp_size, lookup_s, b)
             latency = result["latency"]
             energy = result.get("energy", 0.0)
 
@@ -8686,9 +8059,8 @@ class PerfDatabase:
             database_mode=database_mode,
             error_msg=(
                 f"Failed to query DeepSeek-V4 context attention module for {b=}, {s=}, {prefix=}, "
-                f"{num_heads=}, {compress_ratio=}, {architecture=}"
+                f"{num_heads=}, {native_heads=}, {tp_size=}, {compress_ratio=}"
             ),
-            dsv4_operator_roofline_scale=lambda: self._dsv4_operator_roofline_scale(get_sol),
         )
 
     @functools.lru_cache(maxsize=32768)
@@ -8697,6 +8069,8 @@ class PerfDatabase:
         b: int,
         s: int,
         num_heads: int,
+        native_heads: int,
+        tp_size: int,
         hidden_size: int,
         q_lora_rank: int,
         o_lora_rank: int,
@@ -8713,8 +8087,7 @@ class PerfDatabase:
         gemm_quant_mode: common.GEMMQuantMode = common.GEMMQuantMode.bfloat16,
         database_mode: common.DatabaseMode | None = None,
         *,
-        architecture: str = "DeepseekV4ForCausalLM",
-        native_num_heads: int | None = None,
+        architecture: str = DEFAULT_DSV4_ARCHITECTURE,
     ) -> PerformanceResult | tuple[float, float, float]:
         def get_sol() -> tuple[float, float, float]:
             return self._deepseek_v4_attention_sol(
@@ -8758,43 +8131,15 @@ class PerfDatabase:
                     f"DeepSeek-V4 generation attention module data not loaded for system='{self.system}', "
                     f"backend='{self.backend}', version='{self.version}'."
                 )
-            native_axis = native_num_heads or DSV4_FLASH_NATIVE_HEADS
-            deepseek_v4_dict = _dsv4_select_native_heads(
-                data[kvcache_quant_mode][gemm_quant_mode][architecture][compress_ratio], native_axis
-            )
-            # V4-Flash special-case: data keyed by ``tp_size`` (heads aren't
-            # actually sharded — see note at top of file).
-            head_axis = (
-                _dsv4_tp_from_num_heads(num_heads, native_num_heads) if architecture == "DeepseekV4ForCausalLM" else num_heads
-            )
-            # V4-Flash generation data is keyed as [tp_size][batch][s_total].
-            result = (
-                _dsv4_flash_robust_3d_lookup(self, deepseek_v4_dict, head_axis, b, s, batch_axis="y")
-                if architecture == "DeepseekV4ForCausalLM"
-                else self._interp_3d(head_axis, b, s, deepseek_v4_dict, "cubic")
-            )
-            calibration_data = getattr(self, "_generation_deepseek_v4_attention_module_calibration_data", None)
-            if calibration_data is not None and getattr(calibration_data, "loaded", False):
-                try:
-                    calibration_dict = _dsv4_select_native_heads(
-                        calibration_data[kvcache_quant_mode][gemm_quant_mode][architecture][compress_ratio],
-                        native_axis,
-                    )
-                    calibration_result = (
-                        _dsv4_flash_robust_3d_lookup(self, calibration_dict, head_axis, b, s, batch_axis="y")
-                        if architecture == "DeepseekV4ForCausalLM"
-                        else self._interp_3d(head_axis, b, s, calibration_dict, "cubic")
-                    )
-                    scale = self._dsv4_attention_calibration_scale(
-                        fmha_quant_mode=fmha_quant_mode,
-                        gemm_quant_mode=gemm_quant_mode,
-                    )
-                    result = {"latency": calibration_result["latency"] * scale, "energy": 0.0}
-                except Exception as exc:
-                    logger.debug(
-                        "DSV4 generation attention calibration lookup failed; using target silicon data: %s",
-                        exc,
-                    )
+            arch_dict = _dsv4_select_arch(data[kvcache_quant_mode][gemm_quant_mode], architecture)
+            native_dict = arch_dict.get(native_heads) if isinstance(arch_dict, dict) else None
+            if native_dict is None:
+                raise PerfDataNotAvailableError(
+                    f"No DeepSeek-V4 generation attention silicon data for architecture={architecture}, "
+                    f"native_heads={native_heads}, loaded keys={list(arch_dict.keys()) if isinstance(arch_dict, dict) else []}."
+                )
+            deepseek_v4_dict = native_dict[compress_ratio]
+            result = _dsv4_robust_3d_lookup(self, deepseek_v4_dict, tp_size, b, s, batch_axis="y")
             latency = result["latency"]
             energy = result.get("energy", 0.0)
             return self._interp_pr(latency, energy=energy)
@@ -8805,9 +8150,8 @@ class PerfDatabase:
             database_mode=database_mode,
             error_msg=(
                 f"Failed to query DeepSeek-V4 generation attention module for {b=}, {s=}, "
-                f"{num_heads=}, {compress_ratio=}, {architecture=}"
+                f"{num_heads=}, {native_heads=}, {tp_size=}, {compress_ratio=}"
             ),
-            dsv4_operator_roofline_scale=lambda: self._dsv4_operator_roofline_scale(get_sol),
         )
 
 

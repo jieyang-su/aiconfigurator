@@ -350,7 +350,6 @@ DefaultHFModels = {
     "deepseek-ai/DeepSeek-R1",
     # DeepSeek V3/V3.1 Models
     "deepseek-ai/DeepSeek-V3",
-    "deepseek-ai/DeepSeek-V3.1",
     "nvidia/DeepSeek-V3.1-NVFP4",
     # Kimi K2.5 Models
     "moonshotai/Kimi-K2.5",
@@ -409,6 +408,7 @@ SupportedSystems = {
     "h100_pcie",
     "h200_sxm",
     "b200_sxm",
+    "b300_sxm",
     "gb200",
     "gb300",
     "a100_sxm",
@@ -679,28 +679,20 @@ class PerfDataFilename(Enum):
     dsa_context_module = "dsa_context_module_perf.txt"
     dsa_generation_module = "dsa_generation_module_perf.txt"
     mhc_module = "mhc_module_perf.txt"
-    deepseek_v4_context_module = "deepseek_v4_context_module_perf.txt"
-    deepseek_v4_generation_module = "deepseek_v4_generation_module_perf.txt"
-    # V4-Flash module-level data — one CSV per (attn_kind ∈ {csa, hca},
+    # DeepSeek-V4 module-level data — one CSV per (attn_kind ∈ {csa, hca},
     # mode ∈ {context, generation}) = 4 files.  Each file contains all
     # (tp_size, gemm_type, b, s) rows for that kind+mode.  SWA layers are
     # folded into HCA at the model layer (see models.py:_attention_ops),
     # so no separate SWA collector / data is needed.
-    dsv4_flash_csa_context_module = "dsv4_flash_csa_context_module_perf.txt"
-    dsv4_flash_hca_context_module = "dsv4_flash_hca_context_module_perf.txt"
-    dsv4_flash_csa_generation_module = "dsv4_flash_csa_generation_module_perf.txt"
-    dsv4_flash_hca_generation_module = "dsv4_flash_hca_generation_module_perf.txt"
-    dsv4_pro_csa_context_module = "dsv4_pro_csa_context_module_perf.txt"
-    dsv4_pro_hca_context_module = "dsv4_pro_hca_context_module_perf.txt"
-    dsv4_pro_csa_generation_module = "dsv4_pro_csa_generation_module_perf.txt"
-    dsv4_pro_hca_generation_module = "dsv4_pro_hca_generation_module_perf.txt"
-    # V4-Flash/Pro sparse-kernel data (kernel-level past_kv Δ correction).
-    # Indexed by ``arch -> native_heads -> tp -> past_kv -> isl -> bs``.
+    dsv4_csa_context_module = "dsv4_csa_context_module_perf.txt"
+    dsv4_hca_context_module = "dsv4_hca_context_module_perf.txt"
+    dsv4_csa_generation_module = "dsv4_csa_generation_module_perf.txt"
+    dsv4_hca_generation_module = "dsv4_hca_generation_module_perf.txt"
+    # DeepSeek-V4 sparse-kernel data (kernel-level past_kv Δ correction).
+    # Indexed by ``arch -> tp -> past_kv -> isl -> bs``.
     # topk_512 and csa_attn are modeled analytically — no CSV needed.
-    dsv4_flash_paged_mqa_logits_module = "dsv4_flash_paged_mqa_logits_module_perf.txt"
-    dsv4_flash_hca_attn_module = "dsv4_flash_hca_attn_module_perf.txt"
-    dsv4_pro_paged_mqa_logits_module = "dsv4_pro_paged_mqa_logits_module_perf.txt"
-    dsv4_pro_hca_attn_module = "dsv4_pro_hca_attn_module_perf.txt"
+    dsv4_paged_mqa_logits_module = "dsv4_paged_mqa_logits_module_perf.txt"
+    dsv4_hca_attn_module = "dsv4_hca_attn_module_perf.txt"
 
 
 QuantMapping = namedtuple("QuantMapping", ["memory", "compute", "name"])

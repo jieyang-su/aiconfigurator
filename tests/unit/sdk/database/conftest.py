@@ -51,9 +51,10 @@ _LOADER_STUBS: dict[str, object] = {
     "load_generation_mla_module_data": None,
     "load_context_dsa_module_data": None,
     "load_generation_dsa_module_data": None,
+    "load_context_dsv4_kind_module_data": None,
+    "load_generation_dsv4_kind_module_data": None,
+    "load_dsv4_sparse_kernel_data": None,
     "load_mhc_module_data": None,
-    "load_context_deepseek_v4_attention_module_data": None,
-    "load_generation_deepseek_v4_attention_module_data": None,
 }
 
 

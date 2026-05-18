@@ -6,7 +6,6 @@ from typing import Optional
 
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.perf_database import PerfDatabase
-from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
 from aiconfigurator.sdk.performance_result import PerformanceResult
 
 logger = logging.getLogger(__name__)
@@ -22,7 +21,7 @@ class Operation:
 
     def __init__(self, name: str, scale_factor: float) -> None:
         self._name = name
-        self._scale_factor = scale_factor  # 重复次数（如层数、MTP缩放）
+        self._scale_factor = scale_factor
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """
@@ -68,7 +67,7 @@ class CustomAllReduce(Operation):
         )
 
     def get_weights(self, **kwargs):
-        return self._weights * self._scale_factor #default 0
+        return self._weights * self._scale_factor
 
 
 class P2P(Operation):
@@ -179,7 +178,6 @@ class GEMM(Operation):
         x //= self._scale_num_tokens
         overwrite_quant_mode = kwargs.get("quant_mode")
         quant_mode = self._quant_mode if overwrite_quant_mode is None else overwrite_quant_mode
-        model_name = str(kwargs.get("model_name", ""))
         is_fp8_static = quant_mode == common.GEMMQuantMode.fp8_static
 
         # Query with energy
@@ -210,9 +208,8 @@ class GEMM(Operation):
         if latency_clamped != latency or energy_clamped != energy:
             logger.warning(
                 "GEMM.query clamped latency/energy to 0.0. "
-                "op=%s model=%s m=%s n=%s k=%s quant_mode=%s post_sub(lat=%.6f, eng=%.6f)",
+                "op=%s m=%s n=%s k=%s quant_mode=%s post_sub(lat=%.6f, eng=%.6f)",
                 self._name,
-                model_name,
                 x,
                 self._n,
                 self._k,
@@ -797,24 +794,13 @@ class MoEDispatch(Operation):
                         hidden_size=self._hidden_size,
                     )
             else:
+                assert self._attention_tp_size == 1 or self._attention_dp_size == 1, (
+                    "We don't enable the path for non-wideep SGLang to support TP>1 and DP>1 for attn simultaneously"
+                )
+                # TODO: support TP+DP
                 logger.debug("MoEDispatch: In SGLang non-DeepEP execution path")
-                combined_attention_tpdp = self._attention_tp_size > 1 and self._attention_dp_size > 1
                 if self._pre_dispatch:
-                    if combined_attention_tpdp:
-                        # Matches SGLang DP attention: shard across attention TP, then gather across the full TP world.
-                        comm_latency = database.query_nccl(
-                            common.CommQuantMode.half,
-                            self._attention_tp_size,
-                            "reduce_scatter",
-                            volume,
-                        )
-                        comm_latency += database.query_nccl(
-                            common.CommQuantMode.half,
-                            self.num_gpus,
-                            "all_gather",
-                            volume * self._attention_dp_size,
-                        )
-                    elif self._attention_tp_size > 1:  # tp>1, use allreduce
+                    if self._attention_tp_size > 1:  # tp>1, use allreduce
                         # to do: custom allreduce
                         comm_latency = database.query_custom_allreduce(common.CommQuantMode.half, self.num_gpus, volume)
                     elif self._attention_dp_size > 1:
@@ -827,21 +813,7 @@ class MoEDispatch(Operation):
                     else:
                         comm_latency = 0
                 else:
-                    if combined_attention_tpdp:
-                        # Reverse path: reduce-scatter across the full TP world, then rebuild each attention TP group.
-                        comm_latency = database.query_nccl(
-                            common.CommQuantMode.half,
-                            self.num_gpus,
-                            "reduce_scatter",
-                            volume * self._attention_dp_size,
-                        )
-                        comm_latency += database.query_nccl(
-                            common.CommQuantMode.half,
-                            self._attention_tp_size,
-                            "all_gather",
-                            volume,
-                        )
-                    elif self._attention_tp_size > 1:  # tp>1, use allreduce
+                    if self._attention_tp_size > 1:  # tp>1, use allreduce
                         # to do: custom allreduce
                         comm_latency = database.query_custom_allreduce(common.CommQuantMode.half, self.num_gpus, volume)
                     elif self._attention_dp_size > 1:
@@ -1632,105 +1604,6 @@ class Mamba2(Operation):
         return self._weights * self._scale_factor
 
 
-class FallbackOp(Operation):
-    """Try a primary op first, then sum fallback ops when module data is unavailable."""
-
-    def __init__(self, name: str, primary: Operation, fallback: list[Operation]) -> None:
-        super().__init__(name, 1.0)
-        self._primary = primary
-        self._fallback = fallback
-        self._skip_primary = False
-
-    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
-        if not self._skip_primary:
-            perf_logger = logging.getLogger("aiconfigurator.sdk.perf_database")
-            original_level = perf_logger.level
-            original_database_mode = getattr(database, "_default_database_mode", None)
-            try:
-                perf_logger.setLevel(max(original_level, logging.ERROR))
-                if original_database_mode is not None:
-                    database._default_database_mode = common.DatabaseMode.SILICON
-                return self._primary.query(database, **kwargs)
-            except (PerfDataNotAvailableError, KeyError, AssertionError) as exc:
-                if isinstance(exc, PerfDataNotAvailableError):
-                    self._skip_primary = True
-            finally:
-                perf_logger.setLevel(original_level)
-                if original_database_mode is not None:
-                    database._default_database_mode = original_database_mode
-
-        total_latency = 0.0
-        total_energy = 0.0
-        for op in self._fallback:
-            result = op.query(database, **kwargs)
-            total_latency += float(result)
-            total_energy += result.energy
-        return PerformanceResult(total_latency, energy=total_energy)
-
-    def get_weights(self, **kwargs):
-        primary_weights = self._primary.get_weights(**kwargs)
-        if primary_weights:
-            return primary_weights
-        return sum(op.get_weights(**kwargs) for op in self._fallback)
-
-
-class MLAModule(Operation):
-    """Module-level MLA op that delegates to perf-database fused MLA queries."""
-
-    def __init__(
-        self,
-        name: str,
-        scale_factor: float,
-        is_context: bool,
-        num_heads: int,
-        kvcache_quant_mode: common.KVCacheQuantMode,
-        fmha_quant_mode: common.FMHAQuantMode,
-        gemm_quant_mode: common.GEMMQuantMode,
-    ) -> None:
-        super().__init__(name, scale_factor)
-        self._is_context = is_context
-        self._num_heads = num_heads
-        self._kvcache_quant_mode = kvcache_quant_mode
-        self._fmha_quant_mode = fmha_quant_mode
-        self._gemm_quant_mode = gemm_quant_mode
-        self._weights = 0.0
-
-    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
-        batch_size = kwargs.get("batch_size")
-        s = kwargs.get("s")
-
-        if self._is_context:
-            result = database.query_context_mla_module(
-                b=batch_size,
-                s=s,
-                prefix=kwargs.get("prefix", 0),
-                num_heads=self._num_heads,
-                kvcache_quant_mode=self._kvcache_quant_mode,
-                fmha_quant_mode=self._fmha_quant_mode,
-                gemm_quant_mode=self._gemm_quant_mode,
-            )
-        else:
-            beam_width = kwargs.get("beam_width")
-            if beam_width != 1:
-                raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
-            result = database.query_generation_mla_module(
-                b=batch_size,
-                s=s,
-                num_heads=self._num_heads,
-                kv_cache_dtype=self._kvcache_quant_mode,
-                fmha_quant_mode=self._fmha_quant_mode,
-                gemm_quant_mode=self._gemm_quant_mode,
-            )
-
-        return PerformanceResult(
-            float(result) * self._scale_factor,
-            energy=result.energy * self._scale_factor,
-        )
-
-    def get_weights(self, **kwargs):
-        return self._weights * self._scale_factor
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # DSA (DeepSeek Sparse Attention) Operations
 # ═══════════════════════════════════════════════════════════════════════
@@ -1898,6 +1771,8 @@ class _BaseDeepSeekV4AttentionModule(Operation):
         name: str,
         scale_factor: float,
         num_heads: int,
+        native_heads: int,
+        tp_size: int,
         hidden_size: int,
         q_lora_rank: int,
         o_lora_rank: int,
@@ -1913,10 +1788,11 @@ class _BaseDeepSeekV4AttentionModule(Operation):
         fmha_quant_mode: common.FMHAQuantMode,
         gemm_quant_mode: common.GEMMQuantMode,
         architecture: str = "DeepseekV4ForCausalLM",
-        native_num_heads: int | None = None,
     ) -> None:
         super().__init__(name, scale_factor)
         self._num_heads = num_heads
+        self._native_heads = native_heads
+        self._tp_size = tp_size
         self._hidden_size = hidden_size
         self._q_lora_rank = q_lora_rank
         self._o_lora_rank = o_lora_rank
@@ -1932,7 +1808,6 @@ class _BaseDeepSeekV4AttentionModule(Operation):
         self._fmha_quant_mode = fmha_quant_mode
         self._gemm_quant_mode = gemm_quant_mode
         self._architecture = architecture
-        self._native_num_heads = native_num_heads
         self._weights = self._estimate_weights()
 
     def _estimate_weights(self) -> float:
@@ -1972,6 +1847,8 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             s=kwargs.get("s"),
             prefix=kwargs.get("prefix", 0),
             num_heads=self._num_heads,
+            native_heads=self._native_heads,
+            tp_size=self._tp_size,
             hidden_size=self._hidden_size,
             q_lora_rank=self._q_lora_rank,
             o_lora_rank=self._o_lora_rank,
@@ -1987,7 +1864,6 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             fmha_quant_mode=self._fmha_quant_mode,
             gemm_quant_mode=self._gemm_quant_mode,
             architecture=self._architecture,
-            native_num_heads=self._native_num_heads,
         )
         return PerformanceResult(
             float(result) * self._scale_factor,
@@ -2007,6 +1883,8 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             b=kwargs.get("batch_size"),
             s=kwargs.get("s"),
             num_heads=self._num_heads,
+            native_heads=self._native_heads,
+            tp_size=self._tp_size,
             hidden_size=self._hidden_size,
             q_lora_rank=self._q_lora_rank,
             o_lora_rank=self._o_lora_rank,
@@ -2022,7 +1900,6 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             fmha_quant_mode=self._fmha_quant_mode,
             gemm_quant_mode=self._gemm_quant_mode,
             architecture=self._architecture,
-            native_num_heads=self._native_num_heads,
         )
         return PerformanceResult(
             float(result) * self._scale_factor,
@@ -2222,38 +2099,6 @@ class OverlapOp(Operation):
         total_b = PerformanceResult(0.0, energy=0.0, source="empirical")
         for op in self._group_b:
             total_b += op.query(database, **kwargs)
-
-        # Handle MoE latency hijacking for either branch
-        mock_moe_policy = kwargs.get("mock_moe_policy")
-        if mock_moe_policy is not None and "moe_overlap" in self._name:
-            def apply_mock_moe_policy(group: list, total: PerformanceResult) -> PerformanceResult:
-                moe_ops = [op for op in group if type(op).__name__ in ("MoE", "TrtLLMWideEPMoE")]
-                if not moe_ops:
-                    return total
-
-                total_sf = sum(op._scale_factor for op in moe_ops)
-                dp_size = getattr(moe_ops[0], "_attention_dp_size", 1)
-                moe_tp = getattr(moe_ops[0], "_moe_tp_size", 1)
-                moe_ep = getattr(moe_ops[0], "_moe_ep_size", 1)
-                tokens = kwargs.get("x", 1) * dp_size
-                bottleneck = 0.58 * tokens if tokens > 64 else 0.0
-                hijacked_latency = (float(1160) + bottleneck * total_sf) / 1000.0
-                if tokens > 64 and tokens <=96 and moe_tp == 1 and moe_ep == 4 and dp_size == 4 and mock_moe_policy == "normal":
-                    print(
-                        f"[DEBUG] [MoE-TP={moe_tp}, EP={moe_ep}, DP={dp_size}] "
-                        f"MoE batch_size: {tokens}, native: {float(total):.4f}, "
-                        f"hijacked: {hijacked_latency:.4f}"
-                    )
-                if mock_moe_policy == "normal":
-                    latency = hijacked_latency
-                elif mock_moe_policy == "pareto_best":
-                    latency = min(float(total), hijacked_latency)
-                else:
-                    raise ValueError(f"Unknown mock_moe_policy: {mock_moe_policy}")
-                return PerformanceResult(latency=latency, energy=total.energy, source=total.source)
-
-            total_a = apply_mock_moe_policy(self._group_a, total_a)
-            total_b = apply_mock_moe_policy(self._group_b, total_b)
 
         merged = total_a + total_b
         return PerformanceResult(

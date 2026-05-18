@@ -1468,9 +1468,9 @@ def main():
     parser.add_argument("--device", default="cuda:0", help="CUDA device")
     parser.add_argument(
         "--sglang-version-branch",
-        choices=["auto", "legacy", "current", "v0.5.10", "0.5.10", "main", "adapted"],
+        choices=["auto", "v0.5.10", "0.5.10", "v0.5.12", "0.5.12"],
         default=os.environ.get("COLLECTOR_SGLANG_VERSION_BRANCH", "auto"),
-        help="SGLang API branch. Use legacy/v0.5.10 for sglang-v0.5.10.",
+        help="SGLang API branch. Use v0.5.10 for old SGLang and v0.5.12 for the newer tree.",
     )
     args = parser.parse_args()
     os.environ["COLLECTOR_SGLANG_VERSION_BRANCH"] = args.sglang_version_branch

@@ -32,13 +32,13 @@ try:
     from common_test_cases import get_common_mhc_test_cases
     from registry_types import PerfFile
 
-    from helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
+    from helper import benchmark_with_power, log_perf
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from common_test_cases import get_common_mhc_test_cases
     from registry_types import PerfFile
 
-    from helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
+    from helper import benchmark_with_power, log_perf
 
 
 DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Pro"
@@ -91,17 +91,26 @@ def _default_num_tokens(model_path: str) -> list[int]:
 
 
 def get_mhc_module_test_cases() -> list[dict]:
-    """Return one task per op; each worker sweeps all num_tokens internally.
+    """Return one task per model/op; each worker sweeps all num_tokens internally.
 
     Loading the one-layer runner is expensive, so we pay it once per op
-    (pre/post) instead of per (op, num_tokens) combo.
+    and model instead of per (op, model, num_tokens) combo.
     """
-    model_path = os.environ.get("COLLECTOR_MODEL_PATH", "").strip()
-    if model_path:
-        supported_models = {case.model_name for case in get_common_mhc_test_cases()}
-        if model_path not in supported_models:
-            return []
-    return [{"id": f"mhc_{op}_all", "params": [op]} for op in ("pre", "post")]
+    cases: list[dict] = []
+    seen: set[tuple[str, int, int]] = set()
+    for case in get_common_mhc_test_cases():
+        key = (case.phase, case.hidden_size, case.hc_mult)
+        if key in seen:
+            continue
+        seen.add(key)
+        model_id = case.model_name.replace("/", "_")
+        cases.append(
+            {
+                "id": f"mhc_{case.phase}_hs{case.hidden_size}_hcm{case.hc_mult}_{model_id}",
+                "params": [case.phase, case.model_name],
+            }
+        )
+    return cases
 
 
 def _resolve_perf_path(output_path: str | None, filename: str | None) -> str:
@@ -129,23 +138,9 @@ def _patched_model_dir(model_id: str) -> str:
     original_config = _read_model_config(model_id)
     config = copy.deepcopy(original_config)
 
-    num_layers = int(os.environ.get("SGLANG_TEST_NUM_LAYERS", "1"))
+    num_layers = int(os.environ.get("SGLANG_TEST_NUM_LAYERS", "2"))
     config["num_hidden_layers"] = num_layers  # shrink depth to speed up collector init
-    if config.get("architectures") != ["DeepseekV4ForCausalLM"]:
-        config["architectures"] = ["DeepseekV4ForCausalLM"]
-
-    # Keep the V4 architecture selection via ``architectures`` but rewrite
-    # ``model_type`` to a transformers-known key so AutoConfig succeeds under
-    # dummy load_format without requiring a forked transformers build.
-    config["model_type"] = "deepseek_v3"
-
-    # mHC benchmarks only call hc_pre/hc_post on the decoder layer. The MoE
-    # block is still constructed and dummy-initialized by SGLang, so keep the
-    # per-expert dimensions intact but shrink the routed expert count to avoid
-    # allocating tens of GiB of unused dummy expert weights.
-    min_experts = 8
-    config["n_routed_experts"] = min(int(config.get("n_routed_experts", min_experts)), min_experts)
-    config["num_experts_per_tok"] = min(int(config.get("num_experts_per_tok", 2)), 2)
+    config["model_type"] = "deepseek_ref"
 
     tmp_dir = os.path.join(
         tempfile.gettempdir(),
@@ -172,14 +167,12 @@ def _load_one_layer_runner(
     mem_fraction_static: float,
 ):
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed.parallel_state import cleanup_dist_env_and_memory
     from sglang.srt.entrypoints.engine import _set_envs_and_config
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.utils import suppress_other_loggers
 
     suppress_other_loggers()
-    cleanup_dist_env_and_memory()
     device_obj = torch.device(device)
     torch.cuda.set_device(device_obj)
 
@@ -201,7 +194,7 @@ def _load_one_layer_runner(
         max_prefill_tokens=4096,
     )
     server_args.enable_piecewise_cuda_graph = False
-    server_args.attention_backend = "dsv4"
+    server_args.attention_backend = "compressed"
 
     print(f"[mhc-collector] model_path {model_path} -> {local_model_path}")
 
@@ -260,7 +253,7 @@ def _make_kernel(layer, op: str, residual: torch.Tensor):
         torch.cuda.synchronize()
 
         def kernel():
-            return [layer.hc_post(x, residual, post, comb) for x, post, comb, _norm_fused in post_inputs]
+            return [layer.hc_post(x, residual, post, comb) for x, post, comb in post_inputs]
 
         return kernel
 
@@ -298,11 +291,12 @@ def _log_result(
     *,
     output_path: str | None,
     perf_filename: str | None,
-    model_path: str,
     op: str,
     num_tokens: int,
+    num_sites: int,
     hc_mult: int,
     hidden_size: int,
+    sinkhorn_iters: int,
     latency_ms: float,
     version: str,
     device_name: str,
@@ -311,11 +305,12 @@ def _log_result(
     log_perf(
         item_list=[
             {
-                "model": model_path,
                 "architecture": "DeepseekV4ForCausalLM",
                 "num_tokens": num_tokens,
+                "num_sites": num_sites,
                 "hc_mult": hc_mult,
                 "hidden_size": hidden_size,
+                "sinkhorn_iters": sinkhorn_iters,
                 "latency": f"{latency_ms:.4f}",
             }
         ],
@@ -341,8 +336,6 @@ def run_mhc_module(
     mem_fraction_static: float = 0.5,
     perf_filename: str | None = None,
 ) -> list[dict[str, float]]:
-    from sglang.srt.distributed.parallel_state import cleanup_dist_env_and_memory
-
     if num_iterations < 3:
         raise ValueError("num_iterations must be at least 3")
 
@@ -393,11 +386,12 @@ def run_mhc_module(
                 _log_result(
                     output_path=output_path,
                     perf_filename=perf_filename,
-                    model_path=model_path,
                     op=op,
                     num_tokens=num_tokens,
+                    num_sites=len(_mhc_call_args(layer)),
                     hc_mult=layer.hc_mult,
                     hidden_size=hidden_size,
+                    sinkhorn_iters=int(getattr(layer.config, "hc_sinkhorn_iters", 20)),
                     latency_ms=latency_ms,
                     version=version,
                     device_name=device_name,
@@ -417,7 +411,6 @@ def run_mhc_module(
                 gc.collect()
     finally:
         del model_runner
-        cleanup_dist_env_and_memory()
         torch.cuda.empty_cache()
         gc.collect()
     return results
@@ -425,19 +418,20 @@ def run_mhc_module(
 
 def run_mhc_module_worker(
     op: str,
+    model_path: str | None = None,
     *,
     perf_filename: str,
     device: str = "cuda:0",
 ) -> None:
     """Worker-compatible wrapper used by collector/collect.py.
 
-    Each call sweeps all num_tokens for a single op (pre or post) in
-    one subprocess. ``model_path`` is read from ``COLLECTOR_MODEL_PATH``
-    (set by ``collect.py --model-path``). ``perf_filename`` and ``device``
-    are keyword-only args supplied by collect.py via functools.partial
-    and the worker dispatch loop.
+    Each call sweeps all num_tokens for a single model/op pair in one
+    subprocess. Direct callers that pass only ``op`` still use
+    ``COLLECTOR_MODEL_PATH`` (set by ``collect.py --model-path``) or the
+    default Pro model. ``perf_filename`` and ``device`` are keyword-only args
+    supplied by collect.py via functools.partial and the worker dispatch loop.
     """
-    model_path = os.environ.get("COLLECTOR_MODEL_PATH") or DEFAULT_MODEL
+    model_path = model_path or os.environ.get("COLLECTOR_MODEL_PATH") or DEFAULT_MODEL
     output_path = os.path.dirname(perf_filename) or os.getcwd()
     run_mhc_module(
         ops=[op],
@@ -447,7 +441,6 @@ def run_mhc_module_worker(
         output_path=output_path,
         perf_filename=os.path.basename(perf_filename),
     )
-    sys.exit(EXIT_CODE_RESTART)
 
 
 def main() -> None:
