@@ -418,6 +418,8 @@ def worker(
         if current_task_ids is not None:
             current_task_ids[device_id] = task_id
 
+        should_exit_after_cleanup = False
+
         try:
             worker_logger.debug(f"Starting task {task_id}")
             func(*task, device=device)
@@ -505,7 +507,25 @@ def worker(
                 import gc
 
                 gc.collect()
-                get_device_module().empty_cache()
+                try:
+                    get_device_module().empty_cache()
+                except Exception as cleanup_exc:
+                    is_cuda_fatal_cleanup = isinstance(cleanup_exc, torch.AcceleratorError)
+                    if not is_cuda_fatal_cleanup:
+                        is_cuda_fatal_cleanup = type(cleanup_exc).__name__ == "DSLCudaRuntimeError"
+                    if not is_cuda_fatal_cleanup:
+                        raise
+
+                    worker_logger.warning(
+                        f"Worker {device_id} hit fatal {type(cleanup_exc).__name__} during empty_cache(); "
+                        "exiting cleanly so the parent can restart with a fresh CUDA context"
+                    )
+                    for handler in worker_logger.handlers:
+                        handler.flush()
+                    should_exit_after_cleanup = True
+
+        if should_exit_after_cleanup:
+            return
 
 
 def parallel_run(tasks, func, num_processes, module_name="unknown", resume_options=None):

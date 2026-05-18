@@ -37,6 +37,8 @@ import argparse
 import importlib
 import importlib.util
 import logging
+import math
+import multiprocessing as mp
 import os
 import sys
 import traceback
@@ -161,6 +163,34 @@ PAGE_SIZE_C4 = 64  # paged_mqa_logits block_kv
 PAGE_SIZE_FULL = 64  # FlashMLA paged block_size
 
 DEFAULT_ARCHITECTURE = "DeepseekV4ForCausalLM"
+_HCA_TORCH_FALLBACK_ENV = "COLLECTOR_DSV4_HCA_TORCH_FALLBACK"
+
+
+def _parse_choice_env(env_var: str, default: str) -> str:
+    value = os.environ.get(env_var)
+    if value is None:
+        return default
+    return value.strip().lower()
+
+
+def _get_hca_torch_fallback_policy() -> str:
+    policy = _parse_choice_env(_HCA_TORCH_FALLBACK_ENV, "fatal")
+    if policy in {"0", "false", "off", "never", "disable", "disabled"}:
+        return "never"
+    if policy in {"1", "true", "on", "always"}:
+        return "always"
+    return "fatal"
+
+
+def _is_cuda_illegal_access_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "illegal memory access" in message or "cudaerrorillegaladdress" in message
+
+
+def _pick_hca_torch_q_chunk(batch_size: int, total_k: int) -> int:
+    target_elements = 4 * 1024 * 1024
+    denom = max(1, batch_size * N_HEADS_Q * total_k)
+    return max(1, min(128, target_elements // denom))
 
 
 def _device_num_sms(device: str | torch.device) -> int:
@@ -321,6 +351,36 @@ def _bench_cuda_graph(
 
     if not result.get("used_cuda_graph", False):
         raise RuntimeError("benchmark_with_power did not use CUDA Graph")
+
+    return {
+        "latency_ms": float(result["latency_ms"]),
+        "power_stats": result.get("power_stats"),
+    }
+
+
+def _bench_eager(
+    kernel_fn: Callable[[], None],
+    *,
+    num_warmup: int = 3,
+    num_iterations: int = 8,
+    device: str = "cuda:0",
+) -> dict:
+    """Benchmark an eager-only torch kernel via benchmark_with_power."""
+
+    def timed_kernel():
+        with torch.no_grad():
+            return kernel_fn()
+
+    with benchmark_with_power(
+        device=torch.device(device),
+        kernel_func=timed_kernel,
+        num_warmups=num_warmup,
+        num_runs=num_iterations,
+        repeat_n=1,
+        allow_graph_fail=True,
+        use_cuda_graph=False,
+    ) as result:
+        pass
 
     return {
         "latency_ms": float(result["latency_ms"]),
@@ -634,18 +694,136 @@ def _bench_flash_mla_sparse(
     return _bench_cuda_graph(kernel_fn, device=device)
 
 
-def _bench_hca_attn(M: int, past_kv: int, *, batch_size: int = 1, tp_size: int = 1, device: str = "cuda:0") -> float:  # noqa: N803
-    """HCA: each Q attends to all c128 positions (no topk cap)."""
+def _bench_hca_attn_torch(
+    M: int,  # noqa: N803
+    past_kv: int,
+    *,
+    batch_size: int = 1,
+    device: str = "cuda:0",
+) -> dict:
+    """Torch fallback for HCA sparse attention on unstable FlashMLA runtimes."""
+
+    M_per_req = M // batch_size if batch_size > 1 else M  # noqa: N806
     full_s = M + past_kv
     K_per_query = max(1, full_s // 128)  # noqa: N806
-    return _bench_flash_mla_sparse(
-        M,
-        past_kv,
-        K_per_query=K_per_query,
-        batch_size=batch_size,
-        tp_size=tp_size,
-        device=device,
+    total_k = 128 + K_per_query
+    q_chunk = _pick_hca_torch_q_chunk(batch_size, total_k)
+    torch_device = torch.device(device)
+
+    q = torch.randn(batch_size, N_HEADS_Q, M_per_req, FMLA_D_QK, dtype=torch.bfloat16, device=torch_device)
+    k = torch.randn(batch_size, N_HEADS_Q, total_k, FMLA_D_QK, dtype=torch.bfloat16, device=torch_device)
+    v = torch.randn(batch_size, N_HEADS_Q, total_k, V_HEAD_DIM, dtype=torch.bfloat16, device=torch_device)
+    out = torch.empty(batch_size, N_HEADS_Q, M_per_req, V_HEAD_DIM, dtype=torch.bfloat16, device=torch_device)
+    softmax_scale = 1.0 / math.sqrt(FMLA_D_QK)
+    k_t = k.transpose(-1, -2)
+
+    def kernel_fn():
+        for q_start in range(0, M_per_req, q_chunk):
+            q_end = min(M_per_req, q_start + q_chunk)
+            q_chunk_tensor = q[:, :, q_start:q_end, :]
+            scores = torch.matmul(q_chunk_tensor, k_t) * softmax_scale
+            probs = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+            out[:, :, q_start:q_end, :] = torch.matmul(probs, v)
+
+    result = _bench_eager(kernel_fn, device=device)
+    result["backend"] = "torch_eager"
+    result["fallback_reason"] = "flash_mla_failure"
+    return result
+
+
+def _bench_hca_attn_torch_subprocess_entry(payload: dict, conn) -> None:
+    try:
+        device = str(payload["device"])
+        if torch.cuda.is_available():
+            torch.cuda.set_device(torch.device(device))
+        result = _bench_hca_attn_torch(
+            payload["M"],
+            payload["past_kv"],
+            batch_size=payload["batch_size"],
+            device=device,
+        )
+        conn.send({"ok": True, "result": result})
+    except Exception as exc:
+        conn.send(
+            {
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+    finally:
+        conn.close()
+
+
+def _bench_hca_attn_torch_subprocess(
+    M: int,  # noqa: N803
+    past_kv: int,
+    *,
+    batch_size: int = 1,
+    device: str = "cuda:0",
+) -> dict:
+    ctx = mp.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    process = ctx.Process(
+        target=_bench_hca_attn_torch_subprocess_entry,
+        args=(
+            {
+                "M": M,
+                "past_kv": past_kv,
+                "batch_size": batch_size,
+                "device": str(device),
+            },
+            child_conn,
+        ),
     )
+    process.start()
+    child_conn.close()
+    process.join()
+
+    outcome = parent_conn.recv() if parent_conn.poll() else None
+    parent_conn.close()
+    if process.exitcode != 0:
+        raise RuntimeError(f"torch HCA fallback subprocess exited with status {process.exitcode}")
+    if not outcome:
+        raise RuntimeError("torch HCA fallback subprocess produced no result")
+    if not outcome.get("ok"):
+        raise RuntimeError(
+            "torch HCA fallback failed: "
+            f"{outcome['error_type']}: {outcome['error_message']}\n{outcome['traceback']}"
+        )
+    return outcome["result"]
+
+
+def _bench_hca_attn(M: int, past_kv: int, *, batch_size: int = 1, tp_size: int = 1, device: str = "cuda:0") -> float:  # noqa: N803
+    """HCA: each Q attends to all c128 positions (no topk cap)."""
+    fallback_policy = _get_hca_torch_fallback_policy()
+    if fallback_policy == "always":
+        return _bench_hca_attn_torch(M, past_kv, batch_size=batch_size, device=device)
+
+    full_s = M + past_kv
+    K_per_query = max(1, full_s // 128)  # noqa: N806
+    try:
+        return _bench_flash_mla_sparse(
+            M,
+            past_kv,
+            K_per_query=K_per_query,
+            batch_size=batch_size,
+            tp_size=tp_size,
+            device=device,
+        )
+    except Exception as exc:
+        if fallback_policy == "never" or not _is_cuda_illegal_access_error(exc):
+            raise
+        logger.warning(
+            "FlashMLA HCA benchmark failed with illegal memory access at "
+            "bs=%s M=%s past_kv=%s device=%s; retrying with torch fallback",
+            batch_size,
+            M,
+            past_kv,
+            device,
+        )
+        return _bench_hca_attn_torch_subprocess(M, past_kv, batch_size=batch_size, device=device)
 
 
 _BENCH_FN = {
@@ -777,6 +955,7 @@ def run_dsv4_sparse_kernel_worker(
 
     latency_ms = float(bench_result["latency_ms"])
     power_stats = bench_result.get("power_stats")
+    backend_name = bench_result.get("backend")
     device_name = torch.cuda.get_device_name(device)
     _write_row(
         perf_path,
@@ -791,7 +970,8 @@ def run_dsv4_sparse_kernel_worker(
         power_stats=power_stats,
     )
     power_str = f", power={power_stats['power']:.1f}W" if power_stats and power_stats.get("power") is not None else ""
-    print(f"  latency={latency_ms:.4f} ms{power_str}")
+    backend_str = f", backend={backend_name}" if backend_name else ""
+    print(f"  latency={latency_ms:.4f} ms{power_str}{backend_str}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
