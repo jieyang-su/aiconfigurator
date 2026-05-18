@@ -3,15 +3,16 @@
 
 import csv
 import functools
-import hashlib
 import heapq
 import json
 import logging
 import math
 import multiprocessing as mp
 import os
+import shutil
 import signal
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -47,21 +48,6 @@ def _parse_bool_env(env_var: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in ("true", "1", "yes")
-
-
-def resolve_subprocess_visible_device(logical_device_id: int) -> str:
-    """Map a logical worker-local device index through CUDA_VISIBLE_DEVICES."""
-    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if not visible_devices:
-        return str(logical_device_id)
-
-    device_tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
-    if 0 <= logical_device_id < len(device_tokens):
-        return device_tokens[logical_device_id]
-
-    raise ValueError(
-        f"logical gpu_id={logical_device_id} is out of range for CUDA_VISIBLE_DEVICES={visible_devices!r}"
-    )
 
 
 def _ensure_nvml_initialized():
@@ -457,22 +443,6 @@ _LOGGING_CONFIGURED = False
 _LOG_DIR = None
 
 
-def _build_log_dir_name(scope: list[str], time_stamp: str, max_component_len: int = 200) -> str:
-    """Build a filesystem-safe log directory name from scope + timestamp.
-
-    The final path component must stay below typical filesystem limits
-    (255 bytes on Linux). For long scope lists, keep a readable prefix
-    and append a stable hash suffix.
-    """
-    tokens = [str(item).strip() for item in (scope or ["all"]) if str(item).strip()]
-    base = "+".join(tokens) if tokens else "all"
-    if len(base) > max_component_len:
-        digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
-        head_len = max_component_len - len(digest) - 1
-        base = f"{base[:head_len]}_{digest}"
-    return f"{base}_{time_stamp}"
-
-
 def setup_logging(scope=["all"], debug=False, worker_id=None):
     """
     Setup structured logging - auto-configures based on process type
@@ -557,9 +527,9 @@ def setup_logging(scope=["all"], debug=False, worker_id=None):
 
     # Create log directory
     time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _LOG_DIR = Path(_build_log_dir_name(scope, time_stamp))
+    _LOG_DIR = Path(f"{'+'.join(scope)}_{time_stamp}")
     if not _LOG_DIR.is_dir():
-        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _LOG_DIR.mkdir()
 
     # Set environment variables for workers
     os.environ["COLLECTOR_DEBUG"] = "true" if debug else "false"
@@ -1500,118 +1470,136 @@ def power_law_deepep_decode(num_tokens, num_experts, topk, ep, alpha):
     return num_tokens_per_expert.view(ep, experts_per_rank)[0]
 
 
-def _get_deepseek_model_path():
-    """Get DeepSeek model path, downloading config files from HuggingFace if needed.
+# AIC's cached HuggingFace model configs — avoids HF downloads in CI.
+_AIC_MODEL_CONFIG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "src",
+    "aiconfigurator",
+    "model_configs",
+)
 
-    If a collector/local DeepSeek path is set, use that path.
-    Otherwise, download only the necessary config files from HuggingFace.
-    This allows running the collector without downloading the full model weights.
+
+def _materialize_aic_cached_config(model_id: str, slug: str, cached_config: str) -> str:
+    """Copy a bundled AIC config into a deterministic per-model tempdir.
+
+    ``auto_map`` is stripped so that ``trust_remote_code=True`` consumers
+    (e.g. SGLang's ServerArgs) do not try to import ``configuration_*.py``
+    files that AIC does not ship. A deterministic path (no random suffix,
+    no pid) lets parallel subprocesses / pytest-xdist workers converge on
+    the same directory; the JSON write is atomic via ``os.replace``.
     """
-    collector_local_path = os.environ.get("COLLECTOR_LOCAL_MODEL_PATH")
-    if collector_local_path:
-        return collector_local_path
+    tmp_dir = os.path.join(tempfile.gettempdir(), f"aic_model_config_{slug}")
+    os.makedirs(tmp_dir, exist_ok=True)
 
-    collector_model_path = os.environ.get("COLLECTOR_MODEL_PATH", "").strip()
-    if collector_model_path:
-        return collector_model_path
+    target = os.path.join(tmp_dir, "config.json")
+    if not os.path.exists(target):
+        with open(cached_config) as f:
+            config = json.load(f)
+        config.pop("auto_map", None)
+        tmp_target = f"{target}.{os.getpid()}.tmp"
+        with open(tmp_target, "w") as f:
+            json.dump(config, f)
+        os.replace(tmp_target, target)
 
-    env_path = os.environ.get("DEEPSEEK_MODEL_PATH")
-    if env_path:
-        return env_path
+    quant_side_car = os.path.join(_AIC_MODEL_CONFIG_DIR, f"{slug}_hf_quant_config.json")
+    quant_target = os.path.join(tmp_dir, "hf_quant_config.json")
+    if os.path.exists(quant_side_car) and not os.path.exists(quant_target):
+        tmp_quant = f"{quant_target}.{os.getpid()}.tmp"
+        shutil.copy(quant_side_car, tmp_quant)
+        os.replace(tmp_quant, quant_target)
 
-    # Download config files from HuggingFace (no model weights needed)
+    print(f"Resolved {model_id} from AIC model_configs cache: {tmp_dir}")
+    return tmp_dir
+
+
+def _resolve_local_model_path(model_id: str) -> str:
+    """Resolve a model identifier to a local directory containing ``config.json``.
+
+    Resolution order:
+        1. Existing filesystem path. Must be a directory containing
+           ``config.json`` — a file path or a directory without ``config.json``
+           raises rather than silently falling through to HF download.
+        2. AIC's bundled configs in ``src/aiconfigurator/model_configs/``
+           (``<owner>--<name>_config.json``, with an optional
+           ``..._hf_quant_config.json`` side-car).
+        3. HuggingFace ``hf_hub_download``: ``config.json`` is required
+           and downloaded first; tokenizer files are best-effort.
+
+    Raises ``FileNotFoundError`` if none of the above resolves. There is
+    no hardcoded ``/deepseek-v3`` (or any other model-specific) fallback —
+    callers must supply a real ``model_id``.
+    """
+    if not model_id:
+        raise ValueError("_resolve_local_model_path requires a non-empty model_id")
+
+    # Step 1: existing filesystem path. Be strict about shape so a bogus
+    # MOE_MODEL_PATH (e.g. pointing at a single file) fails loudly here
+    # instead of silently triggering an HF download.
+    if os.path.exists(model_id):
+        if not os.path.isdir(model_id):
+            raise NotADirectoryError(
+                f"model_id '{model_id}' is an existing path but not a directory; "
+                "expected a directory containing config.json"
+            )
+        if not os.path.exists(os.path.join(model_id, "config.json")):
+            raise FileNotFoundError(f"model_id '{model_id}' is a directory but does not contain config.json")
+        return model_id
+
+    # Step 2: AIC bundled cache.
+    slug = model_id.replace("/", "--")
+    cached_config = os.path.join(_AIC_MODEL_CONFIG_DIR, f"{slug}_config.json")
+    if os.path.exists(cached_config):
+        return _materialize_aic_cached_config(model_id, slug, cached_config)
+
+    # Step 3: HuggingFace download. config.json is mandatory and must
+    # succeed before we accept the resulting snapshot directory.
     try:
         from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        raise FileNotFoundError(
+            f"Model '{model_id}' not found under {_AIC_MODEL_CONFIG_DIR} and "
+            "huggingface_hub is not installed — cannot download config."
+        ) from e
 
-        repo_id = "deepseek-ai/DeepSeek-V3"
-        config_files = [
-            "config.json",
-            "configuration_deepseek.py",
-            "tokenizer_config.json",
-            "tokenizer.json",
-        ]
-
-        snapshot_dir = None
-        for filename in config_files:
-            try:
-                path = hf_hub_download(repo_id=repo_id, filename=filename)
-                if snapshot_dir is None:
-                    snapshot_dir = os.path.dirname(path)
-            except Exception as e:
-                print(f"Warning: Failed to download {filename}: {e}")
-
-        if snapshot_dir:
-            print(f"Using DeepSeek-V3 config from HuggingFace cache: {snapshot_dir}")
-            return snapshot_dir
-    except ImportError:
-        print("Warning: huggingface_hub not installed, cannot auto-download config")
-    except Exception as e:
-        print(f"Warning: Failed to download DeepSeek-V3 config: {e}")
-
-    # Fallback to default path
-    return "/deepseek-v3"
-
-
-def _get_moe_model_path():
-    """Get MoE model path, supporting multiple MoE models (DeepSeek, Qwen3, etc.).
-
-    Checks environment variables in priority order:
-    1. COLLECTOR_LOCAL_MODEL_PATH - local path passed via collect.py --model-path
-    2. COLLECTOR_MODEL_PATH - validated canonical model ID or local path
-    3. MOE_MODEL_PATH - generic, for any MoE model
-    4. DEEPSEEK_MODEL_PATH - backward compatibility for DeepSeek models
-    Otherwise, download only the necessary config files from HuggingFace.
-    This allows running the collector without downloading the full model weights.
-    """
-    collector_local_path = os.environ.get("COLLECTOR_LOCAL_MODEL_PATH")
-    if collector_local_path:
-        return collector_local_path
-
-    collector_model_path = os.environ.get("COLLECTOR_MODEL_PATH", "").strip()
-    if collector_model_path:
-        return collector_model_path
-
-    # Try MOE_MODEL_PATH first (generic)
-    env_path = os.environ.get("MOE_MODEL_PATH")
-    if env_path:
-        return env_path
-
-    # Backward compatibility: try DEEPSEEK_MODEL_PATH
-    env_path = os.environ.get("DEEPSEEK_MODEL_PATH")
-    if env_path:
-        return env_path
-
-    # Download config files from HuggingFace (no model weights needed)
     try:
-        from huggingface_hub import hf_hub_download
-
-        repo_id = "deepseek-ai/DeepSeek-V3"
-        config_files = [
-            "config.json",
-            "configuration_deepseek.py",
-            "tokenizer_config.json",
-            "tokenizer.json",
-        ]
-
-        snapshot_dir = None
-        for filename in config_files:
-            try:
-                path = hf_hub_download(repo_id=repo_id, filename=filename)
-                if snapshot_dir is None:
-                    snapshot_dir = os.path.dirname(path)
-            except Exception as e:
-                print(f"Warning: Failed to download {filename}: {e}")
-
-        if snapshot_dir:
-            print(f"Using DeepSeek-V3 config from HuggingFace cache: {snapshot_dir}")
-            return snapshot_dir
-    except ImportError:
-        print("Warning: huggingface_hub not installed, cannot auto-download config")
+        config_path = hf_hub_download(repo_id=model_id, filename="config.json")
     except Exception as e:
-        print(f"Warning: Failed to download DeepSeek-V3 config: {e}")
+        raise FileNotFoundError(
+            f"Model '{model_id}' not found under {_AIC_MODEL_CONFIG_DIR} and "
+            f"HuggingFace download of config.json failed: {e}"
+        ) from e
+    snapshot_dir = os.path.dirname(config_path)
 
-    # Fallback to default path
-    return "/deepseek-v3"
+    for filename in ("tokenizer_config.json", "tokenizer.json"):
+        try:
+            hf_hub_download(repo_id=model_id, filename=filename)
+        except Exception as e:
+            # Tokenizer files are best-effort — many MoE configs ship without them.
+            print(f"Warning: failed to download {filename} for {model_id}: {e}")
+
+    print(f"Resolved {model_id} from HuggingFace cache: {snapshot_dir}")
+    return snapshot_dir
+
+
+@functools.lru_cache(maxsize=1)
+def _get_moe_model_path() -> str:
+    """Resolve the selected MoE model through the generic local-model resolver.
+
+    Environment priority is kept for existing collector workflows:
+    ``COLLECTOR_LOCAL_MODEL_PATH`` (local path set by collect.py),
+    ``COLLECTOR_MODEL_PATH`` (validated model id/path), ``MOE_MODEL_PATH``,
+    then legacy ``DEEPSEEK_MODEL_PATH``.  If none is set, default to
+    DeepSeek-V3.
+    """
+
+    model_id = (
+        os.environ.get("COLLECTOR_LOCAL_MODEL_PATH")
+        or os.environ.get("COLLECTOR_MODEL_PATH")
+        or os.environ.get("MOE_MODEL_PATH")
+        or os.environ.get("DEEPSEEK_MODEL_PATH")
+        or "deepseek-ai/DeepSeek-V3"
+    )
+    return _resolve_local_model_path(model_id.strip())
 
 
 @functools.lru_cache(maxsize=1)

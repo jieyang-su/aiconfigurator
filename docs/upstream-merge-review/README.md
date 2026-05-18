@@ -354,6 +354,38 @@ Resolution in progress:
 - Corrected SGLang branch mapping:
   `v0.5.10 -> compressed`, `v0.5.12 -> dsv4`.
 
+## Current Conflict: #1122 Generic Collector Model Resolver
+
+Upstream commit:
+
+- `a4827ce2 refactor(collector): replace DeepSeek-specific helpers with _resolve_local_model_path() (#708) (#1122)`
+
+Conflict files:
+
+- `collector/helper.py`
+- `collector/sglang/collect_wideep_deepep_moe.py`
+
+Conflict cause:
+
+- Upstream replaced DeepSeek-specific helper behavior with a generic
+  `_resolve_local_model_path(model_id)` that resolves local config directories,
+  AIC cached model configs, or HuggingFace config downloads.
+- This fork already had MoE collector model-path priority across
+  `COLLECTOR_LOCAL_MODEL_PATH`, `COLLECTOR_MODEL_PATH`, `MOE_MODEL_PATH`, and
+  legacy `DEEPSEEK_MODEL_PATH`, plus SGLang-specific config rewriting in
+  `collect_wideep_deepep_moe.py`.
+
+Resolution:
+
+- Keep upstream `_resolve_local_model_path(model_id)` as the shared resolver.
+- Add `_get_moe_model_path()` as a thin compatibility wrapper preserving the
+  existing MoE environment-variable priority, but delegate actual resolution to
+  `_resolve_local_model_path`.
+- Keep `collect_wideep_deepep_moe.py` model-specific SGLang config rewrite and
+  subprocess GPU mapping via `resolve_subprocess_visible_device`.
+- Make wideep MoE config loading call `_resolve_local_model_path()` first so AIC
+  cached configs and HF side-car quant configs work consistently.
+
 ## Current Conflict File-by-File Analysis
 
 This section records the active `#1002` conflict at the file level.  No

@@ -28,6 +28,7 @@ from sglang.srt.utils import (
 try:
     from helper import (
         _get_moe_model_path,
+        _resolve_local_model_path,
         log_perf,
         power_law_deepep_decode,
         power_law_deepep_prefill,
@@ -40,6 +41,7 @@ except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from helper import (
         _get_moe_model_path,
+        _resolve_local_model_path,
         log_perf,
         power_law_deepep_decode,
         power_law_deepep_prefill,
@@ -96,6 +98,11 @@ def _resolve_moe_model_path() -> str:
 
 def _load_model_config_dict(model_ref: str) -> dict | None:
     """Load a model config from a local directory or built-in cached config."""
+    try:
+        model_ref = _resolve_local_model_path(model_ref)
+    except Exception:
+        pass
+
     config_path = None
     if os.path.isdir(model_ref):
         candidate = os.path.join(model_ref, "config.json")
@@ -143,7 +150,16 @@ def _get_total_experts_for_selected_model(default: int = 256) -> int:
     config = _load_model_config_dict(_resolve_moe_model_path())
     if config is None:
         return default
-    return int(config.get("n_routed_experts") or config.get("num_experts") or default)
+    text_config = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+    return int(
+        config.get("n_routed_experts")
+        or config.get("num_experts")
+        or config.get("num_local_experts")
+        or text_config.get("n_routed_experts")
+        or text_config.get("num_experts")
+        or text_config.get("num_local_experts")
+        or default
+    )
 
 
 def get_moe_prefill_test_cases(rank):
