@@ -295,6 +295,41 @@ def _add_default_mode_arguments(parser):
         "Set this to match your actual deployment for accurate KV cache capacity filtering.",
     )
     parser.add_argument(
+        "--gemm-quant-mode",
+        choices=[m.name for m in common.GEMMQuantMode],
+        type=str,
+        default=None,
+        help="GEMM quantization mode override for default-mode sweeps. Auto-inferred from model config if omitted.",
+    )
+    parser.add_argument(
+        "--kvcache-quant-mode",
+        choices=[m.name for m in common.KVCacheQuantMode],
+        type=str,
+        default=None,
+        help="KV cache quantization mode override for default-mode sweeps. Auto-inferred from model config if omitted.",
+    )
+    parser.add_argument(
+        "--fmha-quant-mode",
+        choices=[m.name for m in common.FMHAQuantMode],
+        type=str,
+        default=None,
+        help="FMHA quantization mode override for default-mode sweeps. Auto-inferred from model config if omitted.",
+    )
+    parser.add_argument(
+        "--moe-quant-mode",
+        choices=[m.name for m in common.MoEQuantMode],
+        type=str,
+        default=None,
+        help="MoE quantization mode override for default-mode sweeps. Auto-inferred from model config if omitted.",
+    )
+    parser.add_argument(
+        "--comm-quant-mode",
+        choices=[m.name for m in common.CommQuantMode],
+        type=str,
+        default=None,
+        help="Communication quantization mode override for default-mode sweeps. Auto-inferred if omitted.",
+    )
+    parser.add_argument(
         "--enable-wideep",
         action="store_true",
         default=False,
@@ -761,6 +796,11 @@ def build_default_task_configs(
     enable_chunked_prefill: bool = False,
     free_gpu_memory_fraction: float | None = None,
     max_seq_len: int | None = None,
+    gemm_quant_mode: str | None = None,
+    kvcache_quant_mode: str | None = None,
+    fmha_quant_mode: str | None = None,
+    moe_quant_mode: str | None = None,
+    comm_quant_mode: str | None = None,
     enable_wideep: bool = False,
     engine_step_backend: str | None = None,
 ) -> dict[str, TaskConfig]:
@@ -784,6 +824,11 @@ def build_default_task_configs(
         nextn: Number of draft tokens for MTP speculative decoding.
         nextn_accept_rates: Acceptance rates for MTP draft tokens.
         enable_chunked_prefill: Whether to enable chunked prefill for finer context token sweep.
+        gemm_quant_mode: Optional GEMM quantization mode override.
+        kvcache_quant_mode: Optional KV cache quantization mode override.
+        fmha_quant_mode: Optional FMHA quantization mode override.
+        moe_quant_mode: Optional MoE quantization mode override.
+        comm_quant_mode: Optional communication quantization mode override.
         enable_wideep: Whether to enable Wide Expert Parallelism (WideEP) for MoE models.
         engine_step_backend: Experimental static latency backend ("python" or "rust").
 
@@ -910,15 +955,29 @@ def build_default_task_configs(
     if enable_wideep:
         common_kwargs["moe_backend"] = "deepep_moe"
 
-    # Create yaml_config to pass nextn and nextn_accept_rates if specified
-    yaml_config = None
+    # Create yaml_config patch for explicit overrides without widening TaskConfig's constructor.
+    yaml_patch_config: dict[str, Any] = {}
     if nextn > 0:
-        yaml_config = {
-            "config": {
-                "nextn": nextn,
-                "nextn_accept_rates": nextn_accept_rates,
-            }
-        }
+        yaml_patch_config["nextn"] = nextn
+        yaml_patch_config["nextn_accept_rates"] = nextn_accept_rates
+
+    quant_override = {
+        key: value
+        for key, value in {
+            "gemm_quant_mode": gemm_quant_mode,
+            "kvcache_quant_mode": kvcache_quant_mode,
+            "fmha_quant_mode": fmha_quant_mode,
+            "moe_quant_mode": moe_quant_mode,
+            "comm_quant_mode": comm_quant_mode,
+        }.items()
+        if value is not None
+    }
+    if quant_override:
+        yaml_patch_config["worker_config"] = dict(quant_override)
+        yaml_patch_config["prefill_worker_config"] = dict(quant_override)
+        yaml_patch_config["decode_worker_config"] = dict(quant_override)
+
+    yaml_config = {"config": yaml_patch_config} if yaml_patch_config else None
 
     task_configs: dict[str, TaskConfig] = {}
     is_moe_model = check_is_moe(model_path)
@@ -1730,6 +1789,11 @@ def main(args):
             enable_chunked_prefill=args.enable_chunked_prefill,
             free_gpu_memory_fraction=args.free_gpu_memory_fraction,
             max_seq_len=args.max_seq_len,
+            gemm_quant_mode=args.gemm_quant_mode,
+            kvcache_quant_mode=args.kvcache_quant_mode,
+            fmha_quant_mode=args.fmha_quant_mode,
+            moe_quant_mode=args.moe_quant_mode,
+            comm_quant_mode=args.comm_quant_mode,
             engine_step_backend=args.engine_step_backend,
             enable_wideep=getattr(args, "enable_wideep", False),
         )

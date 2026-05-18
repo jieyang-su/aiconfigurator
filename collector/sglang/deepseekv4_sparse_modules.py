@@ -160,7 +160,11 @@ FMLA_NUM_TILES = 7
 
 # Page sizes
 PAGE_SIZE_C4 = 64  # paged_mqa_logits block_kv
-PAGE_SIZE_FULL = 64  # FlashMLA paged block_size
+PAGE_SIZE_MODEL = 256  # DeepSeek-V4 runtime page size
+PAGE_SIZE_SWA = 128  # SWA ring window and page size
+SWA_WINDOW = PAGE_SIZE_SWA
+PAGE_SIZE_C128 = PAGE_SIZE_MODEL // 128  # c128 extra cache page size (=2)
+PAGE_INDEX_ALIGNED_SIZE = 64
 
 DEFAULT_ARCHITECTURE = "DeepseekV4ForCausalLM"
 _HCA_TORCH_FALLBACK_ENV = "COLLECTOR_DSV4_HCA_TORCH_FALLBACK"
@@ -537,47 +541,81 @@ def _bench_paged_mqa_logits(M: int, past_kv: int, *, batch_size: int = 1, device
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _build_flash_mla_inputs(
+def _pad_page_indices(x: torch.Tensor, *, value: int = -1) -> torch.Tensor:
+    pad = (-x.shape[-1]) % PAGE_INDEX_ALIGNED_SIZE
+    if pad == 0:
+        return x.contiguous()
+    pad_t = torch.full((*x.shape[:-1], pad), value, dtype=x.dtype, device=x.device)
+    return torch.cat([x, pad_t], dim=-1).contiguous()
+
+
+def _build_hca_causal_seq_lens(
     M: int,  # noqa: N803
     past_kv: int,
     *,
-    K_per_query: int,  # noqa: N803
+    batch_size: int,
+    device: str | torch.device,
+) -> torch.Tensor:
+    M_per_req = M // batch_size if batch_size > 1 else M  # noqa: N806
+    per_req = torch.arange(past_kv + 1, past_kv + M_per_req + 1, dtype=torch.int32, device=device)
+    return per_req.repeat(batch_size).contiguous()
+
+
+def _build_hca_swa_page_indices(seq_lens_causal: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    positions = seq_lens_causal - 1
+    offsets = positions.unsqueeze(1) - torch.arange(SWA_WINDOW, dtype=torch.int32, device=seq_lens_causal.device)
+    invalid = offsets < 0
+    swa_indices = torch.remainder(offsets, SWA_WINDOW)
+    swa_indices.masked_fill_(invalid, -1)
+    swa_topk_lengths = torch.clamp(seq_lens_causal, max=SWA_WINDOW)
+    return swa_indices.contiguous(), swa_topk_lengths.contiguous()
+
+
+def _build_hca_c128_page_indices(
+    seq_lens_causal: torch.Tensor,
+    *,
+    max_seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    max_pages = max(1, (max_seq_len + PAGE_SIZE_MODEL - 1) // PAGE_SIZE_MODEL)
+    c128_width = max_pages * PAGE_SIZE_C128
+    base = torch.arange(c128_width, dtype=torch.int32, device=seq_lens_causal.device)
+    c128_topk_lengths = torch.clamp(seq_lens_causal // 128, min=1)
+    c128_indices = base.unsqueeze(0).expand(seq_lens_causal.numel(), c128_width).clone()
+    c128_indices.masked_fill_(base.unsqueeze(0) >= c128_topk_lengths.unsqueeze(1), -1)
+    return _pad_page_indices(c128_indices), c128_topk_lengths.contiguous()
+
+
+def _build_hca_flash_mla_inputs(
+    M: int,  # noqa: N803
+    past_kv: int,
+    *,
     batch_size: int,
     n_local_heads: int,
     device: str,
 ) -> tuple[torch.Tensor, ...]:
-    """Build fp8 paged K cache + Q + indices + scheduler metadata.
+    """Build HCA inputs matching sglang's token-level sparse FlashMLA semantics.
 
-    Layout = MODEL1_FP8Sparse (V4-Flash NSA): d_qk=512 with 584-byte fp8 cache.
+    Each query token is a separate batch element (B=M, s_q=1), so SWA/c128
+    top-k lengths can vary causally per token the same way they do in serving.
     """
     full_s = M + past_kv
-    M_per_req = M // batch_size if batch_size > 1 else M  # noqa: N806
-    K_per_query = max(min(K_per_query, full_s), 1)  # noqa: N806
+    seq_lens_causal = _build_hca_causal_seq_lens(M, past_kv, batch_size=batch_size, device=device)
+    num_q_tokens = seq_lens_causal.numel()
 
-    # Q: (batch, M_per_req, n_local_heads, FMLA_D_QK=512) bf16
-    q = torch.randn(batch_size, M_per_req, n_local_heads, FMLA_D_QK, dtype=torch.bfloat16, device=device)
+    q_local = torch.randn(num_q_tokens, 1, n_local_heads, FMLA_D_QK, dtype=torch.bfloat16, device=device)
 
-    # K cache: SHARED across batch entries to avoid b-fold blowup.
-    blocks_per_req = (full_s + PAGE_SIZE_FULL - 1) // PAGE_SIZE_FULL
-    k_bf16 = torch.randn(blocks_per_req, PAGE_SIZE_FULL, 1, FMLA_D_QK, dtype=torch.bfloat16, device=device)
-    k_cache = _quantize_k_cache_model1(k_bf16)
+    swa_k_bf16 = torch.randn(1, PAGE_SIZE_SWA, 1, FMLA_D_QK, dtype=torch.bfloat16, device=device)
+    swa_k_cache = _quantize_k_cache_model1(swa_k_bf16)
+    swa_indices, swa_topk_lengths = _build_hca_swa_page_indices(seq_lens_causal)
+    swa_indices = swa_indices.unsqueeze(1)
 
-    block_table = torch.arange(blocks_per_req, dtype=torch.int32, device=device)
-    block_table = block_table.unsqueeze(0).expand(batch_size, blocks_per_req).contiguous()
+    extra_pages = max(1, (full_s + PAGE_SIZE_MODEL - 1) // PAGE_SIZE_MODEL)
+    extra_k_bf16 = torch.randn(extra_pages, PAGE_SIZE_C128, 1, FMLA_D_QK, dtype=torch.bfloat16, device=device)
+    extra_k_cache = _quantize_k_cache_model1(extra_k_bf16)
+    extra_indices, extra_topk_lengths = _build_hca_c128_page_indices(seq_lens_causal, max_seq_len=full_s)
+    extra_indices = extra_indices.unsqueeze(1)
 
-    # indices_in_kvcache: (batch, M_per_req, K_per_query) int32 — first K_per_query positions per Q
-    base = torch.arange(K_per_query, dtype=torch.int32, device=device)
-    indices = base.view(1, 1, K_per_query).expand(batch_size, M_per_req, K_per_query).contiguous()
-
-    # Pad indices to multiple of 64 (FlashMLA assertion)
-    if K_per_query % 64 != 0:
-        pad = 64 - K_per_query % 64
-        pad_t = torch.full((batch_size, M_per_req, pad), -1, dtype=torch.int32, device=device)
-        indices = torch.cat([indices, pad_t], dim=-1).contiguous()
-
-    cache_seqlens = torch.full((batch_size,), full_s, dtype=torch.int32, device=device)
-
-    return q, k_cache, block_table, indices, cache_seqlens
+    return q_local, swa_k_cache, swa_indices, swa_topk_lengths, extra_k_cache, extra_indices, extra_topk_lengths
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -618,14 +656,10 @@ def _bench_flash_mla_sparse(
 
     # rank-local head count (what the upstream projection actually produces)
     n_local_heads = max(1, N_HEADS_Q // tp_size)
-    _full_s = M + past_kv
-    M_per_req = M // batch_size if batch_size > 1 else M  # noqa: N806
-
-    # Build main K cache + ``q_local`` (per-rank Q at n_local_heads)
-    q_local, k_cache_main, _, _, cache_seqlens = _build_flash_mla_inputs(
+    # Build main/extra K cache plus token-level causal SWA/c128 metadata.
+    q_local, k_cache_main, swa_indices, swa_topk_lengths, extra_k_cache, extra_indices, extra_topk_lengths = _build_hca_flash_mla_inputs(
         M,
         past_kv,
-        K_per_query=K_per_query,
         batch_size=batch_size,
         n_local_heads=n_local_heads,
         device=device,
@@ -639,34 +673,14 @@ def _bench_flash_mla_sparse(
     if n_local_heads == N_HEADS_Q:
         q = q_local
     else:
-        q = torch.zeros(batch_size, M_per_req, N_HEADS_Q, FMLA_D_QK, dtype=torch.bfloat16, device=device)
+        q = torch.zeros(q_local.shape[0], 1, N_HEADS_Q, FMLA_D_QK, dtype=torch.bfloat16, device=device)
         q[:, :, :n_local_heads, :] = q_local  # rank-0's tp_slice
 
     # Kernel always sees full h_q.
     n_local_heads = N_HEADS_Q
-    swa_window = 128
-    swa_indices = torch.arange(swa_window, dtype=torch.int32, device=device)
-    swa_indices = swa_indices.view(1, 1, swa_window).expand(batch_size, M_per_req, swa_window).contiguous()
-    swa_topk_lengths = torch.full((batch_size,), swa_window, dtype=torch.int32, device=device)
-
-    # Build extra K cache (c128 or c4) + extra indices
-    extra_blocks = (K_per_query + PAGE_SIZE_FULL - 1) // PAGE_SIZE_FULL
-    extra_k_bf16 = torch.randn(max(1, extra_blocks), PAGE_SIZE_FULL, 1, FMLA_D_QK, dtype=torch.bfloat16, device=device)
-    extra_k_cache = _quantize_k_cache_model1(extra_k_bf16)
-    extra_K = max(64, ((K_per_query + 63) // 64) * 64)  # noqa: N806
-    extra_base = torch.arange(extra_K, dtype=torch.int32, device=device)
-    extra_indices = extra_base.view(1, 1, extra_K).expand(batch_size, M_per_req, extra_K).contiguous()
-    extra_topk_lengths = torch.full((batch_size,), K_per_query, dtype=torch.int32, device=device)
 
     if not _sglang_is_sm120():
-        sched_meta, _ = get_mla_metadata(
-            cache_seqlens=cache_seqlens,
-            num_q_tokens_per_head_k=M_per_req * n_local_heads,
-            num_heads_k=1,
-            num_heads_q=n_local_heads,
-            is_fp8_kvcache=True,
-            topk=swa_indices.size(-1),
-        )
+        sched_meta = get_mla_metadata()[0]
 
     softmax_scale = 1.0 / (FMLA_D_QK**0.5)
     attn_sink = torch.zeros(n_local_heads, dtype=torch.float32, device=device)

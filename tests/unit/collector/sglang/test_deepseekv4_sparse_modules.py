@@ -21,6 +21,31 @@ from collector.sglang import deepseekv4_sparse_modules as sparse_modules
 
 
 @pytest.mark.unit
+def test_build_hca_swa_page_indices_follow_causal_window():
+    seq_lens = torch.tensor([1, 2, 129], dtype=torch.int32)
+
+    indices, topk_lengths = sparse_modules._build_hca_swa_page_indices(seq_lens)
+
+    assert topk_lengths.tolist() == [1, 2, 128]
+    assert indices[0, :4].tolist() == [0, -1, -1, -1]
+    assert indices[1, :4].tolist() == [1, 0, -1, -1]
+    assert indices[2, :4].tolist() == [0, 127, 126, 125]
+
+
+@pytest.mark.unit
+def test_build_hca_c128_page_indices_use_runtime_page_granularity():
+    seq_lens = torch.tensor([1, 128, 257], dtype=torch.int32)
+
+    indices, topk_lengths = sparse_modules._build_hca_c128_page_indices(seq_lens, max_seq_len=257)
+
+    assert topk_lengths.tolist() == [1, 1, 2]
+    assert indices.shape == (3, 64)
+    assert indices[0, :4].tolist() == [0, -1, -1, -1]
+    assert indices[1, :4].tolist() == [0, -1, -1, -1]
+    assert indices[2, :4].tolist() == [0, 1, -1, -1]
+
+
+@pytest.mark.unit
 def test_bench_hca_attn_uses_torch_subprocess_after_illegal_access(monkeypatch):
     monkeypatch.setenv("COLLECTOR_DSV4_HCA_TORCH_FALLBACK", "fatal")
 

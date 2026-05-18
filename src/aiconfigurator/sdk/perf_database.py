@@ -3557,6 +3557,12 @@ class PerfDatabase:
                 "wideep_context_mla": list(wideep_context_mla_modes),
                 "wideep_generation_mla": list(wideep_generation_mla_modes),
             }
+            # `fp8_block` is a behavioral mode for sglang GEMMs that reuses
+            # the base `fp8` GEMM perf tables, while V4-Flash module tables may
+            # still carry explicit `fp8_block` rows.
+            gemm_modes = self.supported_quant_mode.get("gemm", []) or []
+            if common.GEMMQuantMode.fp8.name in gemm_modes and common.GEMMQuantMode.fp8_block.name not in gemm_modes:
+                gemm_modes.append(common.GEMMQuantMode.fp8_block.name)
         elif self.backend == "trtllm":
             self.supported_quant_mode = {
                 "gemm": _enum_key_names(getattr(self, "_gemm_data", None)),
@@ -4017,9 +4023,10 @@ class PerfDatabase:
         """
         Normalize GEMM quant modes for perf table lookup.
 
-        `fp8_static` is a behavioral mode that reuses `fp8` perf tables.
+        `fp8_static` and `fp8_block` are behavioral modes that reuse `fp8`
+        perf tables for the generic GEMM-family ops.
         """
-        if quant_mode == common.GEMMQuantMode.fp8_static:
+        if quant_mode in (common.GEMMQuantMode.fp8_static, common.GEMMQuantMode.fp8_block):
             return common.GEMMQuantMode.fp8
         return quant_mode
 
