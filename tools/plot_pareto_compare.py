@@ -8,6 +8,11 @@ from pathlib import Path
 X_CANDIDATES = ["tokens/s/gpu", "per_gpu_throughput", "throughput_per_gpu", "throughput_gpu", "x", "throughput"]
 Y_CANDIDATES = ["tokens/s/user", "per_user_throughput", "throughput_per_user", "throughput_user", "y", "latency", "ttft"]
 
+AXIS_LABELS = {
+    "tokens/s/user": "Interactivity (tokens/s/user)",
+    "tokens/s/gpu": "Token Throughput per GPU (tokens/s/gpu)",
+}
+
 
 def pick_col(fieldnames: list[str], requested: str, candidates: list[str]) -> str:
     if requested in fieldnames:
@@ -37,6 +42,10 @@ def read_xy(path: Path, requested_x: str, requested_y: str) -> tuple[list[float]
     return xs, ys, x_col, y_col
 
 
+def axis_label(requested: str, resolved: str) -> str:
+    return AXIS_LABELS.get(resolved, AXIS_LABELS.get(requested, requested))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scaleup-csv", required=True)
@@ -55,10 +64,10 @@ def main() -> None:
     ox, oy, ox_col, oy_col = read_xy(Path(a.scaleout_csv), a.x_col, a.y_col)
 
     plt.figure(figsize=(8, 5))
-    plt.plot(sx, sy, "o-", label=f"{a.scaleup_label} ({sx_col}/{sy_col})")
-    plt.plot(ox, oy, "o-", label=f"{a.scaleout_label} ({ox_col}/{oy_col})")
-    plt.xlabel(a.x_col)
-    plt.ylabel(a.y_col)
+    plt.plot(sx, sy, "o-", label=a.scaleup_label)
+    plt.plot(ox, oy, "o-", label=a.scaleout_label)
+    plt.xlabel(axis_label(a.x_col, sx_col))
+    plt.ylabel(axis_label(a.y_col, sy_col))
     plt.title(a.title)
     plt.legend()
     plt.tight_layout()

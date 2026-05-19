@@ -13,6 +13,6 @@
   "scaleup_system": "rtx_pro_6000_scaleup_32x1",
   "scaleout_system": "rtx_pro_6000_scaleout_8x4",
   "out_dir": "results/dsv4flash_topology_compare",
-  "x_col": "tokens/s/gpu",
-  "y_col": "tokens/s/user"
+  "x_col": "tokens/s/user",
+  "y_col": "tokens/s/gpu"
 }

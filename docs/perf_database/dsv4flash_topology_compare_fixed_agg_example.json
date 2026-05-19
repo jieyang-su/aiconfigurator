@@ -4,7 +4,7 @@
   "backend": "sglang",
   "backend_version": "0.5.10.post2",
   "gemm_quant_mode": "fp8_block",
-  "database_mode": "HYBRID",
+  "database_mode": "EMPIRICAL",
   "ttft": 10000,
   "tpot": 1000,
   "isl": 2048,
@@ -13,8 +13,8 @@
   "scaleup_system": "rtx_pro_6000_scaleup_32x1",
   "scaleout_system": "rtx_pro_6000_scaleout_8x4",
   "out_dir": "results/dsv4flash_topology_compare_fixed_agg_example",
-  "x_col": "tokens/s/gpu",
-  "y_col": "tokens/s/user",
+  "x_col": "tokens/s/user",
+  "y_col": "tokens/s/gpu",
   "fixed_parallel": {
     "agg": {
       "num_gpu_per_worker": 32,

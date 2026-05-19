@@ -368,8 +368,8 @@ def main() -> None:
                 "--scaleout-csv", str(canon_out_all),
                 "--scaleup-label", scaleup_label,
                 "--scaleout-label", scaleout_label,
-                "--x-col", cfg.get("x_col", "tokens/s/gpu"),
-                "--y-col", cfg.get("y_col", "tokens/s/user"),
+                "--x-col", cfg.get("x_col", "tokens/s/user"),
+                "--y-col", cfg.get("y_col", "tokens/s/gpu"),
                 "--title", f"DS-V4 Flash {m} All Candidates",
                 "--output", str(plot_dir / f"full_compare_{m}.png"),
             ]
@@ -383,8 +383,8 @@ def main() -> None:
             "--scaleout-csv", str(canon_out),
             "--scaleup-label", scaleup_label,
             "--scaleout-label", scaleout_label,
-            "--x-col", cfg.get("x_col", "tokens/s/gpu"),
-            "--y-col", cfg.get("y_col", "tokens/s/user"),
+            "--x-col", cfg.get("x_col", "tokens/s/user"),
+            "--y-col", cfg.get("y_col", "tokens/s/gpu"),
             "--title", f"DS-V4 Flash {m} Scale-up vs Scale-out",
             "--output", str(plot_dir / f"pareto_compare_{m}.png"),
         ]
