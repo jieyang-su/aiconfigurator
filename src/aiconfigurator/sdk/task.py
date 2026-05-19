@@ -593,6 +593,8 @@ class TaskConfigFactory:
             "max_gpu_per_replica": 128,
             "max_prefill_worker": 32,
             "max_decode_worker": 32,
+            "prefill_num_worker_list": None,
+            "decode_num_worker_list": None,
             "max_prefill_gpus": None,
             "max_decode_gpus": None,
         }
@@ -1530,6 +1532,8 @@ class TaskRunner:
             decode_parallel_config_list=decode_parallel_config_list,
             num_gpu_list=task_config.replica_config.num_gpu_per_replica,
             max_num_gpu=task_config.replica_config.max_gpu_per_replica,
+            prefill_num_worker_list=task_config.replica_config.get("prefill_num_worker_list"),
+            decode_num_worker_list=task_config.replica_config.get("decode_num_worker_list"),
             prefill_max_num_worker=task_config.replica_config.max_prefill_worker,
             decode_max_num_worker=task_config.replica_config.max_decode_worker,
             max_prefill_gpus=task_config.replica_config.get("max_prefill_gpus"),

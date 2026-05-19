@@ -1822,10 +1822,13 @@ def main(args):
         **execute_kwargs,
     )
 
+    all_results = {exp_name: df for exp_name, df in pareto_fronts.items()}
+
     if args.save_dir:
         save_results(
             args=args,
             best_configs=best_configs,
+            all_results=all_results,
             pareto_fronts=pareto_fronts,
             task_configs=task_configs,
             save_dir=args.save_dir,

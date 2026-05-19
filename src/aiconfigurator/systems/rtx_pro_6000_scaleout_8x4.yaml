@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# DS-V4 Flash topology compare (scale-up): 1 super-node x 32 GPUs.
+# DS-V4 Flash topology compare (scale-out): 4 nodes x 8 GPUs.
 # Keep GPU/DB assumptions same as rtx_pro_6000_server, only topology-related node fields differ.
 
 data_dir: data/rtx_pro_6000_server
@@ -19,9 +19,9 @@ gpu:
   sm_version: 120
 
 node:
-  num_gpus_per_node: 32
-  inter_node_bw: 50000000000   # unchanged placeholder, not dominant in 1x32
-  intra_node_bw: 900000000000  # 900 GB/s single direction NVLink/NVSwitch assumption
+  num_gpus_per_node: 8
+  inter_node_bw: 50000000000   # same inter-node assumption for comparability
+  intra_node_bw: 64000000000   # Byte/s per GPU, single direction, PCIe Gen5 x16
   pcie_bw: 64000000000
   p2p_latency: 0.00001
 

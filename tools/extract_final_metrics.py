@@ -48,6 +48,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scaleup-log", required=True)
     ap.add_argument("--scaleout-log", required=True)
+    ap.add_argument("--scaleup-label", default="scaleup")
+    ap.add_argument("--scaleout-label", default="scaleout")
     ap.add_argument("--output-csv", required=True)
     a = ap.parse_args()
 
@@ -55,11 +57,13 @@ def main() -> None:
     so = parse(Path(a.scaleout_log))
 
     ordered_metrics = [*PATS.keys(), "tp", "pp", "replicas", "bs"]
+    scaleup_label = a.scaleup_label
+    scaleout_label = a.scaleout_label
     rows = []
     for k in ordered_metrics:
-        row = {"metric": k, "scaleup_32": su.get(k, ""), "scaleout_2x16": so.get(k, ""), "delta": ""}
+        row = {"metric": k, scaleup_label: su.get(k, ""), scaleout_label: so.get(k, ""), "delta": ""}
         try:
-            row["delta"] = str(float(row["scaleup_32"]) - float(row["scaleout_2x16"]))
+            row["delta"] = str(float(row[scaleup_label]) - float(row[scaleout_label]))
         except Exception:
             row["delta"] = ""
         rows.append(row)
@@ -67,7 +71,7 @@ def main() -> None:
     out = Path(a.output_csv)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["metric", "scaleup_32", "scaleout_2x16", "delta"])
+        w = csv.DictWriter(f, fieldnames=["metric", scaleup_label, scaleout_label, "delta"])
         w.writeheader()
         w.writerows(rows)
     print(out)
