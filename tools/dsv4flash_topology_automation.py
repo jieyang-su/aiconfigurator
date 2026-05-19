@@ -23,10 +23,16 @@ def _display_label(system_name: str, fallback: str) -> str:
 
 
 def _requested_modes(cfg: dict) -> list[str]:
-    fixed = cfg.get("fixed_parallel")
-    if not fixed:
+    fixed = cfg.get("fixed_parallel") or {}
+    search = cfg.get("search_parallel") or {}
+    modes = [m for m in ["agg", "disagg"] if fixed.get(m) or search.get(m)]
+    if not modes:
         return ["agg", "disagg"]
-    return [mode for mode in ["agg", "disagg"] if fixed.get(mode)]
+    return modes
+
+
+def _has_custom_parallel(cfg: dict) -> bool:
+    return bool(cfg.get("fixed_parallel") or cfg.get("search_parallel"))
 
 
 def run_cmd(cmd: list[str], log_path: Path, cwd: Path | None = None, env: dict[str, str] | None = None) -> int:
@@ -38,6 +44,10 @@ def run_cmd(cmd: list[str], log_path: Path, cwd: Path | None = None, env: dict[s
 
 def find_pareto_by_mode(root: Path) -> dict[str, Path]:
     return find_result_csv_by_mode(root, "pareto.csv")
+
+
+def find_best_config_by_mode(root: Path) -> dict[str, Path]:
+    return find_result_csv_by_mode(root, "best_config_topn.csv")
 
 
 def find_result_csv_by_mode(root: Path, filename: str) -> dict[str, Path]:
@@ -126,36 +136,53 @@ def _apply_exp_overrides(exp_cfg: dict, overrides: dict | None) -> None:
             exp_cfg[key] = overrides[key]
 
 
-def _build_fixed_experiment_yaml(cfg: dict, system_name: str) -> dict:
+def _build_custom_experiment_yaml(cfg: dict, system_name: str) -> dict:
     fixed = cfg.get("fixed_parallel") or {}
+    search = cfg.get("search_parallel") or {}
     exp_yaml: dict[str, object] = {"exps": []}
 
-    agg_fixed = fixed.get("agg")
-    if agg_fixed:
-        agg_exp = _base_exp_config(cfg, system_name)
-        _apply_exp_overrides(agg_exp, agg_fixed)
-        agg_exp["serving_mode"] = "agg"
-        agg_exp["config"] = {"worker_config": _fixed_worker_config(cfg, agg_fixed)}
-        exp_yaml["exps"].append("agg_fixed")
-        exp_yaml["agg_fixed"] = agg_exp
+    for mode in ["agg", "disagg"]:
+        if fixed.get(mode) and search.get(mode):
+            raise ValueError(
+                f"Mode '{mode}' is configured in both fixed_parallel and search_parallel; choose only one."
+            )
 
-    disagg_fixed = fixed.get("disagg")
-    if disagg_fixed:
-        if "prefill" not in disagg_fixed or "decode" not in disagg_fixed:
-            raise ValueError("fixed_parallel.disagg must provide both 'prefill' and 'decode' sections")
-        if "prefill_workers" not in disagg_fixed or "decode_workers" not in disagg_fixed:
-            raise ValueError("fixed_parallel.disagg must provide both 'prefill_workers' and 'decode_workers'")
+    def _kind_and_spec(mode: str) -> tuple[str, dict] | None:
+        if fixed.get(mode):
+            return "fixed", fixed[mode]
+        if search.get(mode):
+            return "search", search[mode]
+        return None
+
+    agg_spec = _kind_and_spec("agg")
+    if agg_spec:
+        agg_kind, agg_cfg = agg_spec
+        agg_exp = _base_exp_config(cfg, system_name)
+        _apply_exp_overrides(agg_exp, agg_cfg)
+        agg_exp["serving_mode"] = "agg"
+        agg_exp["config"] = {"worker_config": _fixed_worker_config(cfg, agg_cfg)}
+        agg_name = f"agg_{agg_kind}"
+        exp_yaml["exps"].append(agg_name)
+        exp_yaml[agg_name] = agg_exp
+
+    disagg_spec = _kind_and_spec("disagg")
+    if disagg_spec:
+        disagg_kind, disagg_cfg = disagg_spec
+        if "prefill" not in disagg_cfg or "decode" not in disagg_cfg:
+            raise ValueError("disagg config must provide both 'prefill' and 'decode' sections")
+        if "prefill_workers" not in disagg_cfg or "decode_workers" not in disagg_cfg:
+            raise ValueError("disagg config must provide both 'prefill_workers' and 'decode_workers'")
 
         disagg_exp = _base_exp_config(cfg, system_name)
-        _apply_exp_overrides(disagg_exp, disagg_fixed)
+        _apply_exp_overrides(disagg_exp, disagg_cfg)
         disagg_exp["serving_mode"] = "disagg"
         disagg_exp["decode_system_name"] = system_name
-        replica_gpu_list = _int_list(disagg_fixed.get("num_gpu_per_replica", cfg["total_gpus"]))
-        prefill_worker_list = _int_list(disagg_fixed["prefill_workers"])
-        decode_worker_list = _int_list(disagg_fixed["decode_workers"])
+        replica_gpu_list = _int_list(disagg_cfg.get("num_gpu_per_replica", cfg["total_gpus"]))
+        prefill_worker_list = _int_list(disagg_cfg["prefill_workers"])
+        decode_worker_list = _int_list(disagg_cfg["decode_workers"])
         disagg_exp["config"] = {
-            "prefill_worker_config": _fixed_worker_config(cfg, disagg_fixed["prefill"]),
-            "decode_worker_config": _fixed_worker_config(cfg, disagg_fixed["decode"]),
+            "prefill_worker_config": _fixed_worker_config(cfg, disagg_cfg["prefill"]),
+            "decode_worker_config": _fixed_worker_config(cfg, disagg_cfg["decode"]),
             "replica_config": {
                 "num_gpu_per_replica": replica_gpu_list,
                 "max_gpu_per_replica": max(replica_gpu_list),
@@ -165,21 +192,22 @@ def _build_fixed_experiment_yaml(cfg: dict, system_name: str) -> dict:
                 "max_decode_worker": max(decode_worker_list),
             },
         }
-        exp_yaml["exps"].append("disagg_fixed")
-        exp_yaml["disagg_fixed"] = disagg_exp
+        disagg_name = f"disagg_{disagg_kind}"
+        exp_yaml["exps"].append(disagg_name)
+        exp_yaml[disagg_name] = disagg_exp
 
     if not exp_yaml["exps"]:
-        raise ValueError("fixed_parallel is set but no fixed modes were provided")
+        raise ValueError("No modes found in fixed_parallel/search_parallel")
     return exp_yaml
 
 
 def _run_aic(cfg: dict, system_name: str, save_dir: Path, log_path: Path) -> int:
-    fixed = cfg.get("fixed_parallel")
+    custom_parallel = _has_custom_parallel(cfg)
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(SRC_DIR) if not existing_pythonpath else f"{SRC_DIR}:{existing_pythonpath}"
-    if fixed:
-        exp_yaml = _build_fixed_experiment_yaml(cfg, system_name)
+    if custom_parallel:
+        exp_yaml = _build_custom_experiment_yaml(cfg, system_name)
         save_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", suffix=".yaml", prefix="topology_fixed_", dir=save_dir, delete=False
@@ -235,6 +263,14 @@ def _run_aic(cfg: dict, system_name: str, save_dir: Path, log_path: Path) -> int
     return run_cmd(cmd, log_path, cwd=REPO_ROOT, env=env)
 
 
+def _read_first_csv_row(csv_path: Path) -> dict[str, str]:
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise ValueError(f"empty csv: {csv_path}")
+    return rows[0]
+
+
 def _read_best_pareto_row(csv_path: Path) -> dict[str, str]:
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         rows = list(csv.DictReader(f))
@@ -243,20 +279,20 @@ def _read_best_pareto_row(csv_path: Path) -> dict[str, str]:
     return max(rows, key=lambda row: float(row.get("tokens/s/gpu_cluster") or 0.0))
 
 
-def _pick_best_mode(pareto_paths: dict[str, Path]) -> tuple[str, dict[str, str]]:
-    best_mode = ""
-    best_row: dict[str, str] | None = None
-    best_value = float("-inf")
-    for mode, path in pareto_paths.items():
-        row = _read_best_pareto_row(path)
-        value = float(row.get("tokens/s/gpu_cluster") or 0.0)
-        if value > best_value:
-            best_mode = mode
-            best_row = row
-            best_value = value
-    if best_row is None:
-        raise ValueError("no pareto rows available to summarize")
-    return best_mode, best_row
+def _best_rows_by_mode(
+    best_config_paths: dict[str, Path], pareto_paths: dict[str, Path], modes: list[str]
+) -> dict[str, dict[str, str]]:
+    rows: dict[str, dict[str, str]] = {}
+    for mode in modes:
+        best_path = best_config_paths.get(mode)
+        if best_path is not None:
+            rows[mode] = _read_first_csv_row(best_path)
+            continue
+        pareto_path = pareto_paths.get(mode)
+        if pareto_path is None:
+            raise ValueError(f"missing best_config_topn.csv and pareto.csv for mode={mode}")
+        rows[mode] = _read_best_pareto_row(pareto_path)
+    return rows
 
 
 def _row_value(row: dict[str, str], *keys: str) -> str:
@@ -268,47 +304,137 @@ def _row_value(row: dict[str, str], *keys: str) -> str:
 
 
 def _write_compare_summary(
+    scaleup_best: dict[str, Path],
+    scaleout_best: dict[str, Path],
     scaleup: dict[str, Path],
     scaleout: dict[str, Path],
     output_csv: Path,
     scaleup_label: str,
     scaleout_label: str,
+    modes: list[str],
 ) -> None:
-    su_mode, su_row = _pick_best_mode(scaleup)
-    so_mode, so_row = _pick_best_mode(scaleout)
-
-    metric_pairs = [
-        ("best_throughput", _row_value(su_row, "tokens/s/gpu_cluster"), _row_value(so_row, "tokens/s/gpu_cluster")),
-        ("per_gpu_throughput", _row_value(su_row, "tokens/s/gpu"), _row_value(so_row, "tokens/s/gpu")),
-        ("per_user_throughput", _row_value(su_row, "tokens/s/user"), _row_value(so_row, "tokens/s/user")),
-        ("ttft_ms", _row_value(su_row, "ttft"), _row_value(so_row, "ttft")),
-        ("tpot_ms", _row_value(su_row, "tpot"), _row_value(so_row, "tpot")),
-        ("request_latency_ms", _row_value(su_row, "request_latency"), _row_value(so_row, "request_latency")),
-        ("best_experiment", su_mode, so_mode),
-        ("tp", _row_value(su_row, "tp", "(d)tp", "(p)tp"), _row_value(so_row, "tp", "(d)tp", "(p)tp")),
-        ("pp", _row_value(su_row, "pp", "(d)pp", "(p)pp"), _row_value(so_row, "pp", "(d)pp", "(p)pp")),
-        (
-            "replicas",
-            _row_value(su_row, "(d)workers") if su_mode == "disagg" else "",
-            _row_value(so_row, "(d)workers") if so_mode == "disagg" else "",
-        ),
-        ("bs", _row_value(su_row, "bs", "(d)bs"), _row_value(so_row, "bs", "(d)bs")),
-    ]
-
     rows = []
-    for metric, su, so in metric_pairs:
-        delta = ""
-        try:
-            delta = str(float(su) - float(so))
-        except Exception:
-            pass
-        rows.append({"metric": metric, scaleup_label: su, scaleout_label: so, "delta": delta})
+    scaleup_rows = _best_rows_by_mode(scaleup_best, scaleup, modes)
+    scaleout_rows = _best_rows_by_mode(scaleout_best, scaleout, modes)
+
+    for mode in modes:
+        su_row = scaleup_rows[mode]
+        so_row = scaleout_rows[mode]
+        metric_pairs = [
+            ("best_throughput", _row_value(su_row, "tokens/s/gpu_cluster"), _row_value(so_row, "tokens/s/gpu_cluster")),
+            ("per_gpu_throughput", _row_value(su_row, "tokens/s/gpu"), _row_value(so_row, "tokens/s/gpu")),
+            ("per_user_throughput", _row_value(su_row, "tokens/s/user"), _row_value(so_row, "tokens/s/user")),
+            ("ttft_ms", _row_value(su_row, "ttft"), _row_value(so_row, "ttft")),
+            ("tpot_ms", _row_value(su_row, "tpot"), _row_value(so_row, "tpot")),
+            ("request_latency_ms", _row_value(su_row, "request_latency"), _row_value(so_row, "request_latency")),
+        ]
+
+        if mode == "agg":
+            metric_pairs.extend(
+                [
+                    ("tp", _row_value(su_row, "tp"), _row_value(so_row, "tp")),
+                    ("pp", _row_value(su_row, "pp"), _row_value(so_row, "pp")),
+                    ("dp", _row_value(su_row, "dp"), _row_value(so_row, "dp")),
+                    ("moe_tp", _row_value(su_row, "moe_tp"), _row_value(so_row, "moe_tp")),
+                    ("moe_ep", _row_value(su_row, "moe_ep"), _row_value(so_row, "moe_ep")),
+                    ("bs", _row_value(su_row, "bs"), _row_value(so_row, "bs")),
+                ]
+            )
+        else:
+            metric_pairs.extend(
+                [
+                    ("prefill_workers", _row_value(su_row, "(p)workers"), _row_value(so_row, "(p)workers")),
+                    ("decode_workers", _row_value(su_row, "(d)workers"), _row_value(so_row, "(d)workers")),
+                    ("prefill_tp", _row_value(su_row, "(p)tp"), _row_value(so_row, "(p)tp")),
+                    ("decode_tp", _row_value(su_row, "(d)tp"), _row_value(so_row, "(d)tp")),
+                    ("prefill_dp", _row_value(su_row, "(p)dp"), _row_value(so_row, "(p)dp")),
+                    ("decode_dp", _row_value(su_row, "(d)dp"), _row_value(so_row, "(d)dp")),
+                    ("prefill_moe_ep", _row_value(su_row, "(p)moe_ep"), _row_value(so_row, "(p)moe_ep")),
+                    ("decode_moe_ep", _row_value(su_row, "(d)moe_ep"), _row_value(so_row, "(d)moe_ep")),
+                    ("prefill_bs", _row_value(su_row, "(p)bs"), _row_value(so_row, "(p)bs")),
+                    ("decode_bs", _row_value(su_row, "(d)bs"), _row_value(so_row, "(d)bs")),
+                ]
+            )
+
+        for metric, su, so in metric_pairs:
+            delta = ""
+            try:
+                delta = str(float(su) - float(so))
+            except Exception:
+                pass
+            rows.append({"mode": mode, "metric": metric, scaleup_label: su, scaleout_label: so, "delta": delta})
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["metric", scaleup_label, scaleout_label, "delta"])
+        writer = csv.DictWriter(f, fieldnames=["mode", "metric", scaleup_label, scaleout_label, "delta"])
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _compact_best_config(mode: str, row: dict[str, str]) -> dict[str, str]:
+    compact = {
+        "tokens/s/gpu_cluster": _row_value(row, "tokens/s/gpu_cluster"),
+        "tokens/s/gpu": _row_value(row, "tokens/s/gpu"),
+        "tokens/s/user": _row_value(row, "tokens/s/user"),
+        "ttft": _row_value(row, "ttft"),
+        "tpot": _row_value(row, "tpot"),
+        "request_latency": _row_value(row, "request_latency"),
+    }
+    if mode == "agg":
+        compact.update(
+            {
+                "tp": _row_value(row, "tp"),
+                "pp": _row_value(row, "pp"),
+                "dp": _row_value(row, "dp"),
+                "moe_tp": _row_value(row, "moe_tp"),
+                "moe_ep": _row_value(row, "moe_ep"),
+                "bs": _row_value(row, "bs"),
+            }
+        )
+    else:
+        compact.update(
+            {
+                "prefill_workers": _row_value(row, "(p)workers"),
+                "decode_workers": _row_value(row, "(d)workers"),
+                "prefill_tp": _row_value(row, "(p)tp"),
+                "decode_tp": _row_value(row, "(d)tp"),
+                "prefill_dp": _row_value(row, "(p)dp"),
+                "decode_dp": _row_value(row, "(d)dp"),
+                "prefill_moe_ep": _row_value(row, "(p)moe_ep"),
+                "decode_moe_ep": _row_value(row, "(d)moe_ep"),
+                "prefill_bs": _row_value(row, "(p)bs"),
+                "decode_bs": _row_value(row, "(d)bs"),
+            }
+        )
+    return compact
+
+
+def _print_and_save_best_configs(
+    scaleup_best: dict[str, Path],
+    scaleout_best: dict[str, Path],
+    scaleup: dict[str, Path],
+    scaleout: dict[str, Path],
+    out_dir: Path,
+    scaleup_label: str,
+    scaleout_label: str,
+    modes: list[str],
+) -> None:
+    best_dir = out_dir / "best_configs"
+    best_dir.mkdir(parents=True, exist_ok=True)
+    scaleup_rows = _best_rows_by_mode(scaleup_best, scaleup, modes)
+    scaleout_rows = _best_rows_by_mode(scaleout_best, scaleout, modes)
+
+    for mode in modes:
+        su_row = scaleup_rows[mode]
+        so_row = scaleout_rows[mode]
+
+        print(f"[{mode}] {scaleup_label}: {json.dumps(_compact_best_config(mode, su_row), ensure_ascii=False)}")
+        print(f"[{mode}] {scaleout_label}: {json.dumps(_compact_best_config(mode, so_row), ensure_ascii=False)}")
+
+        with (best_dir / f"best_config_{mode}_scaleup.json").open("w", encoding="utf-8") as f:
+            json.dump(su_row, f, indent=2, ensure_ascii=False)
+        with (best_dir / f"best_config_{mode}_scaleout.json").open("w", encoding="utf-8") as f:
+            json.dump(so_row, f, indent=2, ensure_ascii=False)
 
 
 def main() -> None:
@@ -337,6 +463,8 @@ def main() -> None:
 
     up = find_pareto_by_mode(scaleup_dir)
     out = find_pareto_by_mode(scaleout_dir)
+    up_best = find_best_config_by_mode(scaleup_dir)
+    out_best = find_best_config_by_mode(scaleout_dir)
     up_all = find_result_csv_by_mode(scaleup_dir, "all_results.csv")
     out_all = find_result_csv_by_mode(scaleout_dir, "all_results.csv")
 
@@ -399,8 +527,8 @@ def main() -> None:
         )
 
     summary_csv = out_dir / "compare_single_point.csv"
-    if cfg.get("fixed_parallel"):
-        _write_compare_summary(up, out, summary_csv, scaleup_label, scaleout_label)
+    if _has_custom_parallel(cfg):
+        _write_compare_summary(up_best, out_best, up, out, summary_csv, scaleup_label, scaleout_label, modes)
     else:
         extract_cmd = [
             "python", "tools/extract_final_metrics.py",
@@ -412,6 +540,8 @@ def main() -> None:
         ]
         subprocess.run(extract_cmd, check=False)
 
+
+    _print_and_save_best_configs(up_best, out_best, up, out, out_dir, scaleup_label, scaleout_label, modes)
     print("done")
 
 
