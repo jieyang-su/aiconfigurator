@@ -1,0 +1,52 @@
+{
+  "systems_path": "src/aiconfigurator/systems",
+  "model": "sgl-project/DeepSeek-V4-Flash-FP8",
+  "backend": "sglang",
+  "backend_version": "0.5.10.post2",
+  "gemm_quant_mode": "fp8_block",
+  "database_mode": "HYBRID",
+  "ttft": 10000,
+  "tpot": 1000,
+  "isl": 2048,
+  "osl": 500,
+  "total_gpus": 32,
+  "system": "rtx_pro_6000_scaleout_8x4",
+  "out_dir": "results/dsv4flash_single_system_agg_disagg",
+  "x_col": "tokens/s/user",
+  "y_col": "tokens/s/gpu",
+  "search_parallel": {
+    "agg": {
+      "num_gpu_per_worker": 32,
+      "tp": [1, 2, 4, 8, 16, 32],
+      "pp": [1],
+      "dp": [1, 2, 4, 8, 16, 32],
+      "moe_tp": [1],
+      "moe_ep": [1, 2, 4, 8, 16, 32]
+    },
+    "disagg": {
+      "enable_wideep": true,
+      "moe_backend": "deepep_moe",
+      "num_gpu_per_replica": [32],
+      "prefill_workers": [1, 2, 4],
+      "decode_workers": [1, 2, 4],
+      "prefill": {
+        "enable_wideep": true,
+        "num_gpu_per_worker": [8, 16],
+        "tp": [8, 16],
+        "pp": [1],
+        "dp": [1, 2, 4],
+        "moe_tp": [1],
+        "moe_ep": [8, 16]
+      },
+      "decode": {
+        "enable_wideep": true,
+        "num_gpu_per_worker": [8, 16],
+        "tp": [8, 16],
+        "pp": [1],
+        "dp": [1, 2, 4],
+        "moe_tp": [1],
+        "moe_ep": [8, 16]
+      }
+    }
+  }
+}

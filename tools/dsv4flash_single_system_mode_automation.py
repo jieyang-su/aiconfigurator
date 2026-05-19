@@ -18,10 +18,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 
 
-def _display_label(system_name: str, fallback: str) -> str:
-    return system_name or fallback
-
-
 def _requested_modes(cfg: dict) -> list[str]:
     fixed = cfg.get("fixed_parallel") or {}
     search = cfg.get("search_parallel") or {}
@@ -42,18 +38,11 @@ def run_cmd(cmd: list[str], log_path: Path, cwd: Path | None = None, env: dict[s
     return p.returncode
 
 
-def find_pareto_by_mode(root: Path) -> dict[str, Path]:
-    return find_result_csv_by_mode(root, "pareto.csv")
-
-
-def find_best_config_by_mode(root: Path) -> dict[str, Path]:
-    return find_result_csv_by_mode(root, "best_config_topn.csv")
-
-
 def find_result_csv_by_mode(root: Path, filename: str) -> dict[str, Path]:
     out: dict[str, Path] = {}
     for p in root.rglob(filename):
         rel_parts = [part.lower() for part in p.relative_to(root).parts]
+        rel_path = "/".join(rel_parts)
         is_disagg = any(part == "disagg" or part.startswith("disagg_") for part in rel_parts)
         is_agg = any(part == "agg" or part.startswith("agg_") for part in rel_parts)
         if is_disagg:
@@ -65,6 +54,14 @@ def find_result_csv_by_mode(root: Path, filename: str) -> dict[str, Path]:
             if current is None or p.stat().st_mtime > current.stat().st_mtime:
                 out["agg"] = p
     return out
+
+
+def find_pareto_by_mode(root: Path) -> dict[str, Path]:
+    return find_result_csv_by_mode(root, "pareto.csv")
+
+
+def find_best_config_by_mode(root: Path) -> dict[str, Path]:
+    return find_result_csv_by_mode(root, "best_config_topn.csv")
 
 
 def _copy_quant_overrides(cfg: dict) -> dict:
@@ -212,7 +209,7 @@ def _run_aic(cfg: dict, system_name: str, save_dir: Path, log_path: Path) -> int
         exp_yaml = _build_custom_experiment_yaml(cfg, system_name)
         save_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", suffix=".yaml", prefix="topology_fixed_", dir=save_dir, delete=False
+            mode="w", encoding="utf-8", suffix=".yaml", prefix="single_system_fixed_", dir=save_dir, delete=False
         ) as tmp:
             yaml.safe_dump(exp_yaml, tmp, sort_keys=False)
             yaml_path = tmp.name
@@ -281,20 +278,23 @@ def _read_best_pareto_row(csv_path: Path) -> dict[str, str]:
     return max(rows, key=lambda row: float(row.get("tokens/s/gpu_cluster") or 0.0))
 
 
-def _best_rows_by_mode(
-    best_config_paths: dict[str, Path], pareto_paths: dict[str, Path], modes: list[str]
-) -> dict[str, dict[str, str]]:
-    rows: dict[str, dict[str, str]] = {}
-    for mode in modes:
-        best_path = best_config_paths.get(mode)
-        if best_path is not None:
-            rows[mode] = _read_first_csv_row(best_path)
-            continue
-        pareto_path = pareto_paths.get(mode)
-        if pareto_path is None:
-            raise ValueError(f"missing best_config_topn.csv and pareto.csv for mode={mode}")
-        rows[mode] = _read_best_pareto_row(pareto_path)
-    return rows
+def _best_row_for_mode(best_config_paths: dict[str, Path], pareto_paths: dict[str, Path], mode: str) -> dict[str, str]:
+    best_path = best_config_paths.get(mode)
+    if best_path is not None:
+        return _read_first_csv_row(best_path)
+    pareto_path = pareto_paths.get(mode)
+    if pareto_path is None:
+        raise ValueError(f"missing best_config_topn.csv and pareto.csv for mode={mode}")
+    return _read_best_pareto_row(pareto_path)
+
+
+def _best_row_for_mode_or_none(
+    best_config_paths: dict[str, Path], pareto_paths: dict[str, Path], mode: str
+) -> dict[str, str] | None:
+    try:
+        return _best_row_for_mode(best_config_paths, pareto_paths, mode)
+    except ValueError:
+        return None
 
 
 def _row_value(row: dict[str, str], *keys: str) -> str:
@@ -303,74 +303,6 @@ def _row_value(row: dict[str, str], *keys: str) -> str:
         if value not in (None, ""):
             return value
     return ""
-
-
-def _write_compare_summary(
-    scaleup_best: dict[str, Path],
-    scaleout_best: dict[str, Path],
-    scaleup: dict[str, Path],
-    scaleout: dict[str, Path],
-    output_csv: Path,
-    scaleup_label: str,
-    scaleout_label: str,
-    modes: list[str],
-) -> None:
-    rows = []
-    scaleup_rows = _best_rows_by_mode(scaleup_best, scaleup, modes)
-    scaleout_rows = _best_rows_by_mode(scaleout_best, scaleout, modes)
-
-    for mode in modes:
-        su_row = scaleup_rows[mode]
-        so_row = scaleout_rows[mode]
-        metric_pairs = [
-            ("best_throughput", _row_value(su_row, "tokens/s/gpu_cluster"), _row_value(so_row, "tokens/s/gpu_cluster")),
-            ("per_gpu_throughput", _row_value(su_row, "tokens/s/gpu"), _row_value(so_row, "tokens/s/gpu")),
-            ("per_user_throughput", _row_value(su_row, "tokens/s/user"), _row_value(so_row, "tokens/s/user")),
-            ("ttft_ms", _row_value(su_row, "ttft"), _row_value(so_row, "ttft")),
-            ("tpot_ms", _row_value(su_row, "tpot"), _row_value(so_row, "tpot")),
-            ("request_latency_ms", _row_value(su_row, "request_latency"), _row_value(so_row, "request_latency")),
-        ]
-
-        if mode == "agg":
-            metric_pairs.extend(
-                [
-                    ("tp", _row_value(su_row, "tp"), _row_value(so_row, "tp")),
-                    ("pp", _row_value(su_row, "pp"), _row_value(so_row, "pp")),
-                    ("dp", _row_value(su_row, "dp"), _row_value(so_row, "dp")),
-                    ("moe_tp", _row_value(su_row, "moe_tp"), _row_value(so_row, "moe_tp")),
-                    ("moe_ep", _row_value(su_row, "moe_ep"), _row_value(so_row, "moe_ep")),
-                    ("bs", _row_value(su_row, "bs"), _row_value(so_row, "bs")),
-                ]
-            )
-        else:
-            metric_pairs.extend(
-                [
-                    ("prefill_workers", _row_value(su_row, "(p)workers"), _row_value(so_row, "(p)workers")),
-                    ("decode_workers", _row_value(su_row, "(d)workers"), _row_value(so_row, "(d)workers")),
-                    ("prefill_tp", _row_value(su_row, "(p)tp"), _row_value(so_row, "(p)tp")),
-                    ("decode_tp", _row_value(su_row, "(d)tp"), _row_value(so_row, "(d)tp")),
-                    ("prefill_dp", _row_value(su_row, "(p)dp"), _row_value(so_row, "(p)dp")),
-                    ("decode_dp", _row_value(su_row, "(d)dp"), _row_value(so_row, "(d)dp")),
-                    ("prefill_moe_ep", _row_value(su_row, "(p)moe_ep"), _row_value(so_row, "(p)moe_ep")),
-                    ("decode_moe_ep", _row_value(su_row, "(d)moe_ep"), _row_value(so_row, "(d)moe_ep")),
-                    ("prefill_bs", _row_value(su_row, "(p)bs"), _row_value(so_row, "(p)bs")),
-                    ("decode_bs", _row_value(su_row, "(d)bs"), _row_value(so_row, "(d)bs")),
-                ]
-            )
-
-        for metric, su, so in metric_pairs:
-            delta = ""
-            try:
-                delta = str(float(su) - float(so))
-            except Exception:
-                pass
-            rows.append({"mode": mode, "metric": metric, scaleup_label: su, scaleout_label: so, "delta": delta})
-
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    with output_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["mode", "metric", scaleup_label, scaleout_label, "delta"])
-        writer.writeheader()
-        writer.writerows(rows)
 
 
 def _compact_best_config(mode: str, row: dict[str, str]) -> dict[str, str]:
@@ -411,139 +343,138 @@ def _compact_best_config(mode: str, row: dict[str, str]) -> dict[str, str]:
     return compact
 
 
-def _print_and_save_best_configs(
-    scaleup_best: dict[str, Path],
-    scaleout_best: dict[str, Path],
-    scaleup: dict[str, Path],
-    scaleout: dict[str, Path],
-    out_dir: Path,
-    scaleup_label: str,
-    scaleout_label: str,
-    modes: list[str],
-) -> None:
-    best_dir = out_dir / "best_configs"
-    best_dir.mkdir(parents=True, exist_ok=True)
-    scaleup_rows = _best_rows_by_mode(scaleup_best, scaleup, modes)
-    scaleout_rows = _best_rows_by_mode(scaleout_best, scaleout, modes)
+def _write_mode_summary(agg_row: dict[str, str] | None, disagg_row: dict[str, str] | None, output_csv: Path) -> None:
+    agg_row = agg_row or {}
+    disagg_row = disagg_row or {}
+    metric_pairs = [
+        ("best_throughput", _row_value(agg_row, "tokens/s/gpu_cluster"), _row_value(disagg_row, "tokens/s/gpu_cluster")),
+        ("per_gpu_throughput", _row_value(agg_row, "tokens/s/gpu"), _row_value(disagg_row, "tokens/s/gpu")),
+        ("per_user_throughput", _row_value(agg_row, "tokens/s/user"), _row_value(disagg_row, "tokens/s/user")),
+        ("ttft_ms", _row_value(agg_row, "ttft"), _row_value(disagg_row, "ttft")),
+        ("tpot_ms", _row_value(agg_row, "tpot"), _row_value(disagg_row, "tpot")),
+        ("request_latency_ms", _row_value(agg_row, "request_latency"), _row_value(disagg_row, "request_latency")),
+        ("agg_tp", _row_value(agg_row, "tp"), ""),
+        ("agg_dp", _row_value(agg_row, "dp"), ""),
+        ("agg_moe_ep", _row_value(agg_row, "moe_ep"), ""),
+        ("disagg_prefill_workers", "", _row_value(disagg_row, "(p)workers")),
+        ("disagg_decode_workers", "", _row_value(disagg_row, "(d)workers")),
+        ("disagg_prefill_tp", "", _row_value(disagg_row, "(p)tp")),
+        ("disagg_decode_tp", "", _row_value(disagg_row, "(d)tp")),
+    ]
 
-    for mode in modes:
-        su_row = scaleup_rows[mode]
-        so_row = scaleout_rows[mode]
+    rows = []
+    for metric, agg_value, disagg_value in metric_pairs:
+        delta = ""
+        try:
+            delta = str(float(agg_value) - float(disagg_value))
+        except Exception:
+            pass
+        rows.append({"metric": metric, "agg": agg_value, "disagg": disagg_value, "delta": delta})
 
-        print(f"[{mode}] {scaleup_label}: {json.dumps(_compact_best_config(mode, su_row), ensure_ascii=False)}")
-        print(f"[{mode}] {scaleout_label}: {json.dumps(_compact_best_config(mode, so_row), ensure_ascii=False)}")
-
-        with (best_dir / f"best_config_{mode}_scaleup.json").open("w", encoding="utf-8") as f:
-            json.dump(su_row, f, indent=2, ensure_ascii=False)
-        with (best_dir / f"best_config_{mode}_scaleout.json").open("w", encoding="utf-8") as f:
-            json.dump(so_row, f, indent=2, ensure_ascii=False)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["metric", "agg", "disagg", "delta"])
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="One-command DS-V4 Flash topology compare automation")
+    ap = argparse.ArgumentParser(description="One-command DS-V4 Flash single-system agg vs disagg automation")
     ap.add_argument("--config", required=True, help="JSON config path")
     args = ap.parse_args()
 
     cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
 
     out_dir = Path(cfg["out_dir"])
-    scaleup_dir = out_dir / "scaleup"
-    scaleout_dir = out_dir / "scaleout"
+    run_dir = out_dir / "run"
     plot_dir = out_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
-    scaleup_label = _display_label(cfg.get("scaleup_system", ""), "scaleup")
-    scaleout_label = _display_label(cfg.get("scaleout_system", ""), "scaleout")
-    scaleup_log = out_dir / "output_scaleup.log"
-    scaleout_log = out_dir / "output_scaleout.log"
+    log_path = out_dir / "output.log"
     requested_modes = _requested_modes(cfg)
 
-    rc1 = _run_aic(cfg, cfg["scaleup_system"], scaleup_dir, scaleup_log)
-    rc2 = _run_aic(cfg, cfg["scaleout_system"], scaleout_dir, scaleout_log)
+    rc = _run_aic(cfg, cfg["system"], run_dir, log_path)
+    if rc != 0:
+        raise SystemExit(f"run failed: rc={rc}. Check {log_path}")
 
-    if rc1 != 0 or rc2 != 0:
-        raise SystemExit(f"run failed: scaleup_rc={rc1}, scaleout_rc={rc2}")
+    pareto = find_pareto_by_mode(run_dir)
+    best = find_best_config_by_mode(run_dir)
+    all_results = find_result_csv_by_mode(run_dir, "all_results.csv")
 
-    up = find_pareto_by_mode(scaleup_dir)
-    out = find_pareto_by_mode(scaleout_dir)
-    up_best = find_best_config_by_mode(scaleup_dir)
-    out_best = find_best_config_by_mode(scaleout_dir)
-    up_all = find_result_csv_by_mode(scaleup_dir, "all_results.csv")
-    out_all = find_result_csv_by_mode(scaleout_dir, "all_results.csv")
-
-    modes = requested_modes
-    missing_required_modes: list[str] = []
-    for m in modes:
-        up_p = up.get(m)
-        out_p = out.get(m)
-        if not up_p or not out_p:
-            print(f"skip mode={m}: missing pareto. scaleup={up_p} scaleout={out_p}")
-            missing_required_modes.append(m)
+    available_modes: list[str] = []
+    for m in requested_modes:
+        p = pareto.get(m)
+        if not p:
+            print(f"skip mode={m}: missing pareto. path={p}")
             continue
-        canon_up = scaleup_dir / f"pareto_{m}.csv"
-        canon_out = scaleout_dir / f"pareto_{m}.csv"
-        shutil.copy2(up_p, canon_up)
-        shutil.copy2(out_p, canon_out)
+        available_modes.append(m)
+        shutil.copy2(p, run_dir / f"pareto_{m}.csv")
+        a = all_results.get(m)
+        if a:
+            shutil.copy2(a, run_dir / f"all_results_{m}.csv")
 
-        up_all_p = up_all.get(m)
-        out_all_p = out_all.get(m)
-        if up_all_p and out_all_p:
-            canon_up_all = scaleup_dir / f"all_results_{m}.csv"
-            canon_out_all = scaleout_dir / f"all_results_{m}.csv"
-            shutil.copy2(up_all_p, canon_up_all)
-            shutil.copy2(out_all_p, canon_out_all)
+    if not available_modes:
+        missing_str = ", ".join(requested_modes)
+        raise SystemExit(f"no pareto generated for requested mode(s): {missing_str}. Check {log_path} for details.")
 
-            full_plot_cmd = [
-                "uv", "run", "--frozen", "python", "tools/plot_pareto_compare.py",
-                "--scaleup-csv", str(canon_up_all),
-                "--scaleout-csv", str(canon_out_all),
-                "--scaleup-label", scaleup_label,
-                "--scaleout-label", scaleout_label,
-                "--x-col", cfg.get("x_col", "tokens/s/user"),
-                "--y-col", cfg.get("y_col", "tokens/s/gpu"),
-                "--title", f"DS-V4 Flash {m} All Candidates",
-                "--output", str(plot_dir / f"full_compare_{m}.png"),
-            ]
-            full_rc = subprocess.run(full_plot_cmd, text=True, cwd=REPO_ROOT)
-            if full_rc.returncode != 0:
-                print(f"full plot failed for mode={m}")
+    agg_all = run_dir / "all_results_agg.csv"
+    disagg_all = run_dir / "all_results_disagg.csv"
+    agg_pareto = run_dir / "pareto_agg.csv"
+    disagg_pareto = run_dir / "pareto_disagg.csv"
 
-        plot_cmd = [
+    if agg_all.exists() or disagg_all.exists():
+        full_plot_cmd = [
             "uv", "run", "--frozen", "python", "tools/plot_pareto_compare.py",
-            "--scaleup-csv", str(canon_up),
-            "--scaleout-csv", str(canon_out),
-            "--scaleup-label", scaleup_label,
-            "--scaleout-label", scaleout_label,
+            "--scaleup-label", "agg",
+            "--scaleout-label", "disagg",
             "--x-col", cfg.get("x_col", "tokens/s/user"),
             "--y-col", cfg.get("y_col", "tokens/s/gpu"),
-            "--title", f"DS-V4 Flash {m} Scale-up vs Scale-out",
-            "--output", str(plot_dir / f"pareto_compare_{m}.png"),
+            "--title", "DS-V4 Flash agg vs disagg All Candidates",
+            "--output", str(plot_dir / "full_compare_agg_vs_disagg.png"),
         ]
-        prc = subprocess.run(plot_cmd, text=True, cwd=REPO_ROOT)
-        if prc.returncode != 0:
-            print(f"plot failed for mode={m}")
+        if agg_all.exists():
+            full_plot_cmd.extend(["--scaleup-csv", str(agg_all)])
+        if disagg_all.exists():
+            full_plot_cmd.extend(["--scaleout-csv", str(disagg_all)])
+        full_rc = subprocess.run(full_plot_cmd, text=True, cwd=REPO_ROOT)
+        if full_rc.returncode != 0:
+            print("full plot failed")
 
-    if missing_required_modes:
-        missing_str = ", ".join(missing_required_modes)
-        raise SystemExit(
-            f"missing requested pareto for mode(s): {missing_str}. Check {scaleup_log} and {scaleout_log} for details."
-        )
+    pareto_plot_cmd = [
+        "uv", "run", "--frozen", "python", "tools/plot_pareto_compare.py",
+        "--scaleup-label", "agg",
+        "--scaleout-label", "disagg",
+        "--x-col", cfg.get("x_col", "tokens/s/user"),
+        "--y-col", cfg.get("y_col", "tokens/s/gpu"),
+        "--title", "DS-V4 Flash agg vs disagg",
+        "--output", str(plot_dir / "pareto_compare_agg_vs_disagg.png"),
+    ]
+    if agg_pareto.exists():
+        pareto_plot_cmd.extend(["--scaleup-csv", str(agg_pareto)])
+    if disagg_pareto.exists():
+        pareto_plot_cmd.extend(["--scaleout-csv", str(disagg_pareto)])
+    prc = subprocess.run(pareto_plot_cmd, text=True, cwd=REPO_ROOT)
+    if prc.returncode != 0:
+        print("pareto plot failed")
 
-    summary_csv = out_dir / "compare_single_point.csv"
-    if _has_custom_parallel(cfg):
-        _write_compare_summary(up_best, out_best, up, out, summary_csv, scaleup_label, scaleout_label, modes)
+    agg_row = _best_row_for_mode_or_none(best, pareto, "agg")
+    disagg_row = _best_row_for_mode_or_none(best, pareto, "disagg")
+    _write_mode_summary(agg_row, disagg_row, out_dir / "compare_agg_disagg_single_point.csv")
+
+    best_dir = out_dir / "best_configs"
+    best_dir.mkdir(parents=True, exist_ok=True)
+    if agg_row is not None:
+        with (best_dir / "best_config_agg.json").open("w", encoding="utf-8") as f:
+            json.dump(agg_row, f, indent=2, ensure_ascii=False)
+        print(f"[agg] {json.dumps(_compact_best_config('agg', agg_row), ensure_ascii=False)}")
     else:
-        extract_cmd = [
-            "python", "tools/extract_final_metrics.py",
-            "--scaleup-log", str(scaleup_log),
-            "--scaleout-log", str(scaleout_log),
-            "--scaleup-label", scaleup_label,
-            "--scaleout-label", scaleout_label,
-            "--output-csv", str(summary_csv),
-        ]
-        subprocess.run(extract_cmd, check=False)
+        print("[agg] unavailable")
 
-
-    _print_and_save_best_configs(up_best, out_best, up, out, out_dir, scaleup_label, scaleout_label, modes)
+    if disagg_row is not None:
+        with (best_dir / "best_config_disagg.json").open("w", encoding="utf-8") as f:
+            json.dump(disagg_row, f, indent=2, ensure_ascii=False)
+        print(f"[disagg] {json.dumps(_compact_best_config('disagg', disagg_row), ensure_ascii=False)}")
+    else:
+        print("[disagg] unavailable")
     print("done")
 
 

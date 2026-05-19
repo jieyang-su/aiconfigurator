@@ -48,8 +48,8 @@ def axis_label(requested: str, resolved: str) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scaleup-csv", required=True)
-    ap.add_argument("--scaleout-csv", required=True)
+    ap.add_argument("--scaleup-csv")
+    ap.add_argument("--scaleout-csv")
     ap.add_argument("--scaleup-label", default="scaleup")
     ap.add_argument("--scaleout-label", default="scaleout")
     ap.add_argument("--x-col", default="tokens/s/gpu")
@@ -58,18 +58,31 @@ def main() -> None:
     ap.add_argument("--output", required=True)
     a = ap.parse_args()
 
+    if not a.scaleup_csv and not a.scaleout_csv:
+        raise SystemExit("At least one of --scaleup-csv or --scaleout-csv must be provided")
+
     import matplotlib.pyplot as plt
 
-    sx, sy, sx_col, sy_col = read_xy(Path(a.scaleup_csv), a.x_col, a.y_col)
-    ox, oy, ox_col, oy_col = read_xy(Path(a.scaleout_csv), a.x_col, a.y_col)
+    sx = sy = ox = oy = []
+    sx_col = sy_col = ox_col = oy_col = ""
+    if a.scaleup_csv:
+        sx, sy, sx_col, sy_col = read_xy(Path(a.scaleup_csv), a.x_col, a.y_col)
+    if a.scaleout_csv:
+        ox, oy, ox_col, oy_col = read_xy(Path(a.scaleout_csv), a.x_col, a.y_col)
 
     plt.figure(figsize=(8, 5))
-    plt.plot(sx, sy, "o-", label=a.scaleup_label)
-    plt.plot(ox, oy, "o-", label=a.scaleout_label)
-    plt.xlabel(axis_label(a.x_col, sx_col))
-    plt.ylabel(axis_label(a.y_col, sy_col))
+    if a.scaleup_csv:
+        plt.plot(sx, sy, "o-", label=a.scaleup_label)
+    if a.scaleout_csv:
+        plt.plot(ox, oy, "o-", label=a.scaleout_label)
+
+    resolved_x = sx_col or ox_col or a.x_col
+    resolved_y = sy_col or oy_col or a.y_col
+    plt.xlabel(axis_label(a.x_col, resolved_x))
+    plt.ylabel(axis_label(a.y_col, resolved_y))
     plt.title(a.title)
-    plt.legend()
+    if a.scaleup_csv or a.scaleout_csv:
+        plt.legend()
     plt.tight_layout()
     Path(a.output).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(a.output, dpi=150)
