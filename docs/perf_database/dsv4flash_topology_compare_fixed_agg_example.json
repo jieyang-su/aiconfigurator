@@ -13,11 +13,13 @@
   "scaleup_system": "rtx_pro_6000_scaleup_32x1",
   "scaleout_system": "rtx_pro_6000_scaleout_8x4",
   "out_dir": "results/dsv4flash_topology_compare_fixed_agg_example",
+  "debug_comm_queries": true,
+  "prefer_nccl_for_custom_allreduce": true,
   "x_col": "tokens/s/user",
   "y_col": "tokens/s/gpu",
   "search_parallel": {
     "agg": {
-      "num_gpu_per_worker": 32,
+      "num_gpu_per_worker": [1,2,4,8,16,32],
       "tp": [1, 2, 4, 8, 16, 32],
       "pp": [1],
       "dp": [1, 2, 4, 8, 16, 32],
@@ -32,21 +34,21 @@
       "decode_workers": [1, 2, 4],
       "prefill": {
         "enable_wideep": true,
-        "num_gpu_per_worker": [8, 16],
-        "tp": [8, 16],
+        "num_gpu_per_worker": [1,2, 4, 8, 16],
+        "tp": [1, 2, 4, 8, 16],
         "pp": [1],
-        "dp": [1, 2, 4],
+        "dp": [1, 2, 4, 8, 16],
         "moe_tp": [1],
-        "moe_ep": [8, 16]
+        "moe_ep": [1, 2, 4, 8, 16]
       },
       "decode": {
         "enable_wideep": true,
-        "num_gpu_per_worker": [8, 16],
-        "tp": [8, 16],
+        "num_gpu_per_worker": [1,2, 4, 8, 16],
+        "tp": [1, 2, 4, 8, 16],
         "pp": [1],
-        "dp": [1, 2, 4],
+        "dp": [1, 2, 4, 8, 16],
         "moe_tp": [1],
-        "moe_ep": [8, 16]
+        "moe_ep": [1, 2, 4, 8, 16]
       }
     }
   }

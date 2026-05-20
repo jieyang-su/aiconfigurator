@@ -208,6 +208,10 @@ def _run_aic(cfg: dict, system_name: str, save_dir: Path, log_path: Path) -> int
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(SRC_DIR) if not existing_pythonpath else f"{SRC_DIR}:{existing_pythonpath}"
+    if cfg.get("debug_comm_queries"):
+        env["AIC_DEBUG_COMM_QUERIES"] = "1"
+    if cfg.get("prefer_nccl_for_custom_allreduce"):
+        env["AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE"] = "1"
     if custom_parallel:
         exp_yaml = _build_custom_experiment_yaml(cfg, system_name)
         save_dir.mkdir(parents=True, exist_ok=True)

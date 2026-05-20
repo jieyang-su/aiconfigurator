@@ -20,8 +20,8 @@ gpu:
 
 node:
   num_gpus_per_node: 32
-  inter_node_bw: 50000000000   # unchanged placeholder, not dominant in 1x32
-  intra_node_bw: 900000000000  # 900 GB/s single direction NVLink/NVSwitch assumption
+  inter_node_bw: 25000000000   # unchanged placeholder, not dominant in 1x32
+  intra_node_bw: 64000000000  # 64 GB/s single direction 
   pcie_bw: 64000000000
   p2p_latency: 0.000005
 
@@ -32,4 +32,4 @@ misc:
     4: 411041792
     8: 411041792
   other_mem: 3758096384
-  nccl_version: '2.28.9'
+  nccl_version: '2.28.9.1'

@@ -19,7 +19,7 @@ gpu:
   sm_version: 120
 
 node:
-  num_gpus_per_node: 8
+  num_gpus_per_node: 2
   inter_node_bw: 50000000000   # same inter-node assumption for comparability
   intra_node_bw: 64000000000   # Byte/s per GPU, single direction, PCIe Gen5 x16
   pcie_bw: 64000000000
