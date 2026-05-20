@@ -1,0 +1,144 @@
+exps:
+- agg_search
+- disagg_search
+agg_search:
+  mode: patch
+  model_path: sgl-project/DeepSeek-V4-Flash-FP8
+  total_gpus: 32
+  system_name: rtx_pro_6000_scaleout_8x4
+  backend_name: sglang
+  backend_version: 0.5.10.post2
+  database_mode: HYBRID
+  isl: 2048
+  osl: 500
+  ttft: 10000
+  tpot: 1000
+  serving_mode: agg
+  config:
+    worker_config:
+      gemm_quant_mode: fp8_block
+      num_gpu_per_worker:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      tp_list:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      pp_list:
+      - 1
+      dp_list:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      moe_tp_list:
+      - 1
+      moe_ep_list:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+disagg_search:
+  mode: patch
+  model_path: sgl-project/DeepSeek-V4-Flash-FP8
+  total_gpus: 32
+  system_name: rtx_pro_6000_scaleout_8x4
+  backend_name: sglang
+  backend_version: 0.5.10.post2
+  database_mode: HYBRID
+  isl: 2048
+  osl: 500
+  ttft: 10000
+  tpot: 1000
+  enable_wideep: true
+  moe_backend: deepep_moe
+  serving_mode: disagg
+  decode_system_name: rtx_pro_6000_scaleout_8x4
+  config:
+    prefill_worker_config:
+      gemm_quant_mode: fp8_block
+      num_gpu_per_worker:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      tp_list:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      pp_list:
+      - 1
+      dp_list:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      moe_tp_list:
+      - 1
+      moe_ep_list:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      enable_wideep: true
+    decode_worker_config:
+      gemm_quant_mode: fp8_block
+      num_gpu_per_worker:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      tp_list:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      pp_list:
+      - 1
+      dp_list:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      moe_tp_list:
+      - 1
+      moe_ep_list:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      enable_wideep: true
+    replica_config:
+      num_gpu_per_replica:
+      - 32
+      max_gpu_per_replica: 32
+      prefill_num_worker_list:
+      - 1
+      - 2
+      - 4
+      decode_num_worker_list:
+      - 1
+      - 2
+      - 4
+      max_prefill_worker: 4
+      max_decode_worker: 4

@@ -1,0 +1,125 @@
+ServiceConfig:
+  model_path: sgl-project/DeepSeek-V4-Flash-FP8
+  served_model_path: sgl-project/DeepSeek-V4-Flash-FP8
+  include_frontend: true
+  prefix: 0
+  hf_token: null
+  served_model_name: sgl-project/DeepSeek-V4-Flash-FP8
+  model_name: sgl-project/DeepSeek-V4-Flash-FP8
+  head_node_ip: 0.0.0.0
+  port: 8000
+K8sConfig:
+  name_prefix: dynamo
+  k8s_namespace: null
+  k8s_image: nvcr.io/nvidia/ai-dynamo/sglang-runtime:1.2.0
+  k8s_image_pull_secret: null
+  k8s_pvc_name: ''
+  k8s_model_path_in_pvc: ''
+  k8s_pvc_mount_path: /workspace/model_cache
+  k8s_model_cache: ''
+  k8s_etcd_endpoints: null
+  k8s_hf_home: ''
+  name: dynamo-disagg
+  k8s_engine_mode: null
+  use_engine_cm: false
+  prefill_engine_args: /workspace/engine_configs/prefill_config.yaml
+  decode_engine_args: /workspace/engine_configs/decode_config.yaml
+  agg_engine_args: /workspace/engine_configs/agg_config.yaml
+DynConfig:
+  mode: disagg
+  enable_router: false
+WorkerConfig:
+  prefill_workers: 1
+  decode_workers: 4
+  agg_workers: 0
+  prefill_gpus_per_worker: 16
+  decode_gpus_per_worker: 4
+  agg_gpus_per_worker: null
+SlaConfig:
+  isl: 2048
+  osl: 500
+  ttft: 391.865
+  tpot: 275.337
+BenchConfig:
+  name: dynamo-disagg-benchmark
+  image: python:3.12-slim
+  profile_start_timeout: 400
+  endpoint_type: chat
+  endpoint_url: http://dynamo-disagg-frontend.None.svc.cluster.local:8000
+  model: sgl-project/DeepSeek-V4-Flash-FP8
+  tokenizer: sgl-project/DeepSeek-V4-Flash-FP8
+  isl: 2048
+  osl: 500
+  isl_stddev: 0
+  osl_stddev: 0
+  concurrency:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 32
+  - 64
+  - 128
+  - 256
+  num_requests:
+  - 50
+  - 100
+  - 200
+  - 400
+  - 1600
+  - 3200
+  - 6400
+  - 12800
+  ui: simple
+SflowConfig:
+  slurm_account: null
+  slurm_partition: null
+  slurm_timelimit: 120
+  aiperf_image: python:3.12-slim
+  extra_frontend_args: null
+  dynamo_image: null
+  variable_profile: null
+NodeConfig:
+  num_gpus_per_node: 2
+params:
+  prefill:
+    tensor_parallel_size: 16
+    pipeline_parallel_size: 1
+    data_parallel_size: 1
+    gpus_per_worker: 16
+    moe_tensor_parallel_size: 1
+    moe_expert_parallel_size: 16
+    max_batch_size: 1
+    gemm_quant_mode: fp8_block
+    moe_quant_mode: fp8_block
+    kvcache_quant_mode: fp8
+    fmha_quant_mode: bfloat16
+    comm_quant_mode: half
+    memory: 26.982
+    kv_cache_dtype: fp8
+  decode:
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    data_parallel_size: 1
+    gpus_per_worker: 4
+    moe_tensor_parallel_size: 1
+    moe_expert_parallel_size: 4
+    max_batch_size: 7
+    gemm_quant_mode: fp8_block
+    moe_quant_mode: fp8_block
+    kvcache_quant_mode: fp8
+    fmha_quant_mode: bfloat16
+    comm_quant_mode: half
+    memory: 73.19
+    kv_cache_dtype: fp8
+  agg: {}
+ModelConfig:
+  prefix: 0
+  is_moe: true
+  nextn: 1
+  nextn_accept_rates:
+  - 0.85
+  - 0.3
+  - 0.0
+  - 0.0
+  - 0.0

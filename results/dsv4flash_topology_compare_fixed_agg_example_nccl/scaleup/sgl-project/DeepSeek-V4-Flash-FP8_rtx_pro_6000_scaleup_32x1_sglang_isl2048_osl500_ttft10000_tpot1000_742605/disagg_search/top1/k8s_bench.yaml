@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dynamo-disagg-benchmark
+  namespace: None
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      name: dynamo-disagg-benchmark
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: aiperf
+          image: python:3.12-slim
+          env:
+            - name: AIPERF_SERVICE_PROFILE_START_TIMEOUT
+              value: "400"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              pip install aiperf
+              concurrency_array=(1 2 8 16 32 41 44 46 64 128)
+              ARTIFACT_DIR="${BENCH_ARTIFACT_DIR:-/tmp/bench_artifacts}"
+              for concurrency in "${concurrency_array[@]}"; do
+                echo "Run concurrency: $concurrency"
+                aiperf profile \
+                  --artifact-dir "${ARTIFACT_DIR}/concurrency_${concurrency}" \
+                  -m sgl-project/DeepSeek-V4-Flash-FP8 \
+                  --endpoint-type chat \
+                  -u http://dynamo-disagg-frontend.None.svc.cluster.local:8000 \
+                  --tokenizer sgl-project/DeepSeek-V4-Flash-FP8 \
+                  --isl 2048 --isl-stddev 0 \
+                  --osl 500 --osl-stddev 0 \
+                  --extra-inputs ignore_eos:true \
+                  --extra-inputs "{\"nvext\":{\"ignore_eos\":true}}" \
+                  --concurrency ${concurrency} \
+                  --num-requests $(($concurrency*50)) \
+                  --warmup-request-count $(($concurrency*2)) \
+                  --random-seed 100 \
+                  --ui simple \
+                  --streaming
+              done
