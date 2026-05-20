@@ -67,48 +67,56 @@ except ModuleNotFoundError:
     from version_compat import sglang_version_branch
 
 
-# Re-export test case generators from the dedicated test_cases module so
-# collect.py's registry (``module="collector.sglang.collect_dsv4_attn"``)
-# can resolve them via getattr.
+# Re-export test case generators from the centralized case generator module so
+# collect.py's registry (``module="collector.sglang.collect_dsv4_attn"``) can
+# resolve them via getattr.
 try:
-    from collector.common_test_cases import (
+    from collector.case_generator import (
         _DSV4_MODULE_BATCH_SIZES as _BATCH_SIZES,
     )
-    from collector.common_test_cases import (
+    from collector.case_generator import (
         _DSV4_MODULE_SEQ_LENGTHS as _SEQ_LENGTHS,
     )
-    from collector.common_test_cases import (
+    from collector.case_generator import (
         _DSV4_MODULE_TP_SIZES as _TP_SIZES,
     )
-    from collector.common_test_cases import (
-        DSV4_ATTN_KINDS as ATTN_KINDS,
-    )
-    from collector.common_test_cases import (
-        _dsv4_module_filter_pairs as _filter_pairs,
-    )
-    from collector.common_test_cases import (
+    from collector.case_generator import (
         _dsv4_module_tp_sizes,
     )
+    from collector.case_generator import (
+        DSV4_ATTN_KINDS as ATTN_KINDS,
+    )
+    from collector.case_generator import (
+        _dsv4_module_filter_pairs as _filter_pairs,
+    )
+    from collector.case_generator import get_dsv4_csa_context_test_cases as _get_dsv4_csa_context_test_cases_impl
+    from collector.case_generator import get_dsv4_csa_generation_test_cases as _get_dsv4_csa_generation_test_cases_impl
+    from collector.case_generator import get_dsv4_hca_context_test_cases as _get_dsv4_hca_context_test_cases_impl
+    from collector.case_generator import get_dsv4_hca_generation_test_cases as _get_dsv4_hca_generation_test_cases_impl
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from common_test_cases import (
+    from case_generator import (
         _DSV4_MODULE_BATCH_SIZES as _BATCH_SIZES,
     )
-    from common_test_cases import (
+    from case_generator import (
         _DSV4_MODULE_SEQ_LENGTHS as _SEQ_LENGTHS,
     )
-    from common_test_cases import (
+    from case_generator import (
         _DSV4_MODULE_TP_SIZES as _TP_SIZES,
     )
-    from common_test_cases import (
-        DSV4_ATTN_KINDS as ATTN_KINDS,
-    )
-    from common_test_cases import (
-        _dsv4_module_filter_pairs as _filter_pairs,
-    )
-    from common_test_cases import (
+    from case_generator import (
         _dsv4_module_tp_sizes,
     )
+    from case_generator import (
+        DSV4_ATTN_KINDS as ATTN_KINDS,
+    )
+    from case_generator import (
+        _dsv4_module_filter_pairs as _filter_pairs,
+    )
+    from case_generator import get_dsv4_csa_context_test_cases as _get_dsv4_csa_context_test_cases_impl
+    from case_generator import get_dsv4_csa_generation_test_cases as _get_dsv4_csa_generation_test_cases_impl
+    from case_generator import get_dsv4_hca_context_test_cases as _get_dsv4_hca_context_test_cases_impl
+    from case_generator import get_dsv4_hca_generation_test_cases as _get_dsv4_hca_generation_test_cases_impl
 
 
 def _expand_grid():
@@ -117,27 +125,19 @@ def _expand_grid():
 
 
 def get_dsv4_csa_context_test_cases():
-    from collector.common_test_cases import get_dsv4_csa_context_test_cases as _impl
-
-    return _impl()
+    return _get_dsv4_csa_context_test_cases_impl()
 
 
 def get_dsv4_csa_generation_test_cases():
-    from collector.common_test_cases import get_dsv4_csa_generation_test_cases as _impl
-
-    return _impl()
+    return _get_dsv4_csa_generation_test_cases_impl()
 
 
 def get_dsv4_hca_context_test_cases():
-    from collector.common_test_cases import get_dsv4_hca_context_test_cases as _impl
-
-    return _impl()
+    return _get_dsv4_hca_context_test_cases_impl()
 
 
 def get_dsv4_hca_generation_test_cases():
-    from collector.common_test_cases import get_dsv4_hca_generation_test_cases as _impl
-
-    return _impl()
+    return _get_dsv4_hca_generation_test_cases_impl()
 
 
 __all__ = [
@@ -168,30 +168,6 @@ _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
 
 _PORTS_PER_GPU = 1000
 _DSV4_PORT_RETRIES = 5
-
-
-def _dsv4_attention_backend() -> str:
-    """Select the SGLang DSV4 attention backend for the active API branch."""
-    return "compressed" if sglang_version_branch() == "legacy" else "dsv4"
-
-
-def _cuda_major() -> int | None:
-    try:
-        if torch.cuda.is_available():
-            return torch.cuda.get_device_capability(0)[0]
-    except Exception:
-        return None
-    return None
-
-
-def _is_blackwell_supported() -> bool:
-    major = _cuda_major()
-    return major is not None and major >= 10
-
-
-def _is_sm90_supported() -> bool:
-    major = _cuda_major()
-    return major == 9
 
 
 def _port_is_available(port: int) -> bool:
@@ -235,6 +211,11 @@ def _pick_free_port(gpu_id: int) -> int:
 def _kv_dtype_db_to_sglang(kv_dtype_db: str) -> str:
     """Map perf-database kv dtype string to SGLang's ServerArgs value."""
     return {"bfloat16": "bfloat16", "fp8": "fp8_e4m3"}[kv_dtype_db]
+
+
+def _dsv4_attention_backend() -> str:
+    """Select the SGLang DSV4 attention backend for the active API branch."""
+    return "compressed" if sglang_version_branch() == "legacy" else "dsv4"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -566,11 +547,6 @@ def _load_model_runner(
     # gemm_type controls projection GEMM dispatch.  "fp8_block" → DeepGEMM
     # (matches production DSV4 FP8); anything else → cuBLASLt bf16.
     server_args.quantization = "fp8" if gemm_type == "fp8_block" else None
-    if server_args.quantization == "fp8" and server_args.moe_runner_backend == "auto":
-        if _is_blackwell_supported():
-            server_args.moe_runner_backend = "flashinfer_mxfp4"
-        elif _is_sm90_supported():
-            server_args.moe_runner_backend = "marlin"
     server_args.enable_piecewise_cuda_graph = False
     server_args.attention_backend = _dsv4_attention_backend()
 
@@ -1214,7 +1190,7 @@ def _run_subprocess(
             print(log_text)
         return proc.returncode, log_text
 
-    max_attempts = max(1, _DSV4_PORT_RETRIES)
+    max_attempts = _DSV4_PORT_RETRIES
     for attempt in range(max_attempts):
         nccl_port = _nccl_port_for_attempt(gpu_id, attempt)
         returncode, log_text = _run_once(nccl_port)
@@ -1230,13 +1206,10 @@ def _run_subprocess(
             )
             continue
 
-        output_tail = log_text[-4000:].strip()
-        detail = f"\n--- child output tail ---\n{output_tail}" if output_tail else ""
         raise RuntimeError(
             f"dsv4_{attn_kind}_{mode} subprocess failed for "
             f"(bs={batch_size}, tp={tp_size}, gemm={gemm_type}); "
             f"exit={returncode}; log: {log_path}"
-            f"{detail}"
         )
 
 

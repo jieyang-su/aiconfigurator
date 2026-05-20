@@ -9,7 +9,8 @@ using SGLang's own ServerArgs → ModelRunner → ForwardBatch pipeline with dum
 weights. Op names and data schema are aligned with vLLM and TRT-LLM
 collect_mla_module.py so that perf_database queries work across frameworks.
 
-Supported models and their attention types are defined in SUPPORTED_MODELS.
+Supported models, attention types, and micro-sweeps are defined in collector v2
+YAML and loaded through collector.case_generator.
 
 Usage:
     # DSA context phase (DeepSeek-V3.2 style)
@@ -41,43 +42,23 @@ os.environ.setdefault("SGLANG_APPLY_CONFIG_BACKUP", "none")
 
 try:
     from helper import benchmark_with_power, get_sm_version, log_perf, resolve_subprocess_visible_device
-    from collector.sglang.version_compat import (
-        build_forward_batch,
-        maybe_forward_context,
-    )
+    from collector.sglang.version_compat import build_forward_batch, maybe_forward_context
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from helper import benchmark_with_power, get_sm_version, log_perf, resolve_subprocess_visible_device
     from version_compat import build_forward_batch, maybe_forward_context
 
+try:
+    from collector.case_generator import get_mla_module_model_specs, get_mla_module_sweep_spec
+except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from case_generator import get_mla_module_model_specs, get_mla_module_sweep_spec
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Constants
 # ═══════════════════════════════════════════════════════════════════════
-
-SUPPORTED_MODELS: dict[str, str] = {
-    "deepseek-ai/DeepSeek-V3": "mla",
-    "deepseek-ai/DeepSeek-V3.1": "mla",
-    "deepseek-ai/DeepSeek-V3.2": "dsa",
-    "zai-org/GLM-5": "dsa",
-}
-
-MODEL_ARCHITECTURE: dict[str, str] = {
-    "deepseek-ai/DeepSeek-V3": "DeepseekV3ForCausalLM",
-    "deepseek-ai/DeepSeek-V3.1": "DeepseekV3ForCausalLM",
-    "deepseek-ai/DeepSeek-V3.2": "DeepseekV32ForCausalLM",
-    "zai-org/GLM-5": "GlmMoeDsaForCausalLM",
-}
-
-# Native num_attention_heads per model — used to filter TP-sim head counts
-# and to always override correctly when head_num != native.
-MODEL_NATIVE_HEADS: dict[str, int] = {
-    "deepseek-ai/DeepSeek-V3": 128,
-    "deepseek-ai/DeepSeek-V3.1": 128,
-    "deepseek-ai/DeepSeek-V3.2": 128,
-    "zai-org/GLM-5": 64,
-}
 
 # Perf-database-compatible dtype strings → SGLang ServerArgs kv_cache_dtype values.
 # The perf DB uses enum names like "fp8"; SGLang uses "fp8_e4m3".
@@ -93,20 +74,6 @@ _MODEL_CONFIG_DIR = os.path.join(
     "aiconfigurator",
     "model_configs",
 )
-
-
-def _get_selected_model_path() -> str | None:
-    """Return the active collect.py --model-path filter, if any."""
-    model_path = os.environ.get("COLLECTOR_MODEL_PATH", "").strip()
-    return model_path or None
-
-
-def _filter_supported_model_paths(model_paths: list[str]) -> list[str]:
-    """Apply the active model-path filter to a supported-model list."""
-    selected_model = _get_selected_model_path()
-    if selected_model is None:
-        return model_paths
-    return [model_path for model_path in model_paths if model_path == selected_model]
 
 
 def _resolve_local_model_path(model_id: str) -> str:
@@ -125,14 +92,6 @@ def _resolve_local_model_path(model_id: str) -> str:
 
     Falls back to the original HF model ID if local config is not found.
     """
-    if os.path.exists(model_id):
-        return os.path.abspath(model_id)
-
-    collector_local_path = os.environ.get("COLLECTOR_LOCAL_MODEL_PATH")
-    collector_model_name = os.environ.get("COLLECTOR_MODEL_PATH")
-    if collector_local_path and (not collector_model_name or collector_model_name == model_id):
-        return collector_local_path
-
     config_file = os.path.join(_MODEL_CONFIG_DIR, f"{model_id.replace('/', '--')}_config.json")
     if not os.path.exists(config_file):
         return model_id
@@ -263,18 +222,21 @@ def _get_mla_backend_list() -> list[str]:
 # Test Case Generation
 # ═══════════════════════════════════════════════════════════════════════
 
-# Sweep ranges — aligned with vllm/trtllm collect_mla_module.py
-_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
-_SEQ_LENGTHS = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-_HEAD_NUMS = [128, 64, 32, 16, 8]  # 8 covers GLM-5 (native 64) at tp=8
 
-# Reduced head-count list for module-level benchmarks.  Each test case spawns a
-# subprocess that loads a full ModelRunner (~15-20 s), so fewer head counts means
-# fewer subprocesses and faster overall collection.  TP1 (128) and TP2 (64) are
-# the most common production configs.  Kernel-level collectors (collect_mla.py,
-# collect_attn.py) already sweep all 5 head counts; the module benchmark captures
-# scheduling/dispatch overhead which varies less with head count.
-_MODULE_HEAD_NUMS = [128, 64]
+def _module_model_architecture(model_path: str) -> str:
+    """Return the YAML-declared architecture for a module benchmark model."""
+    for spec in get_mla_module_model_specs(apply_model_filter=False):
+        if spec.model_path == model_path:
+            return spec.architecture
+    return "unknown"
+
+
+def _module_model_native_heads(model_path: str) -> int:
+    """Return native attention heads for TP-sim filtering."""
+    for spec in get_mla_module_model_specs(apply_model_filter=False):
+        if spec.model_path == model_path:
+            return spec.native_num_heads
+    return 128
 
 
 def get_context_test_cases(attn_type: str):
@@ -283,14 +245,18 @@ def get_context_test_cases(attn_type: str):
     Returns list of [seq_len, batch_size, num_heads, kv_cache_dtype,
                      compute_dtype, gemm_type].
     """
+    sweep = get_mla_module_sweep_spec()
     cases = []
     for compute_dtype, kv_dtype, gemm_type in _get_precision_combos("context"):
-        for num_heads in _HEAD_NUMS:
-            for batch_size in _BATCH_SIZES:
-                for seq_len in _SEQ_LENGTHS:
-                    if batch_size * seq_len > 128 * 1024:
+        for num_heads in sweep.inner_sweep_head_counts:
+            for batch_size in sweep.batch_sizes:
+                for seq_len in sweep.sequence_lengths:
+                    if batch_size * seq_len > sweep.context_max_tokens:
                         continue
-                    if seq_len >= 8192 and batch_size > 8:
+                    if (
+                        seq_len >= sweep.context_large_sequence_min
+                        and batch_size > sweep.context_large_sequence_max_batch_size
+                    ):
                         continue
                     cases.append([seq_len, batch_size, num_heads, kv_dtype, compute_dtype, gemm_type])
     return cases
@@ -302,14 +268,18 @@ def get_generation_test_cases(attn_type: str):
     Returns list of [kv_cache_len, batch_size, num_heads, kv_cache_dtype,
                      compute_dtype, gemm_type].
     """
+    sweep = get_mla_module_sweep_spec()
     cases = []
     for compute_dtype, kv_dtype, gemm_type in _get_precision_combos("generation"):
-        for num_heads in _HEAD_NUMS:
-            for batch_size in _BATCH_SIZES:
-                for seq_len in _SEQ_LENGTHS:
-                    if batch_size * seq_len > 256 * 1024:
+        for num_heads in sweep.inner_sweep_head_counts:
+            for batch_size in sweep.batch_sizes:
+                for seq_len in sweep.sequence_lengths:
+                    if batch_size * seq_len > sweep.generation_max_tokens:
                         continue
-                    if seq_len >= 8192 and batch_size > 16:
+                    if (
+                        seq_len >= sweep.generation_large_sequence_min
+                        and batch_size > sweep.generation_large_sequence_max_batch_size
+                    ):
                         continue
                     cases.append([seq_len, batch_size, num_heads, kv_dtype, compute_dtype, gemm_type])
     return cases
@@ -328,7 +298,7 @@ def _get_module_precision_combos():
     captures module-level overhead (scheduling, memory management, attention
     dispatch) which is largely precision-independent with dummy weights.
     """
-    return [("bfloat16", "bfloat16", "bfloat16")]
+    return get_mla_module_sweep_spec().module_precision_combos
 
 
 def _build_module_test_cases(attn_type: str, mode: str):
@@ -342,8 +312,8 @@ def _build_module_test_cases(attn_type: str, mode: str):
     combinations internally, so we only need one entry per group — not one per
     individual point. seq_len and batch_size are set to 0 as placeholders.
 
-    Uses _get_module_precision_combos() instead of the full
-    _get_precision_combos() and _MODULE_HEAD_NUMS instead of _HEAD_NUMS to keep
+    Uses the YAML ``module_precision_combos`` and ``top_level_head_counts``
+    instead of the full inner sweep to keep
     the subprocess count low — each subprocess loads a full ModelRunner which
     takes ~15-20 s.  With 4 precision combos x 5 head counts = 20 subprocesses,
     the collection exceeds typical container timeouts.  1 combo x 2 heads per
@@ -355,13 +325,13 @@ def _build_module_test_cases(attn_type: str, mode: str):
     """
     if attn_type == "dsa" and _skip_sm120_deepgemm_attention_modules():
         return []
-    model_paths = _filter_supported_model_paths([m for m, t in SUPPORTED_MODELS.items() if t == attn_type])
+    model_specs = get_mla_module_model_specs(attention_type=attn_type)
+    sweep = get_mla_module_sweep_spec()
     cases = []
-    for model_path in model_paths:
-        native_heads = MODEL_NATIVE_HEADS.get(model_path, 128)
+    for model_spec in model_specs:
         for compute_dtype, kv_dtype, gemm_type in _get_module_precision_combos():
-            for num_heads in _MODULE_HEAD_NUMS:
-                if num_heads > native_heads:
+            for num_heads in sweep.top_level_head_counts:
+                if num_heads > model_spec.native_num_heads:
                     continue  # Skip invalid TP-sim configs
                 cases.append(
                     [
@@ -371,7 +341,7 @@ def _build_module_test_cases(attn_type: str, mode: str):
                         kv_dtype,
                         compute_dtype,
                         gemm_type,
-                        model_path,
+                        model_spec.model_path,
                         attn_type,
                         None,
                     ]
@@ -396,14 +366,14 @@ def _build_wideep_mla_test_cases(mode: str):
     """
     if _skip_sm120_deepgemm_attention_modules():
         return []
-    model_paths = _filter_supported_model_paths([m for m, t in SUPPORTED_MODELS.items() if t == "mla"])
+    model_specs = get_mla_module_model_specs(attention_type="mla", wideep_mla=True)
+    sweep = get_mla_module_sweep_spec()
     backends = _get_mla_backend_list()
     cases = []
-    for model_path in model_paths:
-        native_heads = MODEL_NATIVE_HEADS.get(model_path, 128)
+    for model_spec in model_specs:
         for backend in backends:
-            for num_heads in _HEAD_NUMS:
-                if num_heads > native_heads:
+            for num_heads in sweep.inner_sweep_head_counts:
+                if num_heads > model_spec.native_num_heads:
                     continue
                 # Single precision: run with bfloat16, log as fp8_block/fp8
                 cases.append(
@@ -414,7 +384,7 @@ def _build_wideep_mla_test_cases(mode: str):
                         "bfloat16",
                         "bfloat16",
                         "bfloat16",
-                        model_path,
+                        model_spec.model_path,
                         "mla",
                         backend,
                     ]
@@ -724,7 +694,7 @@ def run_attention_torch(
         gemm_type: Perf-DB-compatible string for logging.
     """
     attention_module = model_runner.model.model.layers[test_layer].self_attn
-    architecture = MODEL_ARCHITECTURE.get(model_path, "unknown")
+    architecture = _module_model_architecture(model_path)
     backend_name = model_runner.server_args.attention_backend
     version = get_version("sglang")
     device_name = torch.cuda.get_device_name(device)
@@ -840,6 +810,7 @@ def _run_prefill(
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.chunk_cache import ChunkCache
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_params import SamplingParams
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils import BumpAllocator
@@ -1023,6 +994,7 @@ def _run_decode(
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.chunk_cache import ChunkCache
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_params import SamplingParams
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils import BumpAllocator
@@ -1479,22 +1451,29 @@ def main():
     if args.attn_type:
         attn_types = [args.attn_type]
     else:
-        attn_types = list(set(SUPPORTED_MODELS.values()))
+        attn_types = sorted({spec.attention_type for spec in get_mla_module_model_specs(apply_model_filter=False)})
 
     for attn_type in attn_types:
         # Determine models
         if args.model:
             models = [args.model]
         else:
-            models = [m for m, t in SUPPORTED_MODELS.items() if t == attn_type]
+            models = [
+                spec.model_path
+                for spec in get_mla_module_model_specs(attention_type=attn_type, apply_model_filter=False)
+            ]
 
         for model_path in models:
             print(f"\n{'=' * 60}")
             print(f"Model: {model_path}  |  Attention: {attn_type.upper()}  |  Mode: {args.mode}")
             print(f"{'=' * 60}")
 
-            native_heads = MODEL_NATIVE_HEADS.get(model_path, 128)
-            head_nums = [args.num_heads] if args.num_heads else [h for h in _HEAD_NUMS if h <= native_heads]
+            native_heads = _module_model_native_heads(model_path)
+            head_nums = (
+                [args.num_heads]
+                if args.num_heads
+                else [h for h in get_mla_module_sweep_spec().inner_sweep_head_counts if h <= native_heads]
+            )
 
             for compute_dtype, kv_dtype, gemm_type in _get_precision_combos(args.mode):
                 if args.kv_cache_dtype and kv_dtype != args.kv_cache_dtype:

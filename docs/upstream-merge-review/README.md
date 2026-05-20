@@ -662,3 +662,57 @@ Recommended resolution:
 Decision needed:
 
 - No major decision if old public names are dropped.
+
+## `1d12d321` / `#1113 refactor: aic collector v2`
+
+Status: in progress during upstream replay.
+
+High-level conflict cause:
+
+- Upstream moved collector case ownership from Python constants in
+  `collector/common_test_cases.py` into YAML plus `collector/case_generator.py`.
+- This fork had model additions and collector behavior in the old Python layer:
+  DeepSeek-V3.1, MiniMax-M2.7, Kimi/MiniMax WideEP MoE wrapper handling,
+  DeepSeek-V4 Pro TP=16, and SGLang version-branch selection.
+
+Resolution applied:
+
+- Kept upstream collector v2 as the canonical architecture.
+- Deleted `collector/common_test_cases.py`; migrated retained behavior into
+  YAML and `case_generator.py`.
+- Added `deepseek-ai/DeepSeek-V3.1` to
+  `collector/cases/models/DeepseekV3ForCausalLM_cases.yaml` for MoE, MLA, and
+  MLA module collection. Existing upstream YAML already covered
+  `MiniMaxAI/MiniMax-M2.7` / `nvidia/MiniMax-M2.7-NVFP4`.
+- Added DSV4 model-specific `module_tp_sizes_by_model` in
+  `DeepseekV4ForCausalLM_cases.yaml`; `DeepSeek-V4-Pro` and
+  `sgl-project/DeepSeek-V4-Pro-FP8` get TP=16 under the generic `dsv4_*`
+  path.
+- Added `_dsv4_module_tp_sizes(model_path)` to `case_generator.py` and used it
+  in DSV4 module case generation.
+- Removed public `dsv4_flash_*` test-case aliases from `case_generator.py`,
+  `collect_dsv4_attn.py`, and `deepseekv4_sparse_modules.py`.
+- Kept `collect.py --sglang-version-branch` with only `auto`, `v0.5.10`,
+  `0.5.10`, `v0.5.12`, `0.5.12`. The flag sets
+  `COLLECTOR_SGLANG_VERSION_BRANCH` and does not interfere with collector v2
+  planning.
+- In `collect_dsv4_attn.py`, `v0.5.10` maps to
+  `attention_backend=compressed`, while `v0.5.12` maps to
+  `attention_backend=dsv4`.
+- In `collect_mla_module.py`, retained v0.5.10/v0.5.12 ForwardBatch and
+  forward-context compatibility via `version_compat.py`, while using upstream
+  YAML-backed model specs.
+- In the moved WideEP MoE collector
+  `collector/wideep/sglang/collect_deepep_moe.py`, migrated fork support for:
+  nested `text_config` lookup, `num_local_experts`, stripping checkpoint
+  quantization metadata for dummy DeepEP collection, reduced local config
+  generation, subprocess visible-device mapping, progress timeout logging, and
+  writing split WideEP perf files beside the caller-provided `perf_filename`.
+
+Remaining review points:
+
+- Verify no external users still depend on public `dsv4_flash_*` collector
+  helper names. The current decision is to drop them.
+- Confirm whether `version_compat.py` should continue accepting internal
+  aliases like `legacy/current` from the environment. CLI choices no longer
+  expose those names.
