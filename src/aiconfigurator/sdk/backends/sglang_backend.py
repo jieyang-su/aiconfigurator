@@ -439,6 +439,26 @@ class SGLANGBackend(BaseBackend):
             summary.set_summary_df(result)
             summary.set_result_dict(result_dict)
 
+            if _debug_exp_estimate_enabled():
+                logger.info(
+                    "[exp-estimate-debug] run_agg output: tp=%s pp=%s dp=%s moe_tp=%s moe_ep=%s "
+                    "b=%s ctx_tokens=%s ttft=%.3f tpot=%.3f tokens_s_gpu=%.3f tokens_s_user=%.3f "
+                    "request_rate=%.3f memory=%.3f",
+                    tp,
+                    pp,
+                    dp,
+                    moe_tp,
+                    moe_ep,
+                    b,
+                    ctx_tokens,
+                    result_dict["ttft"],
+                    result_dict["tpot"],
+                    result_dict["tokens/s/gpu"],
+                    result_dict["tokens/s/user"],
+                    result_dict["request_rate"],
+                    result_dict["memory"],
+                )
+
             # Store per-ops latency breakdown
             per_ops_data["scheduling"] = {
                 "num_mix_steps": float(num_mix_steps),

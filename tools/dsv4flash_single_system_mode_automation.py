@@ -18,6 +18,73 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 
 
+def _resolve_perf_source_from_cfg(cfg: dict, system_name: str) -> dict[str, str] | None:
+    systems_path = Path(cfg["systems_path"])
+    if not systems_path.is_absolute():
+        systems_path = (REPO_ROOT / systems_path).resolve()
+    system_yaml = systems_path / f"{system_name}.yaml"
+    if not system_yaml.exists():
+        return None
+    try:
+        system_spec = yaml.safe_load(system_yaml.read_text(encoding="utf-8")) or {}
+        data_dir = system_spec.get("data_dir")
+        if not data_dir:
+            return None
+    except Exception:
+        return None
+
+    data_path = systems_path / data_dir / cfg["backend"] / cfg["backend_version"]
+    return {
+        "systems_root": str(systems_path),
+        "system_yaml_path": str(system_yaml),
+        "data_path": str(data_path.resolve()),
+    }
+
+
+def _resolve_aiconfigurator_file(env: dict[str, str]) -> str:
+    probe = [
+        sys.executable,
+        "-c",
+        "import aiconfigurator; print(getattr(aiconfigurator, '__file__', '<unknown>'))",
+    ]
+    try:
+        result = subprocess.run(
+            probe,
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+            env=env,
+            check=False,
+        )
+        out = (result.stdout or "").strip()
+        return out if out else "<unresolved>"
+    except Exception:
+        return "<unresolved>"
+
+
+def _build_automation_context_lines(cfg: dict, system_name: str, env: dict[str, str]) -> list[str]:
+    systems_path = Path(cfg["systems_path"])
+    if not systems_path.is_absolute():
+        systems_path = (REPO_ROOT / systems_path).resolve()
+
+    perf_source = _resolve_perf_source_from_cfg(cfg, system_name)
+    lines = [
+        f"[automation-context] sys.executable={sys.executable}",
+        f"[automation-context] aiconfigurator.__file__={_resolve_aiconfigurator_file(env)}",
+        f"[automation-context] resolved systems path={systems_path}",
+    ]
+    if perf_source is None:
+        lines.append("[automation-context] perf file source=<unresolved>")
+    else:
+        lines.append(
+            "[automation-context] perf file source: "
+            f"systems_root={perf_source['systems_root']} "
+            f"system_yaml={perf_source['system_yaml_path']} "
+            f"data_path={perf_source['data_path']}"
+        )
+    return lines
+
+
 def _requested_modes(cfg: dict) -> list[str]:
     fixed = cfg.get("fixed_parallel") or {}
     search = cfg.get("search_parallel") or {}
@@ -33,7 +100,7 @@ def _has_custom_parallel(cfg: dict) -> bool:
 
 def run_cmd(cmd: list[str], log_path: Path, cwd: Path | None = None, env: dict[str, str] | None = None) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as f:
+    with log_path.open("a", encoding="utf-8") as f:
         p = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, text=True, cwd=cwd, env=env)
     return p.returncode
 
@@ -205,6 +272,13 @@ def _run_aic(cfg: dict, system_name: str, save_dir: Path, log_path: Path) -> int
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(SRC_DIR) if not existing_pythonpath else f"{SRC_DIR}:{existing_pythonpath}"
+    context_lines = _build_automation_context_lines(cfg, system_name, env)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as f:
+        for line in context_lines:
+            print(line)
+            f.write(line + "\n")
+
     if custom_parallel:
         exp_yaml = _build_custom_experiment_yaml(cfg, system_name)
         save_dir.mkdir(parents=True, exist_ok=True)

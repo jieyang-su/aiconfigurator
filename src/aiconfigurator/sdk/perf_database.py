@@ -87,6 +87,47 @@ def get_systems_paths() -> list[str]:
     return list(_SYSTEMS_PATHS)
 
 
+def resolve_perf_data_source(
+    system: str,
+    backend: str,
+    version: str,
+    systems_paths: str | list[str] | None = None,
+) -> dict[str, str] | None:
+    """Resolve the first usable perf-data source directory for a database triple.
+
+    This mirrors ``get_database`` source selection logic enough for debug/reporting
+    so callers can print exactly which systems root and perf data dir are used.
+    """
+    if systems_paths is None:
+        systems_paths = get_systems_paths()
+    elif isinstance(systems_paths, str):
+        systems_paths = [systems_paths]
+
+    if not version:
+        return None
+
+    for systems_root in systems_paths:
+        system_yaml_path = os.path.join(systems_root, f"{system}.yaml")
+        if not os.path.isfile(system_yaml_path):
+            continue
+        try:
+            with open(system_yaml_path) as f:
+                system_spec = yaml.load(f, Loader=yaml.SafeLoader)
+            data_dir = system_spec["data_dir"]
+        except Exception:
+            continue
+
+        data_path = os.path.join(systems_root, data_dir, backend, version)
+        is_incomplete = os.path.isfile(os.path.join(data_path, "INCOMPLETE.txt"))
+        if os.path.exists(data_path) and not is_incomplete:
+            return {
+                "systems_root": systems_root,
+                "system_yaml_path": system_yaml_path,
+                "data_path": data_path,
+            }
+    return None
+
+
 def build_no_databases_message() -> str:
     """Build a concise error message for systems path/db validation failures."""
     resolved_paths = get_systems_paths()
