@@ -1,0 +1,20 @@
+{
+  "mix_step": {
+    "context_attention (scaled)": "silicon",
+    "context_attn_norm": "silicon",
+    "context_embedding": "silicon",
+    "context_ffn_norm": "silicon",
+    "context_logits_gemm": "silicon",
+    "context_mhc_post": "silicon",
+    "context_mhc_pre": "silicon",
+    "context_moe": "silicon",
+    "context_moe_post_dispatch": "silicon",
+    "context_moe_pre_dispatch": "silicon",
+    "context_p2p": "silicon",
+    "context_router_gemm": "silicon",
+    "context_shared_act_gate": "silicon",
+    "context_shared_ffn2_gemm": "silicon",
+    "context_shared_gate_up_gemm": "silicon",
+    "generation_attention": "silicon"
+  }
+}

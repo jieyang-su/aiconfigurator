@@ -11,6 +11,7 @@ This module provides simple function interfaces to the CLI's "default", "exp",
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -69,6 +70,9 @@ def cli_support(
 
 
 logger = logging.getLogger(__name__)
+
+def _debug_exp_estimate_enabled() -> bool:
+    return os.getenv("AIC_DEBUG_EXP_ESTIMATE_DIFF", "0") == "1"
 
 
 @dataclass
@@ -590,6 +594,8 @@ def _build_model_config(
     fmha_quant_mode: str | None = None,
     moe_quant_mode: str | None = None,
     comm_quant_mode: str | None = None,
+    nextn: int | None = None,
+    nextn_accept_rates: list[float] | None = None,
 ):
     """Build a ModelConfig with optional quant mode overrides."""
     from aiconfigurator.sdk.common import (
@@ -612,6 +618,8 @@ def _build_model_config(
         fmha_quant_mode=FMHAQuantMode[fmha_quant_mode] if fmha_quant_mode else None,
         moe_quant_mode=MoEQuantMode[moe_quant_mode] if moe_quant_mode else None,
         comm_quant_mode=CommQuantMode[comm_quant_mode] if comm_quant_mode else None,
+        nextn=nextn if nextn is not None else 0,
+        nextn_accept_rates=nextn_accept_rates,
     )
 
 
@@ -627,6 +635,8 @@ def cli_estimate(
     osl: int = 1024,
     batch_size: int = 128,
     ctx_tokens: int | None = None,
+    nextn: int = 0,
+    nextn_accept_rates: list[float] | None = None,
     tp_size: int = 1,
     pp_size: int = 1,
     attention_dp_size: int = 1,
@@ -679,6 +689,9 @@ def cli_estimate(
         batch_size: Batch size (max concurrent requests, used for agg mode). Default is 128.
         ctx_tokens: Context tokens budget for IFB scheduling (agg mode only).
             Default is None, which uses ``isl`` as the budget.
+        nextn: Number of draft tokens for MTP speculative decoding. Default is 0.
+        nextn_accept_rates: Acceptance rates for MTP draft tokens (up to 5 values).
+            Only the first ``nextn`` values are used by the backend implementation.
         tp_size: Tensor parallelism size. Default is 1. Also serves as fallback for
             prefill/decode TP when their specific args are omitted.
         pp_size: Pipeline parallelism size. Default is 1.
@@ -771,6 +784,10 @@ def cli_estimate(
         database_kwargs = {"allow_missing_data": database_mode != "SILICON"}
         if active_systems_paths is not None:
             database_kwargs["systems_paths"] = active_systems_paths
+        # Keep loader behavior consistent with TaskRunner:
+        # HYBRID must be passed at construction time so shared-layer sources
+        # are loaded into PerfDatabase.
+        database_kwargs["database_mode"] = database_mode
         db = get_database(
             sys_name,
             backend_name,
@@ -799,6 +816,8 @@ def cli_estimate(
             osl=osl,
             batch_size=batch_size,
             ctx_tokens=ctx_tokens if ctx_tokens is not None else isl,
+            nextn=nextn,
+            nextn_accept_rates=nextn_accept_rates,
             tp_size=tp_size,
             pp_size=pp_size,
             attention_dp_size=attention_dp_size,
@@ -843,6 +862,8 @@ def cli_estimate(
             resolved_version=resolved_version,
             isl=isl,
             osl=osl,
+            nextn=nextn,
+            nextn_accept_rates=nextn_accept_rates,
             # Prefill config (fall back to shared args)
             prefill_tp_size=prefill_tp_size if prefill_tp_size is not None else tp_size,
             prefill_pp_size=prefill_pp_size if prefill_pp_size is not None else pp_size,
@@ -888,6 +909,8 @@ def _run_agg_estimate(
     osl,
     batch_size,
     ctx_tokens,
+    nextn,
+    nextn_accept_rates,
     tp_size,
     pp_size,
     attention_dp_size,
@@ -924,6 +947,8 @@ def _run_agg_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        nextn,
+        nextn_accept_rates,
     )
     runtime_config = RuntimeConfig(
         isl=isl,
@@ -936,6 +961,25 @@ def _run_agg_estimate(
     database = load_database(system_name)
     backend = get_backend(backend_name)
     session = InferenceSession(model, database, backend)
+    if _debug_exp_estimate_enabled():
+        logger.info(
+            "[exp-estimate-debug] estimate _run_agg_estimate inputs: "
+            "isl=%s osl=%s batch_size=%s ctx_tokens=%s tp=%s pp=%s dp=%s moe_tp=%s moe_ep=%s "
+            "nextn=%s nextn_accept_rates=%s engine_step_backend=%s",
+            isl,
+            osl,
+            batch_size,
+            ctx_tokens,
+            tp_size,
+            pp_size,
+            attention_dp_size,
+            moe_tp_size,
+            moe_ep_size,
+            nextn,
+            nextn_accept_rates,
+            engine_step_backend,
+        )
+
     summary = session.run_agg(
         runtime_config,
         ctx_tokens=ctx_tokens,
@@ -995,6 +1039,8 @@ def _run_disagg_estimate(
     resolved_version,
     isl,
     osl,
+    nextn,
+    nextn_accept_rates,
     prefill_tp_size,
     prefill_pp_size,
     prefill_attention_dp_size,
@@ -1050,6 +1096,8 @@ def _run_disagg_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        nextn,
+        nextn_accept_rates,
     )
     decode_model_config = _build_model_config(
         decode_tp_size,
@@ -1062,6 +1110,8 @@ def _run_disagg_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        nextn,
+        nextn_accept_rates,
     )
 
     runtime_config = RuntimeConfig(isl=isl, osl=osl, engine_step_backend=engine_step_backend)

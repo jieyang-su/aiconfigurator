@@ -26,6 +26,26 @@ from aiconfigurator.sdk.system_spec import SystemSpec
 databases_cache = defaultdict(lambda: defaultdict(lambda: defaultdict()))
 logger = logging.getLogger(__name__)
 
+
+def _comm_debug_enabled() -> bool:
+    return os.environ.get("AIC_DEBUG_COMM_QUERIES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _prefer_nccl_for_custom_allreduce_enabled() -> bool:
+    return os.environ.get("AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _log_comm_debug(event: str, **fields) -> None:
+    if not _comm_debug_enabled():
+        return
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.info("[comm-debug] %s %s", event, payload)
+
 _SYSTEMS_PATHS: list[str] = [os.fspath(pkg_resources.files("aiconfigurator") / "systems")]
 
 
@@ -65,6 +85,47 @@ def set_systems_paths(raw_paths: str | Iterable[str] | None) -> None:
 
 def get_systems_paths() -> list[str]:
     return list(_SYSTEMS_PATHS)
+
+
+def resolve_perf_data_source(
+    system: str,
+    backend: str,
+    version: str,
+    systems_paths: str | list[str] | None = None,
+) -> dict[str, str] | None:
+    """Resolve the first usable perf-data source directory for a database triple.
+
+    This mirrors ``get_database`` source selection logic enough for debug/reporting
+    so callers can print exactly which systems root and perf data dir are used.
+    """
+    if systems_paths is None:
+        systems_paths = get_systems_paths()
+    elif isinstance(systems_paths, str):
+        systems_paths = [systems_paths]
+
+    if not version:
+        return None
+
+    for systems_root in systems_paths:
+        system_yaml_path = os.path.join(systems_root, f"{system}.yaml")
+        if not os.path.isfile(system_yaml_path):
+            continue
+        try:
+            with open(system_yaml_path) as f:
+                system_spec = yaml.load(f, Loader=yaml.SafeLoader)
+            data_dir = system_spec["data_dir"]
+        except Exception:
+            continue
+
+        data_path = os.path.join(systems_root, data_dir, backend, version)
+        is_incomplete = os.path.isfile(os.path.join(data_path, "INCOMPLETE.txt"))
+        if os.path.exists(data_path) and not is_incomplete:
+            return {
+                "systems_root": systems_root,
+                "system_yaml_path": system_yaml_path,
+                "data_path": data_path,
+            }
+    return None
 
 
 def build_no_databases_message() -> str:
@@ -3961,6 +4022,9 @@ class PerfDatabase:
         get_empirical: Callable[[], float],
         database_mode: common.DatabaseMode,
         error_msg: str,
+        fallback_source: str = "empirical",
+        fallback_debug_event: str | None = None,
+        fallback_debug_fields: dict | None = None,
     ) -> PerformanceResult:
         """
         Helper method to query database (SILICON mode) with optional fallback to empirical mode.
@@ -3985,7 +4049,15 @@ class PerfDatabase:
             if database_mode == common.DatabaseMode.HYBRID:
                 debug_msg = error_msg + " Will try empirical mode."
                 logger.debug(debug_msg)
-                return PerformanceResult(get_empirical(), energy=0.0, source="empirical")
+                emp_latency = get_empirical()
+                if fallback_debug_event is not None:
+                    fields = dict(fallback_debug_fields or {})
+                    fields.setdefault("source", fallback_source)
+                    fields["fallback_reason"] = type(e).__name__
+                    fields["fallback_detail"] = str(e)
+                    fields["latency_ms"] = f"{emp_latency:.6f}"
+                    _log_comm_debug(fallback_debug_event, **fields)
+                return PerformanceResult(emp_latency, energy=0.0, source=fallback_source)
 
             exception_msg = error_msg + " Consider using HYBRID mode."
             # PerfDataNotAvailableError is a structured signal that callers (e.g.
@@ -5273,19 +5345,65 @@ class PerfDatabase:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(quant_mode, tp_size, size)[0]
+            _log_comm_debug(
+                "query_custom_allreduce",
+                mode=database_mode.name,
+                quant_mode=quant_mode.name,
+                requested_tp=tp_size,
+                message_size=size,
+                source="sol",
+                latency_ms=f"{sol_latency:.6f}",
+            )
             return PerformanceResult(sol_latency, energy=0.0)
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(quant_mode, tp_size, size)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(quant_mode, tp_size, size)
+            _log_comm_debug(
+                "query_custom_allreduce",
+                mode=database_mode.name,
+                quant_mode=quant_mode.name,
+                requested_tp=tp_size,
+                message_size=size,
+                source="empirical",
+                latency_ms=f"{emp_latency:.6f}",
+            )
             return PerformanceResult(emp_latency, energy=0.0)
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
                 if tp_size == 1:
+                    _log_comm_debug(
+                        "query_custom_allreduce",
+                        mode=database_mode.name,
+                        quant_mode=quant_mode.name,
+                        requested_tp=tp_size,
+                        message_size=size,
+                        source="custom_allreduce",
+                        effective_tp=1,
+                        latency_ms="0.000000",
+                    )
                     return PerformanceResult(0.0, energy=0.0)
+                if _prefer_nccl_for_custom_allreduce_enabled():
+                    _log_comm_debug(
+                        "query_custom_allreduce",
+                        mode=database_mode.name,
+                        quant_mode=quant_mode.name,
+                        requested_tp=tp_size,
+                        message_size=size,
+                        source="prefer_nccl_substitute",
+                    )
+                    return self.query_nccl(quant_mode, tp_size, "all_reduce", size, database_mode=database_mode)
                 if self.system_spec["node"]["num_gpus_per_node"] == 72 and tp_size > 4:
                     # on GB200, we only have custom all reduce for up to tp4.
+                    _log_comm_debug(
+                        "query_custom_allreduce",
+                        mode=database_mode.name,
+                        quant_mode=quant_mode.name,
+                        requested_tp=tp_size,
+                        message_size=size,
+                        source="fallback_to_nccl",
+                    )
                     return self.query_nccl(quant_mode, tp_size, "all_reduce", size)
 
                 self._custom_allreduce_data.raise_if_not_loaded()
@@ -5331,6 +5449,21 @@ class PerfDatabase:
                     )
                     lat = lat * scale_factor
                     energy = energy * scale_factor
+
+                _log_comm_debug(
+                    "query_custom_allreduce",
+                    mode=database_mode.name,
+                    quant_mode=quant_mode.name,
+                    requested_tp=tp_size,
+                    effective_tp=effective_tp,
+                    message_size=size,
+                    bucket_left=size_left,
+                    bucket_right=size_right,
+                    scaled=int(tp_size > self.system_spec["node"]["num_gpus_per_node"]),
+                    source="custom_allreduce",
+                    data_file=self._custom_allreduce_data.filepath,
+                    latency_ms=f"{lat:.6f}",
+                )
 
                 return PerformanceResult(lat, energy=energy)
 
@@ -5399,15 +5532,48 @@ class PerfDatabase:
         if database_mode is None:
             database_mode = self._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol(dtype, num_gpus, operation, message_size)[0], energy=0.0)
+            sol_latency = get_sol(dtype, num_gpus, operation, message_size)[0]
+            _log_comm_debug(
+                "query_nccl",
+                mode=database_mode.name,
+                dtype=dtype.name,
+                operation=operation,
+                requested_num_gpus=num_gpus,
+                message_size=message_size,
+                source="sol",
+                latency_ms=f"{sol_latency:.6f}",
+            )
+            return PerformanceResult(sol_latency, energy=0.0)
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(dtype, num_gpus, operation, message_size)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(get_empirical(dtype, num_gpus, operation, message_size), energy=0.0)
+            emp_latency = get_empirical(dtype, num_gpus, operation, message_size)
+            _log_comm_debug(
+                "query_nccl",
+                mode=database_mode.name,
+                dtype=dtype.name,
+                operation=operation,
+                requested_num_gpus=num_gpus,
+                message_size=message_size,
+                source="empirical",
+                latency_ms=f"{emp_latency:.6f}",
+            )
+            return PerformanceResult(emp_latency, energy=0.0)
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
                 if num_gpus == 1:
+                    _log_comm_debug(
+                        "query_nccl",
+                        mode=database_mode.name,
+                        dtype=dtype.name,
+                        operation=operation,
+                        requested_num_gpus=num_gpus,
+                        message_size=message_size,
+                        source="nccl",
+                        effective_num_gpus=1,
+                        latency_ms="0.000000",
+                    )
                     return PerformanceResult(0.0, energy=0.0)
 
                 # Use oneCCL data as fallback when NCCL data is not available (e.g. XPU systems)
@@ -5417,7 +5583,8 @@ class PerfDatabase:
                 nccl_source.raise_if_not_loaded()
 
                 max_num_gpus = max(nccl_source[dtype][operation].keys())
-                nccl_dict = nccl_source[dtype][operation][min(num_gpus, max_num_gpus)]
+                effective_num_gpus = min(num_gpus, max_num_gpus)
+                nccl_dict = nccl_source[dtype][operation][effective_num_gpus]
                 size_left, size_right = self._nearest_1d_point_helper(
                     message_size,
                     list(nccl_dict.keys()),
@@ -5448,6 +5615,22 @@ class PerfDatabase:
                     lat = lat * scaling_formula
                     energy = energy * scaling_formula
 
+                _log_comm_debug(
+                    "query_nccl",
+                    mode=database_mode.name,
+                    dtype=dtype.name,
+                    operation=operation,
+                    requested_num_gpus=num_gpus,
+                    effective_num_gpus=effective_num_gpus,
+                    message_size=message_size,
+                    bucket_left=size_left,
+                    bucket_right=size_right,
+                    scaled=int(num_gpus > max_num_gpus),
+                    source=("oneccl" if nccl_source is self._oneccl_data else "nccl"),
+                    data_file=nccl_source.filepath,
+                    latency_ms=f"{lat:.6f}",
+                )
+
                 return PerformanceResult(lat, energy=energy)
 
             return self._query_silicon_or_hybrid(
@@ -5455,6 +5638,17 @@ class PerfDatabase:
                 get_empirical=lambda: get_empirical(dtype, num_gpus, operation, message_size),
                 database_mode=database_mode,
                 error_msg=f"Failed to query nccl data for {dtype=}, {num_gpus=}, {operation=}, {message_size=}",
+                fallback_source="empirical_fallback",
+                fallback_debug_event="query_nccl",
+                fallback_debug_fields={
+                    "mode": database_mode.name,
+                    "dtype": dtype.name,
+                    "operation": operation,
+                    "requested_num_gpus": num_gpus,
+                    "message_size": message_size,
+                    "data_file": self._nccl_data.filepath,
+                    "oneccl_file": self._oneccl_data.filepath if self._oneccl_data is not None else None,
+                },
             )
 
     @functools.lru_cache(maxsize=32768)

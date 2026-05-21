@@ -1,0 +1,75 @@
+? disagg_sgl-project/DeepSeek-V4-Flash-FP8_rtx_pro_6000_scaleup_32x1_rtx_pro_6000_scaleup_32x1_sglang_0.5.10.post2_2048_500_0_10000_1000
+: attention_backend: flashinfer
+  backend_name: sglang
+  backend_version: 0.5.10.post2
+  config:
+    advanced_tuning_config:
+      decode_latency_correction_scale: 1.08
+      decode_max_batch_size: 512
+      prefill_latency_correction_scale: 1.1
+      prefill_max_batch_size: 1
+      rate_matching_decode_degradation_factor: null
+      rate_matching_prefill_degradation_factor: null
+    decode_worker_config:
+      attention_backend: flashinfer
+      backend_name: sglang
+      backend_version: 0.5.10.post2
+      comm_quant_mode: half
+      dp_list: [1, 2, 4, 8, 16]
+      enable_eplb: null
+      enable_wideep: true
+      fmha_quant_mode: bfloat16
+      gemm_quant_mode: fp8_block
+      kvcache_quant_mode: fp8
+      moe_backend: deepep_moe
+      moe_ep_list: [1, 2, 4, 8, 16]
+      moe_quant_mode: fp8_block
+      moe_tp_list: [1]
+      num_gpu_per_worker: [1, 2, 4, 8, 16]
+      pp_list: [1]
+      system_name: rtx_pro_6000_scaleup_32x1
+      tp_list: [1, 2, 4, 8, 16]
+    nextn: 1
+    nextn_accept_rates: [0.85, 0.3, 0.0, 0.0, 0.0]
+    prefill_worker_config:
+      attention_backend: flashinfer
+      backend_name: sglang
+      backend_version: 0.5.10.post2
+      comm_quant_mode: half
+      dp_list: [1, 2, 4, 8, 16]
+      enable_eplb: null
+      enable_wideep: true
+      fmha_quant_mode: bfloat16
+      gemm_quant_mode: fp8_block
+      kvcache_quant_mode: fp8
+      moe_backend: deepep_moe
+      moe_ep_list: [1, 2, 4, 8, 16]
+      moe_quant_mode: fp8_block
+      moe_tp_list: [1]
+      num_gpu_per_worker: [1, 2, 4, 8, 16]
+      pp_list: [1]
+      system_name: rtx_pro_6000_scaleup_32x1
+      tp_list: [1, 2, 4, 8, 16]
+    replica_config:
+      decode_num_worker_list: [1, 2, 4]
+      max_decode_gpus: null
+      max_decode_worker: 4
+      max_gpu_per_replica: 32
+      max_prefill_gpus: null
+      max_prefill_worker: 4
+      num_gpu_per_replica: [32]
+      prefill_num_worker_list: [1, 2, 4]
+  decode_system_name: rtx_pro_6000_scaleup_32x1
+  enable_wideep: true
+  isl: 2048
+  mode: patch
+  model_path: sgl-project/DeepSeek-V4-Flash-FP8
+  moe_backend: deepep_moe
+  osl: 500
+  prefix: 0
+  profiles: []
+  serving_mode: disagg
+  system_name: rtx_pro_6000_scaleup_32x1
+  total_gpus: 32
+  tpot: 1000
+  ttft: 10000

@@ -464,6 +464,7 @@ def log_final_summary(
 def save_results(
     args,
     best_configs: dict[str, pd.DataFrame],
+    all_results: dict[str, pd.DataFrame | None],
     pareto_fronts: dict[str, pd.DataFrame | None],
     task_configs: dict[str, TaskConfig],
     save_dir: str,
@@ -597,6 +598,11 @@ def save_results(
         for exp_name, pareto_df in pareto_fronts.items():
             exp_dir = os.path.join(safe_result_dir, exp_name)
             safe_mkdir(exp_dir, exist_ok=True)
+
+            all_results_df = all_results.get(exp_name)
+            if all_results_df is not None:
+                all_results_csv_df = all_results_df.drop(columns=["_per_ops_source"], errors="ignore")
+                all_results_csv_df.to_csv(os.path.join(exp_dir, "all_results.csv"), index=False)
 
             # 1. Save best config dataframe
             #    Strip the object-typed _per_ops_source column before CSV write; it is

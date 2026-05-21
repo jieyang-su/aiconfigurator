@@ -1,0 +1,14 @@
+metric,agg,disagg,delta
+best_throughput,71.202,1.495,69.707
+per_gpu_throughput,71.202,1.495,69.707
+per_user_throughput,4.479,3.685,0.794
+ttft_ms,1543.764,6959.047,-5415.282999999999
+tpot_ms,223.286,271.368,-48.081999999999994
+request_latency_ms,112963.696,142371.679,-29407.983000000007
+agg_tp,16,,
+agg_dp,1,,
+agg_moe_ep,16,,
+disagg_prefill_workers,,1,
+disagg_decode_workers,,1,
+disagg_prefill_tp,,8,
+disagg_decode_tp,,8,
