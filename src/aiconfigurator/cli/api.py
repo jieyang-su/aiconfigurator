@@ -11,6 +11,7 @@ This module provides simple function interfaces to the CLI's "default", "exp",
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -69,6 +70,9 @@ def cli_support(
 
 
 logger = logging.getLogger(__name__)
+
+def _debug_exp_estimate_enabled() -> bool:
+    return os.getenv("AIC_DEBUG_EXP_ESTIMATE_DIFF", "0") == "1"
 
 
 @dataclass
@@ -936,6 +940,23 @@ def _run_agg_estimate(
     database = load_database(system_name)
     backend = get_backend(backend_name)
     session = InferenceSession(model, database, backend)
+    if _debug_exp_estimate_enabled():
+        logger.info(
+            "[exp-estimate-debug] estimate _run_agg_estimate inputs: "
+            "isl=%s osl=%s batch_size=%s ctx_tokens=%s tp=%s pp=%s dp=%s moe_tp=%s moe_ep=%s "
+            "engine_step_backend=%s",
+            isl,
+            osl,
+            batch_size,
+            ctx_tokens,
+            tp_size,
+            pp_size,
+            attention_dp_size,
+            moe_tp_size,
+            moe_ep_size,
+            engine_step_backend,
+        )
+
     summary = session.run_agg(
         runtime_config,
         ctx_tokens=ctx_tokens,

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import os
 from collections import defaultdict
 
 import numpy as np
@@ -20,6 +21,9 @@ from aiconfigurator.sdk.rust_engine_step import (
 )
 
 logger = logging.getLogger(__name__)
+
+def _debug_exp_estimate_enabled() -> bool:
+    return os.getenv("AIC_DEBUG_EXP_ESTIMATE_DIFF", "0") == "1"
 
 
 class SGLANGBackend(BaseBackend):
@@ -47,6 +51,20 @@ class SGLANGBackend(BaseBackend):
         gen_seq_imbalance_correction_scale = runtime_config.gen_seq_imbalance_correction_scale
         ctx_tokens = kwargs.get("ctx_tokens")
         assert ctx_tokens is not None, "ctx_tokens is required"
+
+        if _debug_exp_estimate_enabled():
+            logger.info(
+                "[exp-estimate-debug] run_agg inputs: isl=%s osl=%s b=%s ctx_tokens=%s "
+                "engine_step_backend=%s ctx_seq_imbalance_correction_scale=%s "
+                "gen_seq_imbalance_correction_scale=%s",
+                isl,
+                osl,
+                b,
+                ctx_tokens,
+                engine_step_backend_key,
+                ctx_seq_imbalance_correction_scale,
+                gen_seq_imbalance_correction_scale,
+            )
         balance_score = isl * b / ctx_tokens / osl
 
         cache_by_ctx_tokens = self._agg_cache[isl][osl][b]
