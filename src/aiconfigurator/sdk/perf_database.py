@@ -40,6 +40,23 @@ def _prefer_nccl_for_custom_allreduce_enabled() -> bool:
     }
 
 
+def _hybrid_shared_layer_enabled(database_mode: str | None) -> bool:
+    """Return whether HYBRID mode may inherit sibling backend/version rows.
+
+    Default behavior remains unchanged: HYBRID enables shared-layer inheritance.
+    Set ``AIC_DISABLE_HYBRID_SHARED_LAYER=1`` (or true/yes/on) to force
+    HYBRID to only use the active backend+version files.
+    """
+    if (database_mode or "").upper() != "HYBRID":
+        return False
+    return os.environ.get("AIC_DISABLE_HYBRID_SHARED_LAYER", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _log_comm_debug(event: str, **fields) -> None:
     if not _comm_debug_enabled():
         return
@@ -381,9 +398,10 @@ def get_database(
             backend/version data files are absent. This is intended for SOL/EMPIRICAL
             estimate-only modes, not SILICON mode.
         database_mode: the mode the caller will query under (`SILICON` / `HYBRID` /
-            `EMPIRICAL` / `SOL`). HYBRID auto-enables the shared layer (sibling-row
-            inheritance, including `kernel_source=default` fallback rows); other
-            modes keep it off so predictions stay bit-identical to main.
+            `EMPIRICAL` / `SOL`). HYBRID enables the shared layer (sibling-row
+            inheritance, including `kernel_source=default` fallback rows) unless
+            disabled via ``AIC_DISABLE_HYBRID_SHARED_LAYER``; other modes keep it
+            off so predictions stay bit-identical to main.
 
     Returns:
         PerfDatabase for the given system, backend, version.
@@ -397,7 +415,7 @@ def get_database(
         logger.error(f"No database version available for {system=}, {backend=}")
         return None
 
-    shared_flag = (database_mode or "").upper() == "HYBRID"
+    shared_flag = _hybrid_shared_layer_enabled(database_mode)
     missing_data_candidate = None
     for systems_root in systems_paths:
         system_yaml_path = os.path.join(systems_root, f"{system}.yaml")
@@ -2799,15 +2817,16 @@ class PerfDatabase:
         Args:
             database_mode: drives the shared-layer load behavior. `"HYBRID"` enables
                 sibling-row inheritance (including `kernel_source=default` fallback
-                rows); other modes keep it off so predictions stay bit-identical to
-                main. Doesn't change which rows are interpolated at query time;
-                that's controlled by `set_default_database_mode`.
+                rows) unless ``AIC_DISABLE_HYBRID_SHARED_LAYER`` is set; other modes
+                keep it off so predictions stay bit-identical to main. Doesn't
+                change which rows are interpolated at query time; that's controlled
+                by `set_default_database_mode`.
         """
         self.system = system
         self.backend = backend
         self.version = version
         self.systems_root = systems_root
-        self.enable_shared_layer = (database_mode or "").upper() == "HYBRID"
+        self.enable_shared_layer = _hybrid_shared_layer_enabled(database_mode)
         with open(os.path.join(systems_root, system + ".yaml")) as f:
             self.system_spec = SystemSpec(yaml.load(f, Loader=yaml.SafeLoader))
         self._default_database_mode = common.DatabaseMode.SILICON  # default mode is SILICON

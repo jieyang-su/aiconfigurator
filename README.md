@@ -83,6 +83,31 @@ aiconfigurator cli support --model-path Qwen/Qwen3-32B-FP8 --system h200_sxm
 - Use `--database-mode` to control performance estimation mode: `SILICON` (default, uses collected silicon data), `HYBRID` (uses silicon data when available, otherwise SOL+empirical), `EMPIRICAL` (SOL+empirical for all), or `SOL` (speed-of-light only). Please be careful, only `SILICON` mode's result is reproducible. Other modes are for research purpose
 - Use `--systems-paths` to override where system YAMLs and data are loaded from (comma-separated; `default` maps to the built-in systems path). First match wins for identical system/backend/version.
 - Use `-h` for more options and customization.
+
+#### Runtime Switches (Environment Variables)
+
+You can use the following environment variables to control debug output and HYBRID loading behavior:
+
+| Variable | Values | Default | Effect |
+| --- | --- | --- | --- |
+| `AIC_DEBUG_COMM_QUERIES` | `1`/`true`/`yes`/`on` | off | Enables `[comm-debug]` logs for comm query paths (`query_custom_allreduce`, `query_nccl`, etc.). |
+| `AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE` | `1`/`true`/`yes`/`on` | off | Forces custom all-reduce queries to use NCCL substitution when possible. |
+| `AIC_DISABLE_HYBRID_SHARED_LAYER` | `1`/`true`/`yes`/`on` | off | In `HYBRID` mode, disables sibling backend/version inheritance and only uses the active backend+version files. |
+
+Examples:
+
+```bash
+# Linux/macOS
+export AIC_DISABLE_HYBRID_SHARED_LAYER=1
+export AIC_DEBUG_COMM_QUERIES=1
+```
+
+```powershell
+# Windows PowerShell
+$env:AIC_DISABLE_HYBRID_SHARED_LAYER = "1"
+$env:AIC_DEBUG_COMM_QUERIES = "1"
+```
+
 - SLA constraints:
   - `--ttft` and `--tpot` filter configurations that exceed either bound; omit a flag to leave that constraint unset.
   - `--request-latency` applies an end-to-end per-request limit. The CLI searches for all configurations whose estimated 

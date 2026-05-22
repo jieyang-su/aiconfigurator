@@ -23,7 +23,7 @@ node:
   inter_node_bw: 25000000000   # unchanged placeholder, not dominant in 1x32
   intra_node_bw: 64000000000  # 64 GB/s single direction 
   pcie_bw: 64000000000
-  p2p_latency: 0.000005
+  p2p_latency: 0.00001
 
 misc:
   nccl_mem:

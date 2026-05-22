@@ -1225,6 +1225,8 @@ class TaskConfig:
 
 
 class TaskRunner:
+    _DEFAULT_TPOT_SWEEP: ClassVar[list[float]] = list(range(1, 20, 1)) + list(range(20, 300, 5))
+
     @staticmethod
     def _get_database(system: str, backend: str, version: str, database_mode: str | None = None):
         """Fetch a database from the global cache.
@@ -1256,6 +1258,36 @@ class TaskRunner:
                 db.set_default_database_mode(mode)
         return db
 
+    @classmethod
+    def _resolve_runtime_tpot(cls, runtime_config: DefaultMunch) -> float | list[float]:
+        """Resolve TPOT targets for runtime sweeps.
+
+        Backward-compatible behavior keeps the historical default sweep. If user
+        provides a scalar TPOT, append it to the default sweep so higher targets
+        (for example 1000ms) are considered without shrinking the baseline search.
+        If user provides a list/tuple/set, use that explicit sweep directly.
+        """
+
+        configured_tpot = getattr(runtime_config, "tpot", None)
+        default_sweep = list(cls._DEFAULT_TPOT_SWEEP)
+
+        if isinstance(configured_tpot, list):
+            return configured_tpot or default_sweep
+        if isinstance(configured_tpot, (tuple, set)):
+            explicit_sweep = list(configured_tpot)
+            return explicit_sweep or default_sweep
+        if configured_tpot is None:
+            return default_sweep
+
+        if isinstance(configured_tpot, int | float):
+            if configured_tpot <= 0:
+                return default_sweep
+            if configured_tpot in default_sweep:
+                return default_sweep
+            return [*default_sweep, configured_tpot]
+
+        return default_sweep
+
     def run_agg(self, task_config: DefaultMunch) -> dict[str, pd.DataFrame | None]:
         logger.debug("Task %s: Setting up runtime config", task_config.task_name)
         runtime_config = config.RuntimeConfig(
@@ -1263,7 +1295,7 @@ class TaskRunner:
             osl=task_config.runtime_config.osl,
             prefix=task_config.runtime_config.prefix,
             ttft=task_config.runtime_config.ttft,
-            tpot=list(range(1, 20, 1)) + list(range(20, 300, 5)),
+            tpot=self._resolve_runtime_tpot(task_config.runtime_config),
             request_latency=getattr(task_config.runtime_config, "request_latency", None),
             engine_step_backend=getattr(task_config.runtime_config, "engine_step_backend", None),
         )
@@ -1355,7 +1387,7 @@ class TaskRunner:
             osl=task_config.runtime_config.osl,
             prefix=task_config.runtime_config.prefix,
             ttft=task_config.runtime_config.ttft,
-            tpot=list(range(1, 20, 1)) + list(range(20, 300, 5)),
+            tpot=self._resolve_runtime_tpot(task_config.runtime_config),
             request_latency=getattr(task_config.runtime_config, "request_latency", None),
             engine_step_backend=getattr(task_config.runtime_config, "engine_step_backend", None),
         )
