@@ -555,7 +555,7 @@ def _plot_multi_compare(series: list[tuple[str, Path]], cfg: dict, title: str, o
         xs, ys, x_col, y_col = read_xy(csv_path, requested_x, requested_y)
         resolved_x = x_col or resolved_x
         resolved_y = y_col or resolved_y
-        plt.plot(xs, ys, "o-", label=label)
+        plt.plot(xs, ys, "o-", label=label, markersize=4, linewidth=1.5)
 
     plt.xlabel(axis_label(requested_x, resolved_x))
     plt.ylabel(axis_label(requested_y, resolved_y))
@@ -639,10 +639,8 @@ def _run_compare_cases(cfg: dict, out_dir: Path) -> None:
             raise SystemExit(f"run failed for {label}: rc={rc}. Check {log_path}")
 
         pareto, best, all_results, available_modes = _copy_mode_outputs(run_dir, requested_modes)
-        missing_modes = [mode for mode in requested_modes if mode not in available_modes]
-        if missing_modes:
-            missing_str = ", ".join(missing_modes)
-            raise SystemExit(f"missing requested pareto for {label}: {missing_str}. Check {log_path} for details.")
+        if not available_modes:
+            raise SystemExit(f"no pareto generated for {label}. Check {log_path} for details.")
         case_paretos[label] = pareto
         case_all_results[label] = all_results
         case_rows[label] = {}

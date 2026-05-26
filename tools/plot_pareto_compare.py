@@ -72,9 +72,9 @@ def main() -> None:
 
     plt.figure(figsize=(8, 5))
     if a.scaleup_csv:
-        plt.plot(sx, sy, "o-", label=a.scaleup_label)
+        plt.plot(sx, sy, "o-", label=a.scaleup_label, markersize=4, linewidth=1.5)
     if a.scaleout_csv:
-        plt.plot(ox, oy, "o-", label=a.scaleout_label)
+        plt.plot(ox, oy, "o-", label=a.scaleout_label, markersize=4, linewidth=1.5)
 
     resolved_x = sx_col or ox_col or a.x_col
     resolved_y = sy_col or oy_col or a.y_col
