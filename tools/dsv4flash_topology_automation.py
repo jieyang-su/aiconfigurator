@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,9 +36,68 @@ def _has_custom_parallel(cfg: dict) -> bool:
     return bool(cfg.get("fixed_parallel") or cfg.get("search_parallel"))
 
 
-def run_cmd(cmd: list[str], log_path: Path, cwd: Path | None = None, env: dict[str, str] | None = None) -> int:
+def _safe_label(label: object, fallback: str) -> str:
+    text = str(label or fallback).strip() or fallback
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("_")
+    return text or fallback
+
+
+def _env_for_cfg(cfg: dict) -> dict[str, str]:
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(SRC_DIR) if not existing_pythonpath else f"{SRC_DIR}:{existing_pythonpath}"
+    if cfg.get("debug_comm_queries"):
+        env["AIC_DEBUG_COMM_QUERIES"] = "1"
+    if cfg.get("prefer_nccl_for_custom_allreduce"):
+        env["AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE"] = "1"
+    if cfg.get("disable_hybrid_shared_layer"):
+        env["AIC_DISABLE_HYBRID_SHARED_LAYER"] = "1"
+    if cfg.get("nccl_perf_file"):
+        env["AIC_NCCL_PERF_FILE"] = str(cfg["nccl_perf_file"])
+    return env
+
+
+def _resolve_case_nccl_path(cfg: dict, system_name: str) -> str:
+    systems_path = Path(cfg["systems_path"])
+    if not systems_path.is_absolute():
+        systems_path = (REPO_ROOT / systems_path).resolve()
+    system_yaml = systems_path / f"{system_name}.yaml"
+    if not system_yaml.exists():
+        return "<unresolved>"
+    try:
+        system_spec = yaml.safe_load(system_yaml.read_text(encoding="utf-8")) or {}
+        data_dir = system_spec.get("data_dir")
+        nccl_version = system_spec.get("misc", {}).get("nccl_version")
+        nccl_file = cfg.get("nccl_perf_file") or system_spec.get("misc", {}).get("nccl_perf_file") or "nccl_perf.txt"
+        if not data_dir or not nccl_version:
+            return "<unresolved>"
+        return str((systems_path / data_dir / "nccl" / nccl_version / nccl_file).resolve())
+    except Exception:
+        return "<unresolved>"
+
+
+def _write_run_context(cfg: dict, system_name: str, log_path: Path, env: dict[str, str]) -> None:
+    lines = [
+        f"[automation-context] label={cfg.get('label', '')}",
+        f"[automation-context] system={system_name}",
+        f"[automation-context] total_gpus={cfg.get('total_gpus', '')}",
+        f"[automation-context] nccl_path={_resolve_case_nccl_path(cfg, system_name)}",
+        "[automation-context] env "
+        f"AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE={env.get('AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE', '')} "
+        f"AIC_DEBUG_COMM_QUERIES={env.get('AIC_DEBUG_COMM_QUERIES', '')} "
+        f"AIC_DISABLE_HYBRID_SHARED_LAYER={env.get('AIC_DISABLE_HYBRID_SHARED_LAYER', '')} "
+        f"AIC_NCCL_PERF_FILE={env.get('AIC_NCCL_PERF_FILE', '')}",
+    ]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as f:
+        for line in lines:
+            print(line)
+            f.write(line + "\n")
+
+
+def run_cmd(cmd: list[str], log_path: Path, cwd: Path | None = None, env: dict[str, str] | None = None) -> int:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
         p = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, text=True, cwd=cwd, env=env)
     return p.returncode
 
@@ -205,13 +265,8 @@ def _build_custom_experiment_yaml(cfg: dict, system_name: str) -> dict:
 
 def _run_aic(cfg: dict, system_name: str, save_dir: Path, log_path: Path) -> int:
     custom_parallel = _has_custom_parallel(cfg)
-    env = os.environ.copy()
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = str(SRC_DIR) if not existing_pythonpath else f"{SRC_DIR}:{existing_pythonpath}"
-    if cfg.get("debug_comm_queries"):
-        env["AIC_DEBUG_COMM_QUERIES"] = "1"
-    if cfg.get("prefer_nccl_for_custom_allreduce"):
-        env["AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE"] = "1"
+    env = _env_for_cfg(cfg)
+    _write_run_context(cfg, system_name, log_path, env)
     if custom_parallel:
         exp_yaml = _build_custom_experiment_yaml(cfg, system_name)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -415,6 +470,206 @@ def _compact_best_config(mode: str, row: dict[str, str]) -> dict[str, str]:
     return compact
 
 
+def _merge_case_cfg(base_cfg: dict, case: dict) -> dict:
+    merged = dict(base_cfg)
+    merged.pop("compare_cases", None)
+    merged.pop("scaleup_system", None)
+    merged.pop("scaleout_system", None)
+    for key, value in case.items():
+        if key not in {"nccl_perf_files"}:
+            merged[key] = value
+    if "system" not in merged:
+        raise ValueError(f"compare case must provide system: {case}")
+    return merged
+
+
+def _expand_nccl_perf_file_case(case: dict) -> list[dict]:
+    files = case.get("nccl_perf_files")
+    if files is None:
+        return [case]
+
+    expanded: list[dict] = []
+    base_label = _safe_label(case.get("label"), _safe_label(case.get("system"), "case"))
+    for idx, item in enumerate(files, start=1):
+        if isinstance(item, dict):
+            filename = item.get("file") or item.get("nccl_perf_file")
+            item_label = item.get("label") or Path(str(filename)).stem
+        else:
+            filename = item
+            item_label = Path(str(filename)).stem
+        if not filename:
+            raise ValueError(f"Missing nccl perf file in compare case {base_label}")
+        expanded_case = {key: value for key, value in case.items() if key != "nccl_perf_files"}
+        expanded_case["label"] = _safe_label(f"{base_label}_{item_label}", f"{base_label}_{idx}")
+        expanded_case["nccl_perf_file"] = str(filename)
+        expanded.append(expanded_case)
+    return expanded
+
+
+def _expand_compare_cases(cases: list[dict]) -> list[dict]:
+    expanded: list[dict] = []
+    for case in cases:
+        expanded.extend(_expand_nccl_perf_file_case(case))
+    return expanded
+
+
+def _copy_mode_outputs(run_dir: Path, requested_modes: list[str]) -> tuple[dict[str, Path], dict[str, Path], dict[str, Path], list[str]]:
+    pareto = find_pareto_by_mode(run_dir)
+    best = find_best_config_by_mode(run_dir)
+    all_results = find_result_csv_by_mode(run_dir, "all_results.csv")
+
+    available_modes: list[str] = []
+    for mode in requested_modes:
+        p = pareto.get(mode)
+        if not p:
+            print(f"skip mode={mode}: missing pareto. path={p}")
+            continue
+        available_modes.append(mode)
+        canon_p = run_dir / f"pareto_{mode}.csv"
+        shutil.copy2(p, canon_p)
+        pareto[mode] = canon_p
+        a = all_results.get(mode)
+        if a:
+            canon_a = run_dir / f"all_results_{mode}.csv"
+            shutil.copy2(a, canon_a)
+            all_results[mode] = canon_a
+    return pareto, best, all_results, available_modes
+
+
+def _plot_multi_compare(series: list[tuple[str, Path]], cfg: dict, title: str, output: Path) -> None:
+    if not series:
+        return
+    import matplotlib.pyplot as plt
+
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from tools.plot_pareto_compare import axis_label, read_xy
+
+    requested_x = cfg.get("x_col", "tokens/s/user")
+    requested_y = cfg.get("y_col", "tokens/s/gpu")
+    resolved_x = requested_x
+    resolved_y = requested_y
+
+    plt.figure(figsize=(8, 5))
+    for label, csv_path in series:
+        xs, ys, x_col, y_col = read_xy(csv_path, requested_x, requested_y)
+        resolved_x = x_col or resolved_x
+        resolved_y = y_col or resolved_y
+        plt.plot(xs, ys, "o-", label=label)
+
+    plt.xlabel(axis_label(requested_x, resolved_x))
+    plt.ylabel(axis_label(requested_y, resolved_y))
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output, dpi=150)
+    plt.close()
+    print(output)
+
+
+def _write_cases_summary(case_rows: dict[str, dict[str, dict[str, str] | None]], output_csv: Path) -> None:
+    labels = list(case_rows)
+    rows: list[dict[str, str]] = []
+    metric_keys = [
+        ("best_throughput", ("tokens/s/gpu_cluster",)),
+        ("per_gpu_throughput", ("tokens/s/gpu",)),
+        ("per_user_throughput", ("tokens/s/user",)),
+        ("ttft_ms", ("ttft",)),
+        ("tpot_ms", ("tpot",)),
+        ("request_latency_ms", ("request_latency",)),
+    ]
+    modes = sorted({mode for rows_by_mode in case_rows.values() for mode in rows_by_mode})
+    for mode in modes:
+        for metric, keys in metric_keys:
+            row = {"mode": mode, "metric": metric}
+            baseline = ""
+            for idx, label in enumerate(labels):
+                best_row = case_rows[label].get(mode)
+                value = _row_value(best_row, *keys) if best_row else ""
+                row[label] = value
+                if idx == 0:
+                    baseline = value
+                else:
+                    delta_key = f"{label}_minus_{labels[0]}"
+                    try:
+                        row[delta_key] = str(float(value) - float(baseline))
+                    except Exception:
+                        row[delta_key] = ""
+            rows.append(row)
+
+    fieldnames = ["mode", "metric"]
+    for idx, label in enumerate(labels):
+        fieldnames.append(label)
+        if idx > 0:
+            fieldnames.append(f"{label}_minus_{labels[0]}")
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _run_compare_cases(cfg: dict, out_dir: Path) -> None:
+    raw_cases = cfg.get("compare_cases") or []
+    if not isinstance(raw_cases, list):
+        raise ValueError("compare_cases must be a list")
+    cases = _expand_compare_cases(raw_cases)
+    if len(cases) < 2:
+        raise ValueError("compare_cases must expand to at least two cases")
+
+    plot_dir = out_dir / "plots"
+    best_dir = out_dir / "best_configs"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    best_dir.mkdir(parents=True, exist_ok=True)
+
+    case_paretos: dict[str, dict[str, Path]] = {}
+    case_all_results: dict[str, dict[str, Path]] = {}
+    case_rows: dict[str, dict[str, dict[str, str] | None]] = {}
+
+    for idx, case in enumerate(cases, start=1):
+        label = _safe_label(case.get("label"), f"case_{idx}")
+        case_cfg = _merge_case_cfg(cfg, case)
+        case_cfg["label"] = label
+        requested_modes = _requested_modes(case_cfg)
+        run_dir = out_dir / "runs" / label
+        log_path = out_dir / f"output_{label}.log"
+        rc = _run_aic(case_cfg, case_cfg["system"], run_dir, log_path)
+        if rc != 0:
+            raise SystemExit(f"run failed for {label}: rc={rc}. Check {log_path}")
+
+        pareto, best, all_results, available_modes = _copy_mode_outputs(run_dir, requested_modes)
+        missing_modes = [mode for mode in requested_modes if mode not in available_modes]
+        if missing_modes:
+            missing_str = ", ".join(missing_modes)
+            raise SystemExit(f"missing requested pareto for {label}: {missing_str}. Check {log_path} for details.")
+        case_paretos[label] = pareto
+        case_all_results[label] = all_results
+        case_rows[label] = {}
+        for mode in available_modes:
+            try:
+                best_row = _best_rows_by_mode(best, pareto, [mode])[mode]
+            except ValueError:
+                best_row = None
+            case_rows[label][mode] = best_row
+            if best_row is not None:
+                with (best_dir / f"best_config_{label}_{mode}.json").open("w", encoding="utf-8") as f:
+                    json.dump(best_row, f, indent=2, ensure_ascii=False)
+                print(f"[{label}][{mode}] {json.dumps(_compact_best_config(mode, best_row), ensure_ascii=False)}")
+            else:
+                print(f"[{label}][{mode}] unavailable")
+
+    modes = sorted({mode for label_paths in case_paretos.values() for mode in label_paths})
+    for mode in modes:
+        pareto_series = [(label, paths[mode]) for label, paths in case_paretos.items() if mode in paths]
+        _plot_multi_compare(pareto_series, cfg, f"DS-V4 Flash {mode} Topology Compare", plot_dir / f"pareto_compare_{mode}.png")
+        full_series = [(label, paths[mode]) for label, paths in case_all_results.items() if mode in paths]
+        _plot_multi_compare(full_series, cfg, f"DS-V4 Flash {mode} All Candidates", plot_dir / f"full_compare_{mode}.png")
+
+    _write_cases_summary(case_rows, out_dir / "compare_cases_single_point.csv")
+    print("done")
+
+
 def _print_and_save_best_configs(
     scaleup_best: dict[str, Path],
     scaleout_best: dict[str, Path],
@@ -451,6 +706,10 @@ def main() -> None:
     cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
 
     out_dir = Path(cfg["out_dir"])
+    if cfg.get("compare_cases"):
+        _run_compare_cases(cfg, out_dir)
+        return
+
     scaleup_dir = out_dir / "scaleup"
     scaleout_dir = out_dir / "scaleout"
     plot_dir = out_dir / "plots"

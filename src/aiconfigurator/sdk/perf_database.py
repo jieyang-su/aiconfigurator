@@ -40,6 +40,21 @@ def _prefer_nccl_for_custom_allreduce_enabled() -> bool:
     }
 
 
+def _nccl_perf_filename_override(system_spec: dict) -> str | None:
+    filename = os.environ.get("AIC_NCCL_PERF_FILE") or system_spec.get("misc", {}).get("nccl_perf_file")
+    if filename is None:
+        return None
+    filename = filename.strip()
+    if not filename:
+        return None
+    if filename != os.path.basename(filename):
+        raise ValueError(
+            "NCCL perf filename override must be a file name under the selected nccl_version directory, "
+            f"got: {filename}"
+        )
+    return filename
+
+
 def _hybrid_shared_layer_enabled(database_mode: str | None) -> bool:
     """Return whether HYBRID mode may inherit sibling backend/version rows.
 
@@ -421,15 +436,16 @@ def get_database(
         system_yaml_path = os.path.join(systems_root, f"{system}.yaml")
         if not os.path.isfile(system_yaml_path):
             continue
-        cache_key = (systems_root, system, shared_flag)
         try:
             with open(system_yaml_path) as f:
                 system_spec = yaml.load(f, Loader=yaml.SafeLoader)
             data_dir = system_spec["data_dir"]
+            nccl_perf_filename = _nccl_perf_filename_override(system_spec)
         except Exception:
             logger.warning(f"failed to read system spec at {system_yaml_path}, continuing searching")
             continue
 
+        cache_key = (systems_root, system, shared_flag, nccl_perf_filename)
         data_path = os.path.join(systems_root, data_dir, backend, version)
         is_incomplete = os.path.isfile(os.path.join(data_path, "INCOMPLETE.txt"))
         if os.path.exists(data_path) and not is_incomplete:
@@ -619,7 +635,7 @@ def _store_loaded_database(
 ) -> None:
     system, backend, version, systems_root = ref
     database_dict[system][backend][version] = database
-    databases_cache[(systems_root, system, False)][backend][version] = database
+    databases_cache[(systems_root, system, False, None)][backend][version] = database
 
 
 def _load_database_ref_in_parent(ref: DatabaseRef) -> PerfDatabase | None:
@@ -2845,6 +2861,7 @@ class PerfDatabase:
             "nccl",
             self.system_spec["misc"]["nccl_version"],
         )
+        nccl_perf_filename = _nccl_perf_filename_override(self.system_spec)
         oneccl_version = self.system_spec.get("misc", {}).get("oneccl_version")
         oneccl_data_dir = os.path.join(system_data_root, "oneccl", oneccl_version) if oneccl_version else None
 
@@ -2887,12 +2904,15 @@ class PerfDatabase:
                 PerfDataFilename.dsv4_flash_hca_attn_module: load_dsv4_flash_sparse_kernel_data,
             }
             perf_data_dir = data_dir
+            op_filename = op_filename_enum.value
             if op_filename_enum == PerfDataFilename.nccl:
                 perf_data_dir = nccl_data_dir
+                if nccl_perf_filename:
+                    op_filename = nccl_perf_filename
             elif op_filename_enum == PerfDataFilename.oneccl:
                 perf_data_dir = oneccl_data_dir if oneccl_data_dir else data_dir
 
-            data_filepath = os.path.join(perf_data_dir, op_filename_enum.value)
+            data_filepath = os.path.join(perf_data_dir, op_filename)
             load_fn = func_map[op_filename_enum]
 
             # `sources` is a list of `(path, kernel_source_filter | None)` tuples in
