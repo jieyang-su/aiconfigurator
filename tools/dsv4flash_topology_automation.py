@@ -567,6 +567,57 @@ def _plot_multi_compare(series: list[tuple[str, Path]], cfg: dict, title: str, o
     plt.close()
     print(output)
 
+def _write_plot_data(series: list[tuple[str, Path]], cfg: dict, output_csv: Path) -> None:
+    if not series:
+        return
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from tools.plot_pareto_compare import X_CANDIDATES, Y_CANDIDATES, pick_col
+
+    requested_x = cfg.get("x_col", "tokens/s/user")
+    requested_y = cfg.get("y_col", "tokens/s/gpu")
+    rows: list[dict[str, str]] = []
+    original_fields: list[str] = []
+
+    for label, csv_path in series:
+        with csv_path.open(encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                raise ValueError(f"CSV has no header: {csv_path}")
+            x_col = pick_col(reader.fieldnames, requested_x, X_CANDIDATES)
+            y_col = pick_col(reader.fieldnames, requested_y, Y_CANDIDATES)
+            for field in reader.fieldnames:
+                if field not in original_fields:
+                    original_fields.append(field)
+            point_index = 0
+            for row in reader:
+                try:
+                    x_value = float(row[x_col])
+                    y_value = float(row[y_col])
+                except Exception:
+                    continue
+                out_row = {
+                    "series_label": label,
+                    "point_index": str(point_index),
+                    "x": str(x_value),
+                    "y": str(y_value),
+                    "x_col": x_col,
+                    "y_col": y_col,
+                    "source_csv": str(csv_path),
+                }
+                out_row.update(row)
+                rows.append(out_row)
+                point_index += 1
+
+    fieldnames = ["series_label", "point_index", "x", "y", "x_col", "y_col", "source_csv"]
+    fieldnames.extend(field for field in original_fields if field not in fieldnames)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(output_csv)
+
 
 def _write_cases_summary(case_rows: dict[str, dict[str, dict[str, str] | None]], output_csv: Path) -> None:
     labels = list(case_rows)
@@ -660,6 +711,7 @@ def _run_compare_cases(cfg: dict, out_dir: Path) -> None:
     modes = sorted({mode for label_paths in case_paretos.values() for mode in label_paths})
     for mode in modes:
         pareto_series = [(label, paths[mode]) for label, paths in case_paretos.items() if mode in paths]
+        _write_plot_data(pareto_series, cfg, plot_dir / f"pareto_compare_{mode}.csv")
         _plot_multi_compare(pareto_series, cfg, f"DS-V4 Flash {mode} Topology Compare", plot_dir / f"pareto_compare_{mode}.png")
         full_series = [(label, paths[mode]) for label, paths in case_all_results.items() if mode in paths]
         _plot_multi_compare(full_series, cfg, f"DS-V4 Flash {mode} All Candidates", plot_dir / f"full_compare_{mode}.png")
