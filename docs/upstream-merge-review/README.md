@@ -762,3 +762,47 @@ Rationale:
   metadata. Keeping `perf_database.py` slim and placing the fork-specific DSV4
   metadata behavior in `operations/dsv4.py` matches both upstream's new
   ownership model and the fork's compatibility needs.
+
+## `299aaea9` / `#1131 feat: collect SGLang DeepSeek-V4 attention as full modules`
+
+Status: resolved during upstream replay.
+
+High-level conflict cause:
+
+- Upstream replaced the older sparse-only DeepSeek-V4 attention collection with
+  full-module CSA/HCA context and generation collectors, runtime-limit helpers,
+  default DSV4 op expansion in `collect.py`, and newer SGLang module replay
+  paths.
+- This fork had already added generic DSV4 model selection, per-model TP
+  ranges, v0.5.10/v0.5.12 SGLang backend selection, visible-device remapping,
+  and forward-batch/context compatibility for pinned SGLang builds.
+
+Resolution applied:
+
+- Accepted upstream full-module DSV4 collector behavior and default
+  `collect.py --model-path <DeepSeek-V4>` auto-expansion to generic
+  `dsv4_*` module ops.
+- Preserved the fork's `--sglang-version-branch` flag and environment
+  propagation. The public CLI choices remain `auto`, `v0.5.10`, `0.5.10`,
+  `v0.5.12`, and `0.5.12`; v0.5.10 selects `attention_backend=compressed`,
+  while v0.5.12 selects `attention_backend=dsv4`.
+- Preserved per-model DSV4 TP-size handling via
+  `_dsv4_module_tp_sizes(model_path)` and combined it with upstream's native
+  FP4 precision filtering for `deepseek-ai/*` checkpoints.
+- Dropped upstream's temporary public `dsv4_flash_*` compatibility aliases from
+  `case_generator.py`, matching the decision that public APIs should use only
+  generic `dsv4_*` names.
+- Kept upstream runtime-limit, chunked-allocation, piecewise replay, and module
+  CUDA-graph scaffolding in `collect_mla_module.py`, but routed ForwardBatch
+  creation and forward context setup through the fork's compatibility wrappers
+  so both old and new SGLang APIs remain usable.
+- Kept upstream MoE collector import layout preference for the new
+  `moe_runner.triton_utils` package while preserving fallback imports for the
+  older `fused_moe_triton` package.
+
+Rationale:
+
+- This keeps the fork aligned with upstream's generic DSV4 collector model,
+  while retaining the practical compatibility switches needed for existing
+  SGLang 0.5.10/0.5.12 collection environments and model-specific DSV4 Pro TP
+  sweeps.
