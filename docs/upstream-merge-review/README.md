@@ -749,6 +749,11 @@ Resolution applied:
 - Updated DSV4 sparse tests to import DSV4 constants/helpers from
   `aiconfigurator.sdk.operations.dsv4` while keeping `LoadedOpData` and loader
   re-exports through `perf_database` where upstream still exposes them.
+- Resolved an adjacent `report_and_save.py` conflict between the fork's
+  `all_results.csv` export and upstream's `--inclusive-tpot` display dataframe:
+  both behaviors were retained. `all_results.csv` is still written after
+  dropping `_per_ops_source`; best-config output now uses upstream's
+  `display_best_configs` copy.
 
 Rationale:
 
