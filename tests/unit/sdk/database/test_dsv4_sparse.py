@@ -18,11 +18,14 @@ from typing import ClassVar
 import pytest
 
 from aiconfigurator.sdk import common
-from aiconfigurator.sdk.perf_database import (
+from aiconfigurator.sdk.operations.dsv4 import (
+    ContextDeepSeekV4AttentionModule,
     DEFAULT_DSV4_ARCHITECTURE,
-    LoadedOpData,
     _deep_merge_dsv4_dicts,
     _dsv4_robust_3d_lookup,
+)
+from aiconfigurator.sdk.perf_database import (
+    LoadedOpData,
     load_context_dsv4_kind_module_data,
     load_dsv4_sparse_kernel_data,
     load_generation_dsv4_kind_module_data,
@@ -266,9 +269,11 @@ def test_robust_3d_lookup_exact_match_short_circuits():
 
 
 def _make_sparse_db_with_paged_mqa(tmp_path, *, lat_at_past0: float, lat_at_past8192: float):
-    """Helper: build a minimal PerfDatabase carrying paged_mqa_logits at tp=1."""
-    from aiconfigurator.sdk.perf_database import PerfDatabase
+    """Helper: build a minimal PerfDatabase-like stub carrying paged_mqa_logits at tp=1.
 
+    ``_lookup_sparse_kernel`` calls ``interpolation.*`` directly rather
+    than ``database._interp_*`` wrappers, so the stub only needs the
+    data attribute and the per-database extracted-metrics cache slot."""
     rows = [
         _sparse_row(kernel="paged_mqa_logits", bs=1, isl=8192, past_kv=0, tp=1, cr=4, lat=lat_at_past0),
         _sparse_row(kernel="paged_mqa_logits", bs=1, isl=8192, past_kv=8192, tp=1, cr=4, lat=lat_at_past8192),
@@ -277,12 +282,10 @@ def _make_sparse_db_with_paged_mqa(tmp_path, *, lat_at_past0: float, lat_at_past
     data = load_dsv4_sparse_kernel_data(path)
 
     class _DB:
-        # mimic the attribute name PerfDatabase uses
         _dsv4_sparse_kernel_data: ClassVar[dict] = {
             "paged_mqa_logits": LoadedOpData(data, None, path),
         }
-        _interp_1d = PerfDatabase._interp_1d
-        _nearest_1d_point_helper = PerfDatabase._nearest_1d_point_helper
+        _extracted_metrics_cache: ClassVar[dict] = {}
 
     return _DB()
 
@@ -316,8 +319,6 @@ def _sparse_sampled_batch_caps_grid(*, offset: float = 0.0) -> dict:
 
 
 def _make_sparse_db_from_grid(per_tp_dict: dict):
-    from aiconfigurator.sdk.perf_database import PerfDatabase
-
     class _DB:
         _dsv4_sparse_kernel_data: ClassVar[dict] = {
             "paged_mqa_logits": LoadedOpData(
@@ -326,18 +327,14 @@ def _make_sparse_db_from_grid(per_tp_dict: dict):
                 "mock_paged_mqa_logits",
             ),
         }
-        _interp_2d_linear = PerfDatabase._interp_2d_linear
-        _interp_1d = PerfDatabase._interp_1d
-        _nearest_1d_point_helper = PerfDatabase._nearest_1d_point_helper
+        _extracted_metrics_cache: ClassVar[dict] = {}
 
     return _DB()
 
 
 def test_lookup_sparse_kernel_exact_hit(tmp_path):
-    from aiconfigurator.sdk.perf_database import PerfDatabase
-
     db = _make_sparse_db_with_paged_mqa(tmp_path, lat_at_past0=0.1, lat_at_past8192=0.3)
-    val = PerfDatabase._lookup_dsv4_sparse_kernel(
+    val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
         db,
         kernel="paged_mqa_logits",
         bs=1,
@@ -347,7 +344,7 @@ def test_lookup_sparse_kernel_exact_hit(tmp_path):
         native_heads=_FLASH_NATIVE_HEADS,
     )
     assert val == pytest.approx(0.1)
-    val = PerfDatabase._lookup_dsv4_sparse_kernel(
+    val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
         db,
         kernel="paged_mqa_logits",
         bs=1,
@@ -361,10 +358,9 @@ def test_lookup_sparse_kernel_exact_hit(tmp_path):
 
 def test_lookup_sparse_kernel_tp_fallback(tmp_path):
     """Caller asks tp=8 but data only has tp=1 — must fall back to tp=1."""
-    from aiconfigurator.sdk.perf_database import PerfDatabase
 
     db = _make_sparse_db_with_paged_mqa(tmp_path, lat_at_past0=0.1, lat_at_past8192=0.3)
-    val = PerfDatabase._lookup_dsv4_sparse_kernel(
+    val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
         db,
         kernel="paged_mqa_logits",
         bs=1,
@@ -378,11 +374,10 @@ def test_lookup_sparse_kernel_tp_fallback(tmp_path):
 
 def test_lookup_sparse_kernel_past_kv_linear_interp(tmp_path):
     """Bracketing past_kv values exist — return linear interp."""
-    from aiconfigurator.sdk.perf_database import PerfDatabase
 
     db = _make_sparse_db_with_paged_mqa(tmp_path, lat_at_past0=0.1, lat_at_past8192=0.3)
     # midpoint past_kv=4096 → expect 0.2
-    val = PerfDatabase._lookup_dsv4_sparse_kernel(
+    val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
         db,
         kernel="paged_mqa_logits",
         bs=1,
@@ -395,8 +390,6 @@ def test_lookup_sparse_kernel_past_kv_linear_interp(tmp_path):
 
 
 def test_lookup_sparse_kernel_uses_requested_native_heads(tmp_path):
-    from aiconfigurator.sdk.perf_database import PerfDatabase
-
     rows = [
         _sparse_row(kernel="hca_attn", bs=1, isl=8192, past_kv=0, tp=1, cr=128, lat=0.4, model=_FLASH_MODEL),
         _sparse_row(kernel="hca_attn", bs=1, isl=8192, past_kv=0, tp=1, cr=128, lat=0.9, model=_PRO_MODEL),
@@ -409,7 +402,7 @@ def test_lookup_sparse_kernel_uses_requested_native_heads(tmp_path):
             "hca_attn": LoadedOpData(data, None, path),
         }
 
-    val = PerfDatabase._lookup_dsv4_sparse_kernel(
+    val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
         _DB(),
         kernel="hca_attn",
         bs=1,
@@ -421,9 +414,7 @@ def test_lookup_sparse_kernel_uses_requested_native_heads(tmp_path):
     assert val == pytest.approx(0.9)
 
 
-def test_lookup_sparse_kernel_uses_cubic_3d_before_fallback():
-    from aiconfigurator.sdk.perf_database import PerfDatabase
-
+def test_lookup_sparse_kernel_uses_cubic_3d_before_fallback(monkeypatch):
     calls = []
 
     class _DB:
@@ -443,12 +434,17 @@ def test_lookup_sparse_kernel_uses_cubic_3d_before_fallback():
                 "mock_paged_mqa_logits",
             ),
         }
+        # Carry the cache attribute that ``interpolation.interp_3d`` now
+        # expects to receive from callers.
+        _extracted_metrics_cache: ClassVar[dict] = {}
 
-        def _interp_3d(self, x, y, z, data, method):
-            calls.append((x, y, z, method))
-            return {"latency": 7.0}
+    def _spy_interp_3d(x, y, z, data, method, _cache):
+        calls.append((x, y, z, method))
+        return {"latency": 7.0}
 
-    val = PerfDatabase._lookup_dsv4_sparse_kernel(
+    monkeypatch.setattr("aiconfigurator.sdk.interpolation.interp_3d", _spy_interp_3d)
+
+    val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
         _DB(),
         kernel="paged_mqa_logits",
         bs=2,
@@ -463,10 +459,8 @@ def test_lookup_sparse_kernel_uses_cubic_3d_before_fallback():
 
 
 def test_lookup_sparse_kernel_uses_b2_when_bs3_s2682_is_missing():
-    from aiconfigurator.sdk.perf_database import PerfDatabase
-
     db = _make_sparse_db_from_grid({0: _sparse_sampled_batch_caps_grid()})
-    val = PerfDatabase._lookup_dsv4_sparse_kernel(
+    val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
         db,
         kernel="paged_mqa_logits",
         bs=3,
@@ -481,10 +475,8 @@ def test_lookup_sparse_kernel_uses_b2_when_bs3_s2682_is_missing():
 
 
 def test_lookup_sparse_kernel_uses_largest_batch_that_covers_isl():
-    from aiconfigurator.sdk.perf_database import PerfDatabase
-
     db = _make_sparse_db_from_grid({0: _sparse_sampled_batch_caps_grid()})
-    val = PerfDatabase._lookup_dsv4_sparse_kernel(
+    val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
         db,
         kernel="paged_mqa_logits",
         bs=5,
@@ -499,11 +491,9 @@ def test_lookup_sparse_kernel_uses_largest_batch_that_covers_isl():
 
 
 def test_lookup_sparse_kernel_uses_b4_when_bs5_s1565_is_missing():
-    from aiconfigurator.sdk.perf_database import PerfDatabase
-
     isl = 1565.2
     db = _make_sparse_db_from_grid({0: _sparse_sampled_batch_caps_grid()})
-    val = PerfDatabase._lookup_dsv4_sparse_kernel(
+    val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
         db,
         kernel="paged_mqa_logits",
         bs=5,
@@ -518,8 +508,6 @@ def test_lookup_sparse_kernel_uses_b4_when_bs5_s1565_is_missing():
 
 
 def test_lookup_sparse_kernel_interpolates_past_kv_after_batch_fallback():
-    from aiconfigurator.sdk.perf_database import PerfDatabase
-
     isl = 1565.2
     db = _make_sparse_db_from_grid(
         {
@@ -527,7 +515,7 @@ def test_lookup_sparse_kernel_interpolates_past_kv_after_batch_fallback():
             4096: _sparse_sampled_batch_caps_grid(offset=4.0),
         }
     )
-    val = PerfDatabase._lookup_dsv4_sparse_kernel(
+    val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
         db,
         kernel="paged_mqa_logits",
         bs=5,
@@ -545,12 +533,11 @@ def test_lookup_sparse_kernel_interpolates_past_kv_after_batch_fallback():
 
 def test_lookup_sparse_kernel_missing_returns_none():
     """Missing dict / kernel name → None (caller uses SOL ratio fallback)."""
-    from aiconfigurator.sdk.perf_database import PerfDatabase
 
     class _DB:
         _dsv4_sparse_kernel_data: ClassVar[dict] = {}
 
-    val = PerfDatabase._lookup_dsv4_sparse_kernel(
+    val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
         _DB(),
         kernel="paged_mqa_logits",
         bs=1,

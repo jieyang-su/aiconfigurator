@@ -716,3 +716,44 @@ Remaining review points:
 - Confirm whether `version_compat.py` should continue accepting internal
   aliases like `legacy/current` from the environment. CLI choices no longer
   expose those names.
+
+## `12dca98b` / `#1155 refactor: complete lazy-load Pattern + A cleanup`
+
+Status: resolved during upstream replay.
+
+High-level conflict cause:
+
+- Upstream completed the operations refactor: `_legacy.py` is deleted, CSV
+  loaders move out of `perf_database.py` into owning `operations/*.py` modules,
+  and tests patch loaders at the owning module rather than at
+  `perf_database` re-export sites.
+- This fork still carried DeepSeek-V4 architecture-aware loader/query behavior
+  around `perf_database.py` and DSV4 sparse tests.
+
+Resolution applied:
+
+- Accepted upstream deletion of `src/aiconfigurator/sdk/operations/_legacy.py`.
+  No DSV4 or other op classes are kept in the legacy module.
+- Kept upstream's slim `perf_database.py` structure with loader re-exports.
+  Added only the small `DEFAULT_DSV4_ARCHITECTURE` re-export and DSV4 query
+  wrapper `architecture` passthrough so model code can keep passing
+  `architecture=self.architecture`.
+- Moved/kept fork DSV4 behavior in `src/aiconfigurator/sdk/operations/dsv4.py`:
+  architecture bucket selection, architecture-aware context/generation/sparse
+  loaders, sparse-kernel lookup by architecture/native_heads/tp_size, and
+  context/generation query selection by architecture.
+- Accepted upstream test fixture ownership changes in
+  `tests/unit/sdk/database/conftest.py`.
+- Accepted upstream interpolation tests against the new
+  `aiconfigurator.sdk.interpolation` module.
+- Updated DSV4 sparse tests to import DSV4 constants/helpers from
+  `aiconfigurator.sdk.operations.dsv4` while keeping `LoadedOpData` and loader
+  re-exports through `perf_database` where upstream still exposes them.
+
+Rationale:
+
+- The requested end state is upstream-aligned generic DSV4 public API, with
+  Flash/Pro differences represented as model/architecture/native-head
+  metadata. Keeping `perf_database.py` slim and placing the fork-specific DSV4
+  metadata behavior in `operations/dsv4.py` matches both upstream's new
+  ownership model and the fork's compatibility needs.
