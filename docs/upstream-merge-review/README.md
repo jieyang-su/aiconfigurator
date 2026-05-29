@@ -806,3 +806,29 @@ Rationale:
   while retaining the practical compatibility switches needed for existing
   SGLang 0.5.10/0.5.12 collection environments and model-specific DSV4 Pro TP
   sweeps.
+
+## `f93be4ae` / `#1047 perf: replace perf CSV assets with parquet`
+
+Status: resolved during upstream replay.
+
+High-level conflict cause:
+
+- Upstream added collector parquet finalization and the `--keep-csv` CLI flag,
+  while this fork had added `--sglang-version-branch` at the same parser
+  location.
+- The commit also converts many checked-in perf-data assets from `.txt` CSV
+  files to `.parquet`.
+
+Resolution applied:
+
+- Kept both collector CLI flags. `--sglang-version-branch` still controls
+  SGLang v0.5.10/v0.5.12 attention backend compatibility, and upstream's
+  `--keep-csv` remains available for preserving staging CSVs.
+- Accepted upstream parquet perf-data assets and deletions of the corresponding
+  `.txt` files as the canonical data format for this replay.
+
+Rationale:
+
+- The two CLI flags are independent. Accepting upstream parquet data keeps the
+  fork aligned with current upstream perf-database storage while preserving the
+  fork's SGLang collector compatibility switch.
