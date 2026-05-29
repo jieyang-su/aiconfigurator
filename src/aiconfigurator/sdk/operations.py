@@ -1845,6 +1845,7 @@ class _BaseDeepSeekV4AttentionModule(Operation):
         fmha_quant_mode: common.FMHAQuantMode,
         gemm_quant_mode: common.GEMMQuantMode,
         architecture: str = "DeepseekV4ForCausalLM",
+        native_num_heads: int | None = None,
     ) -> None:
         super().__init__(name, scale_factor)
         self._num_heads = num_heads
@@ -1863,6 +1864,7 @@ class _BaseDeepSeekV4AttentionModule(Operation):
         self._fmha_quant_mode = fmha_quant_mode
         self._gemm_quant_mode = gemm_quant_mode
         self._architecture = architecture
+        self._native_num_heads = native_num_heads
         self._weights = self._estimate_weights()
 
     def _estimate_weights(self) -> float:
@@ -1917,6 +1919,7 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             fmha_quant_mode=self._fmha_quant_mode,
             gemm_quant_mode=self._gemm_quant_mode,
             architecture=self._architecture,
+            native_num_heads=self._native_num_heads,
         )
         return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
 
@@ -1947,6 +1950,7 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             fmha_quant_mode=self._fmha_quant_mode,
             gemm_quant_mode=self._gemm_quant_mode,
             architecture=self._architecture,
+            native_num_heads=self._native_num_heads,
         )
         return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
 

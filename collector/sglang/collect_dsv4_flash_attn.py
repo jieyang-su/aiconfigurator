@@ -5,11 +5,11 @@
 
 ONE file containing both:
 
-  1. The bench engine — builds an sglang ``ModelRunner`` for a single
+  1. The bench engine - builds an sglang ``ModelRunner`` for a single
      attn_kind (CSA / HCA) layer and times CUDA-Graph replay of
      ``layer.self_attn(...)`` (Q/KV proj + norm/rope + cache store +
      compressor + C4 indexer/topk for CSA + final FlashMLA).
-  2. The registry-facing entrypoints — ``run_dsv4_flash_attn_worker``
+  2. The registry-facing entrypoints - ``run_dsv4_flash_attn_worker``
      (per-(kind, tp, gemm, bs) test case) which spawns a subprocess that
      internally sweeps every valid sl for that bs.
 
@@ -128,6 +128,29 @@ def get_dsv4_flash_hca_generation_test_cases():
     return _impl()
 
 
+def get_dsv4_pro_csa_context_test_cases():
+    from collector.common_test_cases import get_dsv4_pro_csa_context_test_cases as _impl
+
+    return _impl()
+
+
+def get_dsv4_pro_csa_generation_test_cases():
+    from collector.common_test_cases import get_dsv4_pro_csa_generation_test_cases as _impl
+
+    return _impl()
+
+
+def get_dsv4_pro_hca_context_test_cases():
+    from collector.common_test_cases import get_dsv4_pro_hca_context_test_cases as _impl
+
+    return _impl()
+
+
+def get_dsv4_pro_hca_generation_test_cases():
+    from collector.common_test_cases import get_dsv4_pro_hca_generation_test_cases as _impl
+
+    return _impl()
+
 __all__ = [
     "ATTN_KINDS",
     "_BATCH_SIZES",
@@ -138,6 +161,10 @@ __all__ = [
     "get_dsv4_flash_csa_generation_test_cases",
     "get_dsv4_flash_hca_context_test_cases",
     "get_dsv4_flash_hca_generation_test_cases",
+    "get_dsv4_pro_csa_context_test_cases",
+    "get_dsv4_pro_csa_generation_test_cases",
+    "get_dsv4_pro_hca_context_test_cases",
+    "get_dsv4_pro_hca_generation_test_cases",
     "run_dsv4_flash_attn_worker",
 ]
 
@@ -150,7 +177,7 @@ ATTN_KIND_TO_COMPRESS_RATIO = {
 }
 
 
-CLI_DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Pro"
+CLI_DEFAULT_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
 _MODEL_CONFIG_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -160,7 +187,10 @@ _MODEL_CONFIG_DIR = os.path.join(
 )
 
 _DSV4_FP4_EXPERTS_OVERRIDES = {
+    "deepseek-ai/DeepSeek-V4-Flash": False,
+    "deepseek-ai/DeepSeek-V4-Pro": False,
     "sgl-project/DeepSeek-V4-Flash-FP8": False,
+    "sgl-project/DeepSeek-V4-Pro-FP8": False,
 }
 
 
@@ -220,9 +250,9 @@ def _kv_dtype_db_to_sglang(kv_dtype_db: str) -> str:
     return {"bfloat16": "bfloat16", "fp8": "fp8_e4m3"}[kv_dtype_db]
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Bench engine — model load, forward batch, CUDA-graph timing, perf log
-# ═══════════════════════════════════════════════════════════════════════
+# ================================================================
+# Bench engine - model load, forward batch, CUDA-graph timing, perf log
+# ================================================================
 
 
 def _resolve_perf_path(output_path: str | None, default_name: str) -> str:
@@ -300,6 +330,31 @@ def _load_aic_cached_model_config(model_id: str) -> dict | None:
         return json.load(f)
 
 
+def _dsv4_config_value(model_path: str, key: str, default: int) -> int:
+    if os.path.isdir(model_path):
+        config_file = os.path.join(model_path, "config.json")
+        if os.path.isfile(config_file):
+            with open(config_file) as f:
+                return int(json.load(f).get(key, default))
+    cached_config = _load_aic_cached_model_config(model_path)
+    if cached_config is not None:
+        return int(cached_config.get(key, default))
+    return default
+
+def _dsv4_num_attention_heads(model_path: str) -> int:
+    return _dsv4_config_value(model_path, "num_attention_heads", 128 if "Pro" in model_path else NATIVE_HEADS)
+
+
+def _dsv4_o_groups(model_path: str) -> int:
+    return _dsv4_config_value(model_path, "o_groups", 16 if "Pro" in model_path else 8)
+
+
+def _dsv4_supported_tp_sizes(model_path: str) -> tuple[int, ...]:
+    """TP values supported by SGLang's current DSV4 attention layout."""
+    num_heads = _dsv4_num_attention_heads(model_path)
+    o_groups = _dsv4_o_groups(model_path)
+    return tuple(tp for tp in (1, 2, 4, 8, 16, 32) if tp <= o_groups and num_heads % tp == 0 and o_groups % tp == 0)
+
 def _resolve_model_path(
     model_path: str,
     *,
@@ -309,6 +364,7 @@ def _resolve_model_path(
     disable_weight_quant: bool,
     strip_auto_map: bool = True,
     gemm_type: str = "bfloat16",
+    tp_size: int = 1,
 ) -> str:
     """Create a local config dir patched for a single DSV4 attention kind.
 
@@ -319,13 +375,13 @@ def _resolve_model_path(
         - ``"fp8_block"``: keeps the upstream V4-Flash fp8 block-quantized
           ``quantization_config``.  Combined with ServerArgs ``quantization="fp8"``
           this routes projection GEMMs through DeepGEMM's
-          ``sm90_fp8_gemm_1d2d_impl`` kernel — the same path the production
+          ``sm90_fp8_gemm_1d2d_impl`` kernel - the same path the production
           server uses, so kernel-by-kernel the latency lines up with a real run.
 
     TP simulation is NOT done at this layer (do not patch num_attention_heads).
     Use ``_tp_load_model_patch`` instead, which sets ``_TP.world_size`` and
     ``_ATTN_TP_SIZE`` to N at model construction.  That keeps FMLA's required
-    h_q=64 (Q is zero-padded with only the rank's tp_slice filled) while
+    native head count (Q is zero-padded with only the rank's tp_slice filled) while
     projection GEMMs (wq_b, wo_a, wo_b, ColumnParallel/RowParallel) allocate
     1/N shards.  Patching ``num_attention_heads`` directly would bypass the
     zero-pad path and trip FlashMLA's "Unsupported h_q: 8" template guard.
@@ -389,9 +445,14 @@ def _resolve_model_path(
         #   - Setting ``n_shared_experts=0`` makes ``DeepseekV2MoE`` build a
         #     shared expert with intermediate=0, which divides-by-zero in
         #     ``validate_block_quant_shapes``.
-        # 8 routed experts x 2048 inter x 7168 hidden x 1 byte fp8 ≈ 230 MB
-        # per layer, comfortable on one H20.
-        config["n_routed_experts"] = min(int(config.get("n_routed_experts", 8)), 8)
+        # Keep at least ``tp_size`` experts. DeepseekV2MoE validates
+        # ``tp_size <= n_routed_experts`` during model construction even
+        # though this collector only forwards ``layer.self_attn``.
+        min_experts_for_tp = max(8, int(tp_size))
+        config["n_routed_experts"] = min(
+            int(config.get("n_routed_experts", min_experts_for_tp)),
+            min_experts_for_tp,
+        )
         config["num_experts_per_tok"] = min(int(config.get("num_experts_per_tok", 2)), 2)
 
     tmp_dir = os.path.join(
@@ -428,12 +489,12 @@ def _tp_load_model_patch(tp_size: int):
           reads ``get_attention_tp_size()`` at forward time for the
           ``q_padded[..., n_heads]`` / ``q_out = q_padded[:, tp_slice, :]``
           zero-pad logic; keeping it at N is what makes FlashMLA receive the
-          fixed h_q=64 with only the rank-0 slice filled (matching prod TP=N
+          fixed native head count with only the rank-0 slice filled (matching prod TP=N
           rank-0 byte-for-byte).
 
     Why this is safe:
-      - FlashMLA's ``Unsupported h_q: 8`` error is avoided because Q is always
-        zero-padded to h_q=64 before FMLA — at any N, FMLA sees h_q=64.
+      - FlashMLA's unsupported local h_q error is avoided because Q is always
+        zero-padded to the model's native head count before FMLA.
       - V4 main attention's ``wq_b`` is ``ColumnParallelLinear`` and stores
         ``self.tp_size`` at construction (read once), so forward uses N
         without re-querying _TP.world_size.
@@ -443,7 +504,7 @@ def _tp_load_model_patch(tp_size: int):
     What the measured kernel time represents: the cost of attention module
     forward on **one** rank of a real TP=N deployment, including projection
     GEMMs at the correctly sharded shape and full-resolution attention
-    kernels (FMLA/paged_mqa_logits/compressor — TP-invariant).
+    kernels (FMLA/paged_mqa_logits/compressor - TP-invariant).
     """
     if tp_size <= 1:
         yield
@@ -515,6 +576,7 @@ def _load_model_runner(
         shrink_unused_moe=shrink_unused_moe,
         disable_weight_quant=disable_weight_quant,
         gemm_type=gemm_type,
+        tp_size=tp_size,
     )
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
     # CUDA_VISIBLE_DEVICES remaps every child to cuda:0; keep the physical GPU
@@ -547,8 +609,8 @@ def _load_model_runner(
         max_running_requests=1100,
         max_prefill_tokens=max(max_total_tokens or 4096, 2048),
     )
-    # gemm_type controls projection GEMM dispatch.  "fp8_block" → DeepGEMM
-    # (matches production V4-Flash-FP8); anything else → cuBLASLt bf16.
+    # gemm_type controls projection GEMM dispatch.  "fp8_block" -> DeepGEMM
+    # (matches production V4-Flash-FP8); anything else -> cuBLASLt bf16.
     server_args.quantization = "fp8" if gemm_type == "fp8_block" else None
     if server_args.quantization == "fp8" and server_args.moe_runner_backend == "auto":
         if is_blackwell_supported():
@@ -659,7 +721,7 @@ def _make_reqs(batch_size: int, seq_len: int, *, decode: bool):
 # Fallback chunk size used only when ``server_args.chunked_prefill_size``
 # is unavailable.  The real value is read from sglang's server args at
 # wrap-time so we follow whatever sglang's GPU-memory-based default would
-# pick (8192 on H20/H100, 16384 on B200, 4096 fallback — see
+# pick (8192 on H20/H100, 16384 on B200, 4096 fallback - see
 # ``server_args.py`` ``_finalize_resource_allocation``).
 _ALLOC_EXTEND_CHUNK_FALLBACK = 8192
 
@@ -667,26 +729,9 @@ _ALLOC_EXTEND_CHUNK_FALLBACK = 8192
 def _chunked_alloc_extend(orig_alloc_extend, chunk_size: int = _ALLOC_EXTEND_CHUNK_FALLBACK):
     """Wrap ``alloc_extend`` to chunk large extends in sglang-aligned style.
 
-    Sglang's scheduler chunks any prefill into ≤``chunked_prefill_size`` token
-    rounds, with each round invoking ``alloc_extend`` with the **total** token
-    count distributed across all in-flight requests.  This wrapper mimics
-    that: every ``alloc_extend`` call has ``extend_num_tokens ≤ chunk_size``
-    by issuing N ≥ 1 sub-calls, each round advancing every request by a
-    proportional share of its remaining extend.  Per-call constexpr stays at
-    ≤ chunk_size so Triton's PTX size stays bounded.
-
-    Per-round token distribution:
-      * ``per_round_share[i] = extend_per_req[i] // n_rounds`` plus an extra
-        +1 in the first ``remainder[i]`` rounds to absorb the remainder.
-      * ``sum(chunk_extends_for_round) ≤ chunk_size`` (matches sglang's
-        per-round token budget).
-
-    Output index layout: each round's indices come back as
-    ``[req0_extends_for_round, req1_extends_for_round, ...]`` (same
-    contract as ``alloc_extend_kernel``).  We accumulate per-request lists
-    across rounds and concat them in order at the end so the final result
-    matches what a single big ``alloc_extend`` would have returned —
-    necessary for callers that index into ``out_cache_loc`` per request.
+    Sglang's scheduler chunks any prefill into <= ``chunked_prefill_size``
+    token rounds. This wrapper mimics that by issuing smaller alloc_extend
+    calls whose total extend tokens stay within ``chunk_size``.
     """
 
     def wrapped(prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu, last_loc, extend_num_tokens):
@@ -697,11 +742,8 @@ def _chunked_alloc_extend(orig_alloc_extend, chunk_size: int = _ALLOC_EXTEND_CHU
             return orig_alloc_extend(prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu, last_loc, extend_num_tokens)
 
         extend_per_req = (seq_lens_cpu - prefix_lens_cpu).tolist()
-        # Per-request token budget per round.  ``chunk_size // bs`` ensures
-        # ``sum(chunk_extends) ≤ chunk_size`` always — Triton constexpr
-        # ``next_pow_2(chunk_total) ≤ next_pow_2(chunk_size) = 8192``.
-        # ``max(1, ...)`` handles bs > chunk_size (shouldn't happen with our
-        # filter cap, but defensive).
+        # Per-request token budget per round. ``chunk_size // bs`` ensures
+        # sum(chunk_extends) <= chunk_size.
         chunk_size_per_req = max(1, chunk_size // bs)
 
         cur_prefix = prefix_lens.clone()
@@ -711,8 +753,6 @@ def _chunked_alloc_extend(orig_alloc_extend, chunk_size: int = _ALLOC_EXTEND_CHU
         per_req_indices: list[list[torch.Tensor]] = [[] for _ in range(bs)]
 
         while True:
-            # Each round: every request advances by ≤ chunk_size_per_req,
-            # capped at its remaining extend.  Sum naturally ≤ chunk_size.
             chunk_extends = [min(chunk_size_per_req, extend_per_req[i] - advanced[i]) for i in range(bs)]
             chunk_total = sum(chunk_extends)
             if chunk_total == 0:
@@ -726,9 +766,7 @@ def _chunked_alloc_extend(orig_alloc_extend, chunk_size: int = _ALLOC_EXTEND_CHU
             if indices is None:
                 return None
 
-            # Distribute the round's flat ``indices`` back to per-request
-            # buckets.  ``alloc_extend_kernel`` writes
-            # ``[req0_n, req1_n, ..., req(bs-1)_n]`` in order.
+            # alloc_extend_kernel writes [req0_n, req1_n, ..., req(bs-1)_n].
             offset = 0
             for i in range(bs):
                 n = chunk_extends[i]
@@ -741,8 +779,6 @@ def _chunked_alloc_extend(orig_alloc_extend, chunk_size: int = _ALLOC_EXTEND_CHU
             cur_prefix = new_seq
             cur_prefix_cpu = new_seq_cpu
 
-        # Concat each request's pieces, then concat across requests in
-        # order — preserves single-call alloc_extend's index layout.
         final = []
         for lst in per_req_indices:
             if lst:
@@ -752,7 +788,6 @@ def _chunked_alloc_extend(orig_alloc_extend, chunk_size: int = _ALLOC_EXTEND_CHU
         return torch.cat(final)
 
     return wrapped
-
 
 def _build_forward_batch(model_runner, batch_size: int, seq_len: int, *, is_prefill: bool):
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -782,10 +817,10 @@ def _build_forward_batch(model_runner, batch_size: int, seq_len: int, *, is_pref
         spec_algorithm=SpeculativeAlgorithm.NONE,
     )
 
-    # Read sglang's actual ``chunked_prefill_size`` from server_args — this
+    # Read sglang's actual ``chunked_prefill_size`` from server_args - this
     # is the same per-call token budget the production scheduler uses, set
     # by sglang based on GPU memory (8192 on H20/H100, 16384 on B200,
-    # 4096 fallback).  Our chunked alloc_extend wrapper splits requests
+# pick (8192 on H20/H100, 16384 on B200, 4096 fallback - see
     # into rounds of this size so each Triton constexpr stays bounded.
     server_args = getattr(model_runner, "server_args", None)
     sglang_chunk = getattr(server_args, "chunked_prefill_size", None) if server_args else None
@@ -925,7 +960,7 @@ def _log_result(
     gemm_type: str = "bfloat16",
     tp_size: int = 1,
 ) -> None:
-    # V4-Flash output layout: ONE CSV per (attn_kind, mode) — 3 kinds x 2
+    # V4-Flash output layout: ONE CSV per (attn_kind, mode) - 3 kinds x 2
     # modes = 6 files total, regardless of how many (tp_size, gemm_type)
     # subprocesses run.  Within each file, rows are disambiguated by the
     # ``tp_size``, ``gemm_type``, ``batch_size``, ``isl`` columns.
@@ -947,7 +982,7 @@ def _log_result(
                 "mla_dtype": "bfloat16",
                 "kv_cache_dtype": kv_cache_dtype,
                 "gemm_type": gemm_type,
-                "num_heads": NATIVE_HEADS,
+                "num_heads": _dsv4_num_attention_heads(model_path),
                 "batch_size": batch_size,
                 "isl": seq_len if is_prefill else 1,
                 "tp_size": tp_size,
@@ -993,8 +1028,13 @@ def run_dsv4_mla_module(
 ) -> list[dict[str, float]]:
     is_prefill = mode == "context"
     compress_ratio = ATTN_KIND_TO_COMPRESS_RATIO[attn_kind]
-    if tp_size not in (1, 2, 4, 8, 16, 32):
-        raise ValueError(f"tp_size must be a power of 2 in [1, 32]; got {tp_size}")
+    supported_tp_sizes = _dsv4_supported_tp_sizes(model_path)
+    if tp_size not in supported_tp_sizes:
+        raise ValueError(
+            f"tp_size={tp_size} is unsupported for {model_path}; "
+            f"supported values are {supported_tp_sizes}. "
+            f"SGLang DSV4 attention requires tp_size to divide o_groups={_dsv4_o_groups(model_path)}."
+        )
     model_runner = _load_model_runner(
         model_path,
         attn_kind=attn_kind,
@@ -1131,15 +1171,15 @@ def run_dsv4_mla_module(
     if skipped_shapes:
         skipped_str = ", ".join(f"(bs={b},sl={s},reason={r})" for b, s, r in skipped_shapes)
         print(
-            f"[WARN] dsv4-flash {sweep_label}: SWEEP SUMMARY — {len(skipped_shapes)} of "
+            f"[WARN] dsv4-flash {sweep_label}: SWEEP SUMMARY - {len(skipped_shapes)} of "
             f"{len(skipped_shapes) + len(results)} shapes failed: {skipped_str}"
         )
     return results
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ================================================================
 # Subprocess-isolated worker (registry path)
-# ═══════════════════════════════════════════════════════════════════════
+# ================================================================
 
 
 def _run_subprocess(
@@ -1153,6 +1193,8 @@ def _run_subprocess(
     gpu_id: int,
     gemm_type: str = "bfloat16",
     tp_size: int = 1,
+    perf_filename_prefix: str = "dsv4_flash",
+    seq_lens: Iterable[int] | None = None,
 ):
     """Run one (attn_kind, tp, gemm, bs) subprocess that sweeps all valid sl.
 
@@ -1182,6 +1224,8 @@ def _run_subprocess(
         f'    output_path="{output_path}",\n'
         f'    gemm_type="{gemm_type}",\n'
         f"    tp_size={tp_size!r},\n"
+        f'    perf_filename_prefix="{perf_filename_prefix}",\n'
+        f"    seq_lens={list(seq_lens) if seq_lens is not None else None!r},\n"
         f")\n"
     )
 
@@ -1258,6 +1302,8 @@ def _subprocess_entry(
     output_path: str,
     gemm_type: str = "bfloat16",
     tp_size: int = 1,
+    perf_filename_prefix: str = "dsv4_flash",
+    seq_lens: list[int] | None = None,
 ):
     """In-subprocess runner: build model once for fixed bs, sweep all valid sl.
 
@@ -1265,11 +1311,13 @@ def _subprocess_entry(
     forward reuses the same allocator without re-init.
     """
     bs_grid, sl_grid = _expand_grid()
+    if seq_lens is not None:
+        sl_grid = list(seq_lens)
     pairs = _filter_pairs(mode, [batch_size], sl_grid)
     if not pairs:
         print(f"[dsv4-flash] no valid sl values for mode={mode}, bs={batch_size}")
         return
-    # Sort sl DESCENDING — start from the largest case so:
+    # Sort sl DESCENDING - start from the largest case so:
     #   1. OOM fails fast (don't waste time on small sl before discovering
     #      max_sl can't fit)
     #   2. CUDA / DeepGEMM workspace grows monotonically; allocator settles
@@ -1277,14 +1325,14 @@ def _subprocess_entry(
     #      grow / re-alloc.
     sl_for_bs = sorted({sl for _, sl in pairs}, reverse=True)
 
-    # Both kinds (csa/hca) write the swa_k_cache sub-pool — see
+    # Both kinds (csa/hca) write the swa_k_cache sub-pool - see
     # ``deepseek_v4_backend_radix.py`` line ~1020.  Sub-pool ratios out of
     # ``max_total`` (page-256 aligned, not exact):
-    #   swa_pool / max_total: ~1/10 at max_total≥100k, ~1/16 at smaller
-    # so we need ``max_total ≥ ~16 * max(bs*sl)``.
+    #   swa_pool / max_total: ~1/10 at max_total>=100k, ~1/16 at smaller
+    # so we need ``max_total >= ~16 * max(bs*sl)``.
     #
     # The global ceiling on bs*sl in our sweep is bs=1024 x sl=1024 = 1M
-    # (other (bs, sl) pairs all stay ≤ 1M).  Hard-code max_total off this
+    # (other (bs, sl) pairs all stay <= 1M).  Hard-code max_total off this
     # global cap so every subprocess gets the same KV pool, regardless of
     # which (bs, sl_list) it owns.  H20 80GB easily fits 16M tokens of
     # single-layer fp8 KV.
@@ -1302,7 +1350,7 @@ def _subprocess_entry(
         output_path=output_path,
         mem_fraction_static=0.7,
         max_total_tokens=max_total_tokens,
-        perf_filename_prefix="dsv4_flash",
+        perf_filename_prefix=perf_filename_prefix,
         gemm_type=gemm_type,
         tp_size=tp_size,
     )
@@ -1322,7 +1370,7 @@ def run_dsv4_flash_attn_worker(
     perf_filename: str,
     device: str = "cuda:0",
 ):
-    """collect.py-compatible worker — runs ONE (kind, tp, gemm, bs) test case.
+    """collect.py-compatible worker - runs ONE (kind, tp, gemm, bs) test case.
 
     Test case tuple is 9 elements (``perf_filename`` is bound by collect.py
     via OpEntry, NOT in the tuple).  Worker spawns a subprocess that builds
@@ -1330,14 +1378,15 @@ def run_dsv4_flash_attn_worker(
 
     ``tp_size`` triggers single-process TP simulation in the spawned subprocess
     via ``collect_dsv4_mla_module._tp_load_model_patch``: ColumnParallel /
-    RowParallel weights allocate at 1/N shape; FMLA sees h_q=64 (zero-padded).
+    RowParallel weights allocate at 1/N shape; FMLA sees native h_q (zero-padded).
     """
     del seq_len, attention_backend  # placeholders; sl swept inside subprocess
 
     if attn_kind not in ATTN_KINDS:
         raise ValueError(f"unknown attn_kind={attn_kind}; expected one of {ATTN_KINDS}")
-    if tp_size not in _TP_SIZES:
-        raise ValueError(f"unsupported tp_size={tp_size}; expected one of {_TP_SIZES}")
+    supported_tp_sizes = _dsv4_supported_tp_sizes(model_path)
+    if tp_size not in supported_tp_sizes:
+        raise ValueError(f"unsupported tp_size={tp_size} for {model_path}; expected one of {supported_tp_sizes}")
 
     perf_basename = os.path.basename(perf_filename)
     is_prefill = "context" in perf_basename
@@ -1352,6 +1401,7 @@ def run_dsv4_flash_attn_worker(
     )
 
     output_path = os.path.dirname(perf_filename) or os.getcwd()
+    perf_filename_prefix = "dsv4_pro" if perf_basename.startswith("dsv4_pro") else "dsv4_flash"
     kv_dtype_sglang = _kv_dtype_db_to_sglang(kv_cache_dtype)
 
     _run_subprocess(
@@ -1364,12 +1414,13 @@ def run_dsv4_flash_attn_worker(
         gpu_id=gpu_id,
         gemm_type=gemm_type,
         tp_size=tp_size,
+        perf_filename_prefix=perf_filename_prefix,
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ================================================================
 # CLI (manual / smoke test)
-# ═══════════════════════════════════════════════════════════════════════
+# ================================================================
 
 
 def _parse_int_list(value: str) -> list[int]:
@@ -1405,7 +1456,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             f"Comma-separated TP sizes to sweep.  Default '{','.join(str(t) for t in _TP_SIZES)}'.  "
             "Each value runs the in-process TP simulation; FMLA always sees "
-            "h_q=64 (V4 zero-pads), so any TP power-of-2 in [1, 32] is valid."
+            "native h_q (V4 zero-pads), so any TP power-of-2 in [1, 32] is valid."
         ),
     )
     return parser
@@ -1428,8 +1479,18 @@ def main() -> None:
     kinds = [args.attn_kind] if args.attn_kind else list(ATTN_KINDS)
     tp_sizes = _parse_int_list(args.tp_sizes)
     for tp_size in tp_sizes:
-        if tp_size not in _TP_SIZES and tp_size not in (16, 32):
+        if tp_size not in (1, 2, 4, 8, 16, 32):
             raise ValueError(f"tp_size={tp_size} not in supported set; pick from 1/2/4/8/16/32")
+    supported_tp_sizes = _dsv4_supported_tp_sizes(args.model_path)
+    skipped_tp_sizes = [tp for tp in tp_sizes if tp not in supported_tp_sizes]
+    if skipped_tp_sizes:
+        print(
+            f"[dsv4-collector] skipping unsupported tp_sizes={skipped_tp_sizes} for {args.model_path}; "
+            f"supported={supported_tp_sizes}, o_groups={_dsv4_o_groups(args.model_path)}"
+        )
+    tp_sizes = [tp for tp in tp_sizes if tp in supported_tp_sizes]
+    if not tp_sizes:
+        raise ValueError(f"no requested tp_sizes are supported for {args.model_path}; supported={supported_tp_sizes}")
 
     device_str = str(args.device)
     gpu_id = int(device_str.split(":")[-1]) if ":" in device_str else 0
@@ -1438,6 +1499,7 @@ def main() -> None:
     # sl values for that bs.  Mirrors the registry-driven path used by
     # collect.py (one test case per (kind, tp, gemm, bs)).
     bs_unique = sorted({bs for bs, _ in pairs})
+    perf_filename_prefix = "dsv4_pro" if "Pro" in args.model_path else "dsv4_flash"
     for kind in kinds:
         for tp_size in tp_sizes:
             for bs in bs_unique:
@@ -1452,10 +1514,12 @@ def main() -> None:
                         gpu_id=gpu_id,
                         gemm_type=args.gemm_type,
                         tp_size=tp_size,
+                        perf_filename_prefix=perf_filename_prefix,
+                        seq_lens=seq_lens,
                     )
                 except Exception:
                     traceback.print_exc()
-                    print(f"[dsv4-flash] FAILED kind={kind} tp={tp_size} bs={bs}; continuing")
+                    print(f"[{perf_filename_prefix}] FAILED kind={kind} tp={tp_size} bs={bs}; continuing")
 
 
 if __name__ == "__main__":

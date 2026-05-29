@@ -87,7 +87,12 @@ class DeepSeekV4Model(BaseModel):
             else self.config.workload_distribution
         )
         local_heads = self._num_heads // tp_size
-        local_o_groups = max(1, deepseek_v4_cfg.o_groups // tp_size)
+        if tp_size > deepseek_v4_cfg.o_groups or deepseek_v4_cfg.o_groups % tp_size != 0:
+            raise ValueError(
+                f"DeepSeek-V4 attention TP size {tp_size} is not supported by o_groups={deepseek_v4_cfg.o_groups}; "
+                "pick a TP size that evenly divides o_groups."
+            )
+        local_o_groups = deepseek_v4_cfg.o_groups // tp_size
         local_moe_inter_size = self._moe_inter_size // tp_size
 
         def _attention_ops(is_context: bool, scale_factor: float):
@@ -120,6 +125,7 @@ class DeepSeekV4Model(BaseModel):
                     fmha_quant_mode,
                     gemm_quant_mode,
                     architecture=self.architecture,
+                    native_num_heads=self._num_heads,
                 )
                 for ratio, count in ratio_counts.items()
                 if count > 0

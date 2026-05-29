@@ -50,7 +50,7 @@ def is_wideep_moe_model(model_name: str) -> bool:
     return model_name in _WIDEEP_MOE_MODEL_NAMES
 
 
-# Raw model config lists — module-level so get_all_model_names() can read them
+# Raw model config lists: module-level so get_all_model_names() can read them
 # without instantiating test case objects or calling generator functions.
 
 # MoE: [hidden_size, inter_size, topk, num_experts, model_name]
@@ -141,7 +141,7 @@ _MAMBA2_MODEL_CONFIGS: list[list] = [
 def get_all_model_names() -> list[str]:
     """Return all known model names across all op types.
 
-    Reads directly from the raw config list data — does not instantiate test
+    Reads directly from the raw config list data; does not instantiate test
     case objects or call generator functions, so pruning logic in the generators
     cannot accidentally exclude models from the allowlist.
     """
@@ -541,7 +541,7 @@ def get_common_mamba2_test_cases() -> list[Mamba2CommonTestCase]:
 
 
 # =============================================================================
-# GDN (Gated DeltaNet) Test Cases  — Qwen3.5 linear_attention layers
+# GDN (Gated DeltaNet) Test Cases: Qwen3.5 linear_attention layers
 # =============================================================================
 
 
@@ -730,15 +730,24 @@ def get_common_gdn_test_cases() -> list[GdnCommonTestCase]:
     return test_cases
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# =============================================================================
 # DeepSeek-V4-Flash test cases
-# ═══════════════════════════════════════════════════════════════════════
+# =============================================================================
 # Used by ``collector.sglang.collect_dsv4_flash_attn`` (full-module bench)
 # and ``collector.sglang.deepseekv4_sparse_modules`` (sparse kernel bench).
 # Both backends re-export the relevant ``get_*`` functions so collect.py
 # can resolve them via getattr on each per-backend module.
 
 _DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
+_DSV4_PRO_MODEL_PATH = "sgl-project/DeepSeek-V4-Pro-FP8"
+_DSV4_FLASH_MODEL_ALIASES = {
+    _DSV4_FLASH_MODEL_PATH,
+    "deepseek-ai/DeepSeek-V4-Flash",
+}
+_DSV4_PRO_MODEL_ALIASES = {
+    _DSV4_PRO_MODEL_PATH,
+    "deepseek-ai/DeepSeek-V4-Pro",
+}
 DSV4_FLASH_ATTN_KINDS = ("csa", "hca")
 
 
@@ -750,13 +759,24 @@ def _dsv4_flash_active() -> bool:
     cases so the collector skips it.
     """
     filt = _get_model_path_filter()
-    return filt is None or filt == _DSV4_FLASH_MODEL_PATH
+    return filt is None or filt in _DSV4_FLASH_MODEL_ALIASES
 
+
+def _dsv4_pro_active() -> bool:
+    """Honour the ``--model-path`` filter for V4-Pro-only test cases."""
+    filt = _get_model_path_filter()
+    return filt is None or filt in _DSV4_PRO_MODEL_ALIASES
 
 def _dsv4_flash_model_path() -> str:
     """Return the active V4-Flash model id for generated test cases."""
     filt = _get_model_path_filter()
     return filt if filt is not None else _DSV4_FLASH_MODEL_PATH
+
+
+def _dsv4_pro_model_path() -> str:
+    """Return the active V4-Pro model id for generated test cases."""
+    filt = _get_model_path_filter()
+    return filt if filt is not None else _DSV4_PRO_MODEL_PATH
 
 
 # --- Module-level (full self_attn) sweep ---
@@ -794,10 +814,12 @@ _DSV4_FLASH_MODULE_SEQ_LENGTHS = [
     1048575,
 ]
 
-# TP sizes — single-process simulation via _tp_load_model_patch in
+# TP sizes: single-process simulation via _tp_load_model_patch in
 # collect_dsv4_flash_attn.  Projection ColumnParallel/RowParallel weights
-# allocate at 1/N shards; FMLA always sees h_q=64 because V4 zero-pads Q.
+# allocate at 1/N shards; FMLA sees the model's native head count because V4
+# zero-pads Q before the FlashMLA call (64 for Flash, 128 for Pro).
 _DSV4_FLASH_MODULE_TP_SIZES = [1, 2, 4, 8]
+_DSV4_PRO_MODULE_TP_SIZES = [1, 2, 4, 8, 16]
 
 
 def _has_native_fp4_experts() -> bool:
@@ -810,7 +832,7 @@ def _has_native_fp4_experts() -> bool:
     fp8.py:process_weights_after_loading_block_quant`` raises
     ``NotImplementedError: DeepSeekV4 FP4 experts now require a native FP4
     MoE backend.`` before any ``ignored_layers`` / ``is_layer_skipped``
-    logic gets a chance — both the upstream ``SGLANG_FP8_IGNORED_LAYERS``
+    logic gets a chance; both the upstream ``SGLANG_FP8_IGNORED_LAYERS``
     env var and ``quantization_config.ignored_layers`` are bypassed by
     that hard-coded check. The sglang error message suggests
     ``--moe-runner-backend marlin``, but Marlin software-emulates FP4 with
@@ -829,13 +851,22 @@ def _has_native_fp4_experts() -> bool:
         return False
 
 
+def _dsv4_module_tp_sizes(model_path: str) -> list[int]:
+    """Return TP sizes supported by SGLang's current DSV4 attention layout.
+
+    ``deepseek_v4.MQALayer`` shards ``wo_a`` by ``o_groups // tp_size``.
+    Flash has o_groups=8 and Pro has o_groups=16, so TP values above that
+    would make n_local_groups=0 rather than representing a real rank shard.
+    """
+    return list(_DSV4_PRO_MODULE_TP_SIZES if "Pro" in model_path else _DSV4_FLASH_MODULE_TP_SIZES)
+
 def _dsv4_flash_module_precision_combos(phase: str):
     """``(compute_dtype, kv_cache_dtype, gemm_type)`` triples.
 
     DeepseekV4ForCausalLM rejects bfloat16 KV cache (asserts at load time),
     so we only emit fp8 KV.  ``gemm_type`` switches projection dispatch:
-      * ``bfloat16``  — projections through cuBLASLt nvjet kernels
-      * ``fp8_block`` — fp8 block-quantised weights → DeepGEMM
+      * ``bfloat16``: projections through cuBLASLt nvjet kernels
+      * ``fp8_block``: fp8 block-quantised weights -> DeepGEMM
                         ``sm90_fp8_gemm_1d2d_impl`` (matches production)
 
     ``fp8_block`` is omitted on pre-Blackwell parts; see
@@ -857,11 +888,11 @@ def _dsv4_flash_module_filter_pairs(mode: str, batch_sizes, seq_lens):
     """Drop ``(bs, sl)`` pairs that exceed KV pool / kernel limits.
 
     Context (b * s):
-        ≤ 8192 — matches sglang's default ``chunked_prefill_size``.
+        <= 8192: matches sglang's default ``chunked_prefill_size``.
     Generation (b * s):
-        ≤ 1M overall, with per-sl batch caps for long contexts (sl≥8192→bs≤64,
-        sl≥32768→bs≤16, sl≥65536→bs≤8, sl≥131072→bs≤4, sl≥262144→bs≤2,
-        sl≥524288→bs==1).  Ensures bs=1 is always allowed at every sl.
+        <= 1M overall, with per-sl batch caps for long contexts (sl>=8192 -> bs<=64,
+        sl>=32768 -> bs<=16, sl>=65536 -> bs<=8, sl>=131072 -> bs<=4,
+        sl>=262144 -> bs<=2, sl>=524288 -> bs==1).  Ensures bs=1 is always allowed at every sl.
     """
     is_context = mode == "context"
     pairs = []
@@ -889,7 +920,12 @@ def _dsv4_flash_module_filter_pairs(mode: str, batch_sizes, seq_lens):
     return pairs
 
 
-def _build_dsv4_flash_module_test_cases(mode: str, attn_kinds=DSV4_FLASH_ATTN_KINDS):
+def _build_dsv4_module_test_cases(
+    mode: str,
+    attn_kinds=DSV4_FLASH_ATTN_KINDS,
+    *,
+    model_path: str | None = None,
+):
     """One case per ``(attn_kind, tp_size, gemm_type, batch_size)``.
 
     Test case shape (9 elements; ``perf_filename`` is bound by collect.py
@@ -901,14 +937,14 @@ def _build_dsv4_flash_module_test_cases(mode: str, attn_kinds=DSV4_FLASH_ATTN_KI
     Each spawned subprocess builds ONE ``ModelRunner`` for ``(bs, max_sl)``
     and sweeps every valid sl for that bs internally.
     """
-    model_path = _dsv4_flash_model_path()
+    model_path = model_path or _dsv4_flash_model_path()
     pairs = _dsv4_flash_module_filter_pairs(mode, _DSV4_FLASH_MODULE_BATCH_SIZES, _DSV4_FLASH_MODULE_SEQ_LENGTHS)
     bs_set = sorted({bs for bs, _ in pairs})
 
     cases: list[list] = []
     for attn_kind in attn_kinds:
         for compute_dtype, kv_dtype, gemm_type in _dsv4_flash_module_precision_combos(mode):
-            for tp_size in _DSV4_FLASH_MODULE_TP_SIZES:
+            for tp_size in _dsv4_module_tp_sizes(model_path):
                 for bs in bs_set:
                     cases.append(
                         [
@@ -924,6 +960,14 @@ def _build_dsv4_flash_module_test_cases(mode: str, attn_kinds=DSV4_FLASH_ATTN_KI
                         ]
                     )
     return cases
+
+
+def _build_dsv4_flash_module_test_cases(mode: str, attn_kinds=DSV4_FLASH_ATTN_KINDS):
+    return _build_dsv4_module_test_cases(mode, attn_kinds, model_path=_dsv4_flash_model_path())
+
+
+def _build_dsv4_pro_module_test_cases(mode: str, attn_kinds=DSV4_FLASH_ATTN_KINDS):
+    return _build_dsv4_module_test_cases(mode, attn_kinds, model_path=_dsv4_pro_model_path())
 
 
 def get_dsv4_flash_csa_context_test_cases():
@@ -950,10 +994,34 @@ def get_dsv4_flash_hca_generation_test_cases():
     return _build_dsv4_flash_module_test_cases("generation", ("hca",))
 
 
+def get_dsv4_pro_csa_context_test_cases():
+    if not _dsv4_pro_active():
+        return []
+    return _build_dsv4_pro_module_test_cases("context", ("csa",))
+
+
+def get_dsv4_pro_hca_context_test_cases():
+    if not _dsv4_pro_active():
+        return []
+    return _build_dsv4_pro_module_test_cases("context", ("hca",))
+
+
+def get_dsv4_pro_csa_generation_test_cases():
+    if not _dsv4_pro_active():
+        return []
+    return _build_dsv4_pro_module_test_cases("generation", ("csa",))
+
+
+def get_dsv4_pro_hca_generation_test_cases():
+    if not _dsv4_pro_active():
+        return []
+    return _build_dsv4_pro_module_test_cases("generation", ("hca",))
+
+
 # --- Sparse-kernel sweep (paged_mqa_logits / hca_attn) ---
 # Strict superset of the module collector's (bs, sl) coverage.  Every
 # (bs, isl) the module collector exercises is included with past_kv=0;
-# on top of that we add past_kv>0 variants for kernel-level Δ correction.
+# on top of that we add past_kv>0 variants for kernel-level delta correction.
 _DSV4_FLASH_SPARSE_BS_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 _DSV4_FLASH_SPARSE_ISL_LIST = [
     1,
@@ -1005,16 +1073,16 @@ _DSV4_FLASH_SPARSE_CHUNK_PREFILL_SIZE = 8192  # bs x isl per-chunk new-token bud
 _DSV4_FLASH_SPARSE_MAX_FULL_S = 1048576  # max_position_embeddings
 # Sparse kernels are TP-invariant:
 #   * paged_mqa_logits: ReplicatedLinear indexer (no sharding)
-#   * hca_attn:       FlashMLA gets h_q=64 on every rank (sglang zero-pads
+#   * hca_attn:       FlashMLA gets native h_q on every rank (sglang zero-pads
 #                     Q to N_HEADS_Q before the kernel call), no GEMM in
-#                     the bench path → kernel time is identical across TP
-# Module-level ops still sweep all 4 TP values because their projections
+#                     the bench path; kernel time is identical across TP
+# Module-level ops still sweep all configured TP values because their projections
 # (q_a/q_b/o_proj) are 1/N sharded by ColumnParallel/RowParallel.
 _DSV4_FLASH_SPARSE_TP_LIST_ATTN = [1]
 _DSV4_FLASH_SPARSE_TP_LIST_INDEXER = [1]
 
 # Bench-sampled sparse kernels.  topk_512 + csa_attn are modeled analytically
-# in perf_database — see KERNELS comment in deepseekv4_sparse_modules.py.
+# in perf_database; see KERNELS comment in deepseekv4_sparse_modules.py.
 DSV4_FLASH_SPARSE_KERNELS = ("paged_mqa_logits", "hca_attn")
 
 
@@ -1029,8 +1097,8 @@ def _build_dsv4_flash_sparse_test_cases(
     """Generate ``(bs, isl, past_kv, tp_size, kernel, model)`` tuples.
 
     Filters mirror sglang prefill scheduler:
-      * bs x isl ≤ chunked_prefill_size = 8192   — new-token budget per chunk
-      * bs x (isl + past_kv) ≤ 1M                — model context cap
+      * bs x isl <= chunked_prefill_size = 8192: new-token budget per chunk
+      * bs x (isl + past_kv) <= 1M: model context cap
     """
     bs_list = list(bs_list) if bs_list is not None else list(_DSV4_FLASH_SPARSE_BS_LIST)
     isl_list = list(isl_list) if isl_list is not None else list(_DSV4_FLASH_SPARSE_ISL_LIST)
@@ -1068,6 +1136,41 @@ def _build_dsv4_flash_sparse_test_cases(
     return cases
 
 
+def _build_dsv4_pro_sparse_test_cases(
+    kernels=DSV4_FLASH_SPARSE_KERNELS,
+    bs_list=None,
+    isl_list=None,
+    past_kv_list=None,
+    tp_list_attn=None,
+    tp_list_indexer=None,
+):
+    """Generate V4-Pro ``(bs, isl, past_kv, tp_size, kernel, model)`` tuples."""
+    bs_list = list(bs_list) if bs_list is not None else list(_DSV4_FLASH_SPARSE_BS_LIST)
+    isl_list = list(isl_list) if isl_list is not None else list(_DSV4_FLASH_SPARSE_ISL_LIST)
+    past_kv_list = list(past_kv_list) if past_kv_list is not None else list(_DSV4_FLASH_SPARSE_PAST_KV_LIST)
+    tp_list_attn = list(tp_list_attn) if tp_list_attn is not None else list(_DSV4_FLASH_SPARSE_TP_LIST_ATTN)
+    tp_list_indexer = list(tp_list_indexer) if tp_list_indexer is not None else list(_DSV4_FLASH_SPARSE_TP_LIST_INDEXER)
+    model_path = _dsv4_pro_model_path()
+
+    cases = []
+    for kernel in kernels:
+        tp_list = tp_list_attn if kernel == "hca_attn" else tp_list_indexer
+        for tp_size in tp_list:
+            for bs in bs_list:
+                for isl in isl_list:
+                    if bs * isl > _DSV4_FLASH_SPARSE_CHUNK_PREFILL_SIZE:
+                        continue
+                    for past_kv in past_kv_list:
+                        if bs * (isl + past_kv) > _DSV4_FLASH_SPARSE_MAX_FULL_S:
+                            continue
+                        full_s = isl + past_kv
+                        if kernel == "paged_mqa_logits" and full_s < 4:
+                            continue
+                        if kernel == "hca_attn" and full_s < 64:
+                            continue
+                        cases.append([bs, isl, past_kv, tp_size, kernel, model_path])
+    return cases
+
 def _dsv4_flash_sparse_smoke_or_full(kernel: str):
     if not _dsv4_flash_active():
         return []
@@ -1084,3 +1187,21 @@ def get_dsv4_flash_paged_mqa_logits_test_cases():
 def get_dsv4_flash_hca_attn_test_cases():
     """hca_attn sparse-kernel sweep (HCA c128 sparse FMLA)."""
     return _dsv4_flash_sparse_smoke_or_full("hca_attn")
+
+
+def _dsv4_pro_sparse_smoke_or_full(kernel: str):
+    if not _dsv4_pro_active():
+        return []
+    if "--smoke" in sys.argv:
+        return [[1, 1024, 8192, 1, kernel, _dsv4_pro_model_path()]]
+    return _build_dsv4_pro_sparse_test_cases(kernels=(kernel,))
+
+
+def get_dsv4_pro_paged_mqa_logits_test_cases():
+    """paged_mqa_logits sparse-kernel sweep (CSA indexer scoring)."""
+    return _dsv4_pro_sparse_smoke_or_full("paged_mqa_logits")
+
+
+def get_dsv4_pro_hca_attn_test_cases():
+    """hca_attn sparse-kernel sweep (HCA c128 sparse FMLA)."""
+    return _dsv4_pro_sparse_smoke_or_full("hca_attn")

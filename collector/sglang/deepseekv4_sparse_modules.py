@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
+import json
 import logging
 import math
 import multiprocessing as mp
@@ -123,6 +124,25 @@ def get_dsv4_flash_hca_attn_test_cases():
     return _impl()
 
 
+def get_dsv4_pro_paged_mqa_logits_test_cases():
+    from collector.common_test_cases import get_dsv4_pro_paged_mqa_logits_test_cases as _impl
+
+    supported, reason = _dsv4_sparse_kernel_support_status("paged_mqa_logits")
+    if not supported:
+        logger.warning("Skipping dsv4 sparse kernel paged_mqa_logits: %s", reason)
+        return []
+    return _impl()
+
+
+def get_dsv4_pro_hca_attn_test_cases():
+    from collector.common_test_cases import get_dsv4_pro_hca_attn_test_cases as _impl
+
+    supported, reason = _dsv4_sparse_kernel_support_status("hca_attn")
+    if not supported:
+        logger.warning("Skipping dsv4 sparse kernel hca_attn: %s", reason)
+        return []
+    return _impl()
+
 __all__ = [
     "DEFAULT_BS_LIST",
     "DEFAULT_ISL_LIST",
@@ -133,6 +153,8 @@ __all__ = [
     "_build_sparse_test_cases",
     "get_dsv4_flash_hca_attn_test_cases",
     "get_dsv4_flash_paged_mqa_logits_test_cases",
+    "get_dsv4_pro_hca_attn_test_cases",
+    "get_dsv4_pro_paged_mqa_logits_test_cases",
     "run_dsv4_sparse_kernel_worker",
 ]
 
@@ -167,6 +189,34 @@ PAGE_SIZE_C128 = PAGE_SIZE_MODEL // 128  # c128 extra cache page size (=2)
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 DEFAULT_ARCHITECTURE = "DeepseekV4ForCausalLM"
+_MODEL_CONFIG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "src",
+    "aiconfigurator",
+    "model_configs",
+)
+
+
+def _load_aic_cached_model_config(model_id: str) -> dict | None:
+    config_file = os.path.join(_MODEL_CONFIG_DIR, f"{model_id.replace('/', '--')}_config.json")
+    if not os.path.isfile(config_file):
+        return None
+    with open(config_file) as f:
+        return json.load(f)
+
+
+def _dsv4_num_attention_heads(model_path: str) -> int:
+    if os.path.isdir(model_path):
+        config_file = os.path.join(model_path, "config.json")
+        if os.path.isfile(config_file):
+            with open(config_file) as f:
+                return int(json.load(f).get("num_attention_heads", 64))
+    cached_config = _load_aic_cached_model_config(model_path)
+    if cached_config is not None:
+        return int(cached_config.get("num_attention_heads", 64))
+    return 128 if "Pro" in model_path else 64
+
+
 _HCA_TORCH_FALLBACK_ENV = "COLLECTOR_DSV4_HCA_TORCH_FALLBACK"
 
 
@@ -278,6 +328,21 @@ KERNEL_TO_DEFAULT_FILENAME = {
     "paged_mqa_logits": "dsv4_flash_paged_mqa_logits_module_perf.txt",
     "hca_attn": "dsv4_flash_hca_attn_module_perf.txt",
 }
+
+
+def _dsv4_family_from_model_or_path(model_path: str, perf_filename: str | None = None) -> str:
+    basename = os.path.basename(perf_filename or "")
+    if basename.startswith("dsv4_pro") or "Pro" in model_path:
+        return "dsv4_pro"
+    return "dsv4_flash"
+
+
+def _kernel_op_name(kernel: str, family: str) -> str:
+    return f"{family}_{kernel}_module"
+
+
+def _kernel_default_filename(kernel: str, family: str) -> str:
+    return f"{family}_{kernel}_module_perf.txt"
 
 
 def _dsv4_sparse_kernel_support_status(kernel: str) -> tuple[bool, str]:
@@ -854,9 +919,9 @@ _BENCH_FN = {
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _make_perf_filename(kernel: str, output_path: str) -> str:
+def _make_perf_filename(kernel: str, output_path: str, family: str = "dsv4_flash") -> str:
     if os.path.isdir(output_path) or not output_path.endswith(".txt"):
-        return os.path.join(output_path, KERNEL_TO_DEFAULT_FILENAME[kernel])
+        return os.path.join(output_path, _kernel_default_filename(kernel, family))
     return output_path
 
 
@@ -873,6 +938,7 @@ def _write_row(
     model_path: str = DEFAULT_MODEL,
     architecture: str = DEFAULT_ARCHITECTURE,
     power_stats: dict | None = None,
+    family: str = "dsv4_flash",
 ) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(perf_filename)) or ".", exist_ok=True)
 
@@ -900,7 +966,7 @@ def _write_row(
         framework="SGLang",
         version="kernel-level",
         device_name=device_name,
-        op_name=KERNEL_TO_OP_NAME[kernel],
+        op_name=_kernel_op_name(kernel, family),
         kernel_source=KERNEL_TO_KERNEL_SOURCE[kernel],
         perf_filename=perf_filename,
         power_stats=power_stats,
@@ -946,7 +1012,11 @@ def run_dsv4_sparse_kernel_worker(
     # one op — always derive the directory from the bound path and dispatch
     # to ``dsv4_flash_{kernel}_module_perf.txt`` per the case's ``kernel``.
     output_dir = os.path.dirname(perf_filename) or os.getcwd()
-    perf_path = _make_perf_filename(kernel, output_dir)
+    family = _dsv4_family_from_model_or_path(model_path, perf_filename)
+    perf_path = _make_perf_filename(kernel, output_dir, family)
+
+    global N_HEADS_Q
+    N_HEADS_Q = _dsv4_num_attention_heads(model_path)
 
     M = bs * isl  # noqa: N806
     print(f"[dsv4-sparse {kernel}] bs={bs} isl={isl} past_kv={past_kv} tp={tp_size} (M={M}) → {perf_path}")
@@ -985,6 +1055,7 @@ def run_dsv4_sparse_kernel_worker(
         device_name=device_name,
         model_path=model_path,
         power_stats=power_stats,
+        family=family,
     )
     power_str = f", power={power_stats['power']:.1f}W" if power_stats and power_stats.get("power") is not None else ""
     backend_str = f", backend={backend_name}" if backend_name else ""
@@ -1038,7 +1109,7 @@ def main():
     print(f"Running {len(cases)} sparse-kernel test cases on {args.device}")
     for case in cases:
         bs, isl, past_kv, tp, kernel = case[:5]
-        perf_path = _make_perf_filename(kernel, args.output_path)
+        perf_path = _make_perf_filename(kernel, args.output_path, _dsv4_family_from_model_or_path(args.model_path))
         run_dsv4_sparse_kernel_worker(
             bs,
             isl,

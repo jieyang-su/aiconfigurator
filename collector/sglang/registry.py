@@ -139,6 +139,50 @@ REGISTRY: list[OpEntry] = [
         run_func="run_dsv4_sparse_kernel_worker",
         perf_filename=PerfFile.DSV4_FLASH_HCA_ATTN_MODULE,
     ),
+    # V4-Pro uses the same SGLang DSV4 operators as V4-Flash, with Pro-specific
+    # model dimensions (128 attention heads and index_topk=1024).
+    OpEntry(
+        op="dsv4_pro_csa_context_module",
+        module="collector.sglang.collect_dsv4_flash_attn",
+        get_func="get_dsv4_pro_csa_context_test_cases",
+        run_func="run_dsv4_flash_attn_worker",
+        perf_filename=PerfFile.DSV4_PRO_CSA_CONTEXT_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_pro_hca_context_module",
+        module="collector.sglang.collect_dsv4_flash_attn",
+        get_func="get_dsv4_pro_hca_context_test_cases",
+        run_func="run_dsv4_flash_attn_worker",
+        perf_filename=PerfFile.DSV4_PRO_HCA_CONTEXT_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_pro_csa_generation_module",
+        module="collector.sglang.collect_dsv4_flash_attn",
+        get_func="get_dsv4_pro_csa_generation_test_cases",
+        run_func="run_dsv4_flash_attn_worker",
+        perf_filename=PerfFile.DSV4_PRO_CSA_GENERATION_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_pro_hca_generation_module",
+        module="collector.sglang.collect_dsv4_flash_attn",
+        get_func="get_dsv4_pro_hca_generation_test_cases",
+        run_func="run_dsv4_flash_attn_worker",
+        perf_filename=PerfFile.DSV4_PRO_HCA_GENERATION_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_pro_paged_mqa_logits_module",
+        module="collector.sglang.deepseekv4_sparse_modules",
+        get_func="get_dsv4_pro_paged_mqa_logits_test_cases",
+        run_func="run_dsv4_sparse_kernel_worker",
+        perf_filename=PerfFile.DSV4_PRO_PAGED_MQA_LOGITS_MODULE,
+    ),
+    OpEntry(
+        op="dsv4_pro_hca_attn_module",
+        module="collector.sglang.deepseekv4_sparse_modules",
+        get_func="get_dsv4_pro_hca_attn_test_cases",
+        run_func="run_dsv4_sparse_kernel_worker",
+        perf_filename=PerfFile.DSV4_PRO_HCA_ATTN_MODULE,
+    ),
     OpEntry(
         op="wideep_moe",
         module="collector.sglang.collect_wideep_deepep_moe",

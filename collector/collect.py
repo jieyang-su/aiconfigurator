@@ -1205,9 +1205,15 @@ def main():
         # MoE, and mHC.  All other models keep the default behaviour: run
         # every op and let each get_func's ``_filter_model_config_list``
         # filter cases at the test-case level.
-        if args.ops is None and args.model_path == "sgl-project/DeepSeek-V4-Flash-FP8":
-            dsv4_flash_ops = [name for name in _all_op_names() if name.startswith("dsv4_flash_")]
-            ops = dsv4_flash_ops + ["gemm", "moe", "mhc_module"]
+        if args.ops is None and args.model_path in {
+            "deepseek-ai/DeepSeek-V4-Flash",
+            "deepseek-ai/DeepSeek-V4-Pro",
+            "sgl-project/DeepSeek-V4-Flash-FP8",
+            "sgl-project/DeepSeek-V4-Pro-FP8",
+        }:
+            dsv4_prefix = "dsv4_pro_" if "Pro" in args.model_path else "dsv4_flash_"
+            dsv4_ops = [name for name in _all_op_names() if name.startswith(dsv4_prefix)]
+            ops = dsv4_ops + ["gemm", "moe", "mhc_module"]
             _dsv4_auto_expand = True
     else:
         os.environ.pop("COLLECTOR_MODEL_PATH", None)
@@ -1218,7 +1224,7 @@ def main():
         # Use short label when V4-Flash auto-expanded ops to several names
         # (the joined scope may exceed Linux filename length limit).
         if _dsv4_auto_expand:
-            log_scope = ["dsv4_flash"]
+            log_scope = ["dsv4_pro" if args.model_path and "Pro" in args.model_path else "dsv4_flash"]
         else:
             log_scope = ops if ops else ["all"]
         logger = setup_logging(scope=log_scope, debug=args.debug)

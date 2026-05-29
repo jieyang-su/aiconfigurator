@@ -1652,11 +1652,21 @@ def _dsv4_normalize_dtype(name: str) -> str:
 # When sglang eventually adds real V4 head sharding, drop this special-case
 # and the generic ``local_heads`` axis will work directly.
 DSV4_FLASH_NATIVE_HEADS = 64
+DSV4_PRO_NATIVE_HEADS = 128
 
 
-def _dsv4_flash_tp_from_num_heads(num_heads: int) -> int:
+def _dsv4_tp_from_num_heads(num_heads: int, native_num_heads: int | None = None) -> int:
     """Recover ``tp_size`` from the model layer's ``local_heads`` value."""
-    return max(1, DSV4_FLASH_NATIVE_HEADS // max(num_heads, 1))
+    native_heads = native_num_heads or DSV4_FLASH_NATIVE_HEADS
+    return max(1, native_heads // max(num_heads, 1))
+
+
+def _dsv4_select_native_heads(data, native_num_heads: int | None):
+    """Select the native-head axis when split V4 Flash/Pro data is present."""
+    native_heads = native_num_heads or DSV4_FLASH_NATIVE_HEADS
+    if isinstance(data, dict) and native_heads in data:
+        return data[native_heads]
+    return data
 
 
 def _dsv4_flash_robust_3d_lookup(self, dict_, x, y, z, *, batch_axis: str = "z"):
@@ -1792,7 +1802,7 @@ def load_context_dsv4_flash_kind_module_data(file_path: str):
             return defaultdict()
         return defaultdict(lambda d=depth: _make_nested(d - 1))
 
-    data = _make_nested(7)
+    data = _make_nested(8)
     has_power = bool(rows) and "power" in rows[0]
 
     for row in rows:
@@ -1802,6 +1812,7 @@ def load_context_dsv4_flash_kind_module_data(file_path: str):
             b = int(row["batch_size"])
             s = int(row["isl"])
             tp_size = int(row.get("tp_size", 1))
+            native_heads = int(row.get("num_heads", DSV4_FLASH_NATIVE_HEADS))
             cr = int(row["compress_ratio"])
             latency = float(row["latency"])
         except (TypeError, ValueError, KeyError):
@@ -1816,7 +1827,7 @@ def load_context_dsv4_flash_kind_module_data(file_path: str):
         # V4-Flash: TP doesn't shard heads (h_q=64 on every rank), so the
         # row-distinguishing axis is ``tp_size`` itself.  Query side recovers
         # this via ``_dsv4_flash_tp_from_num_heads``.  See top-of-file note.
-        data[fmha_mode][kv_dtype][gemm_mode][arch][cr][tp_size][s][b] = {
+        data[fmha_mode][kv_dtype][gemm_mode][arch][cr][native_heads][tp_size][s][b] = {
             "latency": latency,
             "power": power,
             "energy": power * latency,
@@ -1846,7 +1857,7 @@ def load_generation_dsv4_flash_kind_module_data(file_path: str):
             return defaultdict()
         return defaultdict(lambda d=depth: _make_nested(d - 1))
 
-    data = _make_nested(6)
+    data = _make_nested(7)
     has_power = bool(rows) and "power" in rows[0]
 
     for row in rows:
@@ -1856,6 +1867,7 @@ def load_generation_dsv4_flash_kind_module_data(file_path: str):
             b = int(row["batch_size"])
             s_total = int(row["isl"]) + int(row["step"])
             tp_size = int(row.get("tp_size", 1))
+            native_heads = int(row.get("num_heads", DSV4_FLASH_NATIVE_HEADS))
             cr = int(row["compress_ratio"])
             latency = float(row["latency"])
         except (TypeError, ValueError, KeyError):
@@ -1870,7 +1882,7 @@ def load_generation_dsv4_flash_kind_module_data(file_path: str):
         # at the top of the file.  Generation convention puts ``b`` before
         # ``s_total`` (matches existing ``_interp_3d(num_heads, b, s, ...)``
         # call order in ``query_generation_*``).
-        data[kv_dtype][gemm_mode][arch][cr][tp_size][b][s_total] = {
+        data[kv_dtype][gemm_mode][arch][cr][native_heads][tp_size][b][s_total] = {
             "latency": latency,
             "power": power,
             "energy": power * latency,
@@ -1908,7 +1920,7 @@ def load_dsv4_flash_sparse_kernel_data(file_path: str):
         logger.debug(f"DSV4-Flash sparse-kernel data file {file_path} not found.")
         return None
 
-    data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict()))))
+    data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))))
 
     for row in rows:
         # Skip duplicate header rows (file may be appended to across runs)
@@ -1919,11 +1931,12 @@ def load_dsv4_flash_sparse_kernel_data(file_path: str):
             isl = int(row["isl"])
             past_kv = int(row["step"])
             tp_size = int(row.get("tp_size", 1))
+            native_heads = int(row.get("num_heads", DSV4_FLASH_NATIVE_HEADS))
             latency = float(row["latency"])
         except (TypeError, ValueError):
             continue
         arch = row.get("architecture", "DeepseekV4ForCausalLM")
-        data[arch][tp_size][past_kv][isl][bs] = {"latency": latency}
+        data[arch][native_heads][tp_size][past_kv][isl][bs] = {"latency": latency}
 
     return data
 
@@ -2900,8 +2913,14 @@ class PerfDatabase:
                 PerfDataFilename.dsv4_flash_hca_context_module: load_context_dsv4_flash_kind_module_data,
                 PerfDataFilename.dsv4_flash_csa_generation_module: load_generation_dsv4_flash_kind_module_data,
                 PerfDataFilename.dsv4_flash_hca_generation_module: load_generation_dsv4_flash_kind_module_data,
+                PerfDataFilename.dsv4_pro_csa_context_module: load_context_dsv4_flash_kind_module_data,
+                PerfDataFilename.dsv4_pro_hca_context_module: load_context_dsv4_flash_kind_module_data,
+                PerfDataFilename.dsv4_pro_csa_generation_module: load_generation_dsv4_flash_kind_module_data,
+                PerfDataFilename.dsv4_pro_hca_generation_module: load_generation_dsv4_flash_kind_module_data,
                 PerfDataFilename.dsv4_flash_paged_mqa_logits_module: load_dsv4_flash_sparse_kernel_data,
                 PerfDataFilename.dsv4_flash_hca_attn_module: load_dsv4_flash_sparse_kernel_data,
+                PerfDataFilename.dsv4_pro_paged_mqa_logits_module: load_dsv4_flash_sparse_kernel_data,
+                PerfDataFilename.dsv4_pro_hca_attn_module: load_dsv4_flash_sparse_kernel_data,
             }
             perf_data_dir = data_dir
             op_filename = op_filename_enum.value
@@ -2982,10 +3001,14 @@ class PerfDatabase:
         ctx_split = [
             _load_op_data(PerfDataFilename.dsv4_flash_csa_context_module),
             _load_op_data(PerfDataFilename.dsv4_flash_hca_context_module),
+            _load_op_data(PerfDataFilename.dsv4_pro_csa_context_module),
+            _load_op_data(PerfDataFilename.dsv4_pro_hca_context_module),
         ]
         gen_split = [
             _load_op_data(PerfDataFilename.dsv4_flash_csa_generation_module),
             _load_op_data(PerfDataFilename.dsv4_flash_hca_generation_module),
+            _load_op_data(PerfDataFilename.dsv4_pro_csa_generation_module),
+            _load_op_data(PerfDataFilename.dsv4_pro_hca_generation_module),
         ]
         self._context_deepseek_v4_attention_module_data = _load_dsv4_flash_split(ctx_split) or _load_op_data(
             PerfDataFilename.deepseek_v4_context_module
@@ -3000,8 +3023,18 @@ class PerfDatabase:
         # V4-Flash sparse-kernel data (kernel-level past_kv Δ correction).
         # Dict keyed by ``arch -> tp -> past_kv -> isl -> bs``.
         self._dsv4_flash_sparse_kernel_data = {
-            "paged_mqa_logits": _load_op_data(PerfDataFilename.dsv4_flash_paged_mqa_logits_module),
-            "hca_attn": _load_op_data(PerfDataFilename.dsv4_flash_hca_attn_module),
+            "paged_mqa_logits": _load_dsv4_flash_split(
+                [
+                    _load_op_data(PerfDataFilename.dsv4_flash_paged_mqa_logits_module),
+                    _load_op_data(PerfDataFilename.dsv4_pro_paged_mqa_logits_module),
+                ]
+            ),
+            "hca_attn": _load_dsv4_flash_split(
+                [
+                    _load_op_data(PerfDataFilename.dsv4_flash_hca_attn_module),
+                    _load_op_data(PerfDataFilename.dsv4_pro_hca_attn_module),
+                ]
+            ),
         }
 
         # sglang wideep path
@@ -7662,6 +7695,7 @@ class PerfDatabase:
         past_kv: int,
         tp_size: int,
         architecture: str = "DeepseekV4ForCausalLM",
+        native_num_heads: int | None = None,
     ) -> Optional[float]:
         """Look up a sparse-kernel latency at (kernel, bs, isl, past_kv, tp).
 
@@ -7681,7 +7715,8 @@ class PerfDatabase:
         per_arch = loaded.data
         if architecture not in per_arch:
             return None
-        per_tp = per_arch[architecture]
+        per_native = per_arch[architecture]
+        per_tp = _dsv4_select_native_heads(per_native, native_num_heads)
         if tp_size in per_tp:
             per_tp_dict = per_tp[tp_size]
         elif 1 in per_tp:
@@ -7935,6 +7970,7 @@ class PerfDatabase:
         *,
         prefix: int = 0,
         architecture: str = "DeepseekV4ForCausalLM",
+        native_num_heads: int | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
         def get_sol() -> tuple[float, float, float]:
             return self._deepseek_v4_attention_sol(
@@ -7978,14 +8014,17 @@ class PerfDatabase:
                     f"DeepSeek-V4 context attention module data not loaded for system='{self.system}', "
                     f"backend='{self.backend}', version='{self.version}'."
                 )
-            deepseek_v4_dict = data[fmha_quant_mode][kvcache_quant_mode][gemm_quant_mode][architecture][compress_ratio]
+            native_axis = native_num_heads or DSV4_FLASH_NATIVE_HEADS
+            deepseek_v4_dict = _dsv4_select_native_heads(
+                data[fmha_quant_mode][kvcache_quant_mode][gemm_quant_mode][architecture][compress_ratio], native_axis
+            )
             # V4-Flash special-case: data is keyed by ``tp_size`` (sglang
             # never splits attention heads, so the "post-TP local_heads"
             # value the model layer passes here is just a label — recover
             # the actual tp_size for the lookup).  Other architectures are
             # unaffected; this branch only fires for DeepseekV4ForCausalLM.
             head_axis = (
-                _dsv4_flash_tp_from_num_heads(num_heads) if architecture == "DeepseekV4ForCausalLM" else num_heads
+                _dsv4_tp_from_num_heads(num_heads, native_num_heads) if architecture == "DeepseekV4ForCausalLM" else num_heads
             )
 
             # Pick correction strategy up-front because it changes the lookup
@@ -8006,6 +8045,7 @@ class PerfDatabase:
                     past_kv=prefix,
                     tp_size=head_axis,
                     architecture=architecture,
+                    native_num_heads=native_axis,
                 )
                 t_without = self._lookup_dsv4_flash_sparse_kernel(
                     kernel=kernel,
@@ -8014,6 +8054,7 @@ class PerfDatabase:
                     past_kv=0,
                     tp_size=head_axis,
                     architecture=architecture,
+                    native_num_heads=native_axis,
                 )
                 if t_with is None or t_without is None:
                     raise PerfDataNotAvailableError(
@@ -8033,6 +8074,7 @@ class PerfDatabase:
                         raw_dict = raw_data[fmha_quant_mode][kvcache_quant_mode][gemm_quant_mode][architecture][
                             compress_ratio
                         ]
+                        raw_dict = _dsv4_select_native_heads(raw_dict, native_axis)
                     except KeyError:
                         raw_dict = None
                 result = self._interp_context_topk_piecewise_from_raw(
@@ -8132,6 +8174,7 @@ class PerfDatabase:
         database_mode: common.DatabaseMode | None = None,
         *,
         architecture: str = "DeepseekV4ForCausalLM",
+        native_num_heads: int | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
         def get_sol() -> tuple[float, float, float]:
             return self._deepseek_v4_attention_sol(
@@ -8175,11 +8218,14 @@ class PerfDatabase:
                     f"DeepSeek-V4 generation attention module data not loaded for system='{self.system}', "
                     f"backend='{self.backend}', version='{self.version}'."
                 )
-            deepseek_v4_dict = data[kvcache_quant_mode][gemm_quant_mode][architecture][compress_ratio]
+            native_axis = native_num_heads or DSV4_FLASH_NATIVE_HEADS
+            deepseek_v4_dict = _dsv4_select_native_heads(
+                data[kvcache_quant_mode][gemm_quant_mode][architecture][compress_ratio], native_axis
+            )
             # V4-Flash special-case: data keyed by ``tp_size`` (heads aren't
             # actually sharded — see note at top of file).
             head_axis = (
-                _dsv4_flash_tp_from_num_heads(num_heads) if architecture == "DeepseekV4ForCausalLM" else num_heads
+                _dsv4_tp_from_num_heads(num_heads, native_num_heads) if architecture == "DeepseekV4ForCausalLM" else num_heads
             )
             # V4-Flash generation data is keyed as [tp_size][batch][s_total].
             result = (
