@@ -630,7 +630,7 @@ def _load_model_runner(
     )
     fp4_experts_override = _dsv4_fp4_experts_override(model_path)
     with contextlib.ExitStack() as stack:
-        if fp4_experts_override is not None:
+        if fp4_experts_override is not None and hasattr(envs, "SGLANG_DSV4_FP4_EXPERTS"):
             stack.enter_context(envs.SGLANG_DSV4_FP4_EXPERTS.override(fp4_experts_override))
             print(f"[dsv4-collector] SGLANG_DSV4_FP4_EXPERTS={fp4_experts_override}")
 
