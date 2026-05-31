@@ -940,9 +940,11 @@ def collect_sglang(
 
     try:
         from importlib.metadata import version as get_version
+        from collector.sglang.version_compat import sglang_version_branch
 
         version = get_version("sglang")
         logger.info(f"SGLang version: {version}")
+        logger.info(f"SGLang collector branch: {sglang_version_branch()}")
     except Exception:
         logger.exception("SGLang is not installed")
         return
@@ -1169,9 +1171,19 @@ def main():
         action="store_true",
         help="Profile the collector run and save output ",
     )
+    parser.add_argument(
+        "--sglang-version-branch",
+        choices=["auto", "legacy", "current", "v0.5.10", "0.5.10", "main", "adapted"],
+        default="auto",
+        help="SGLang API branch for AIC compatibility. Use 'legacy' or "
+        "'v0.5.10' for sglang-v0.5.10; use 'current' or 'main' for the "
+        "adapted sglang tree. Default: auto-detect.",
+    )
     args = parser.parse_args()
     ops = args.ops
     _dsv4_auto_expand = False
+
+    os.environ["COLLECTOR_SGLANG_VERSION_BRANCH"] = args.sglang_version_branch
 
     if args.model_path:
         from collector.common_test_cases import get_all_model_names

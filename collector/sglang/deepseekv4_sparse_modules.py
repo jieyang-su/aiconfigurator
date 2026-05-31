@@ -51,9 +51,11 @@ logger = logging.getLogger(__name__)
 
 try:
     from collector.sglang.helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
+    from collector.sglang.version_compat import paged_mqa_seq_lens, sglang_version_branch
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
+    from version_compat import paged_mqa_seq_lens, sglang_version_branch
 
 # Re-export test case generators from the centralised common_test_cases
 # module so collect.py's registry can resolve them via getattr on this module.
@@ -355,6 +357,8 @@ def _dsv4_sparse_kernel_support_status(kernel: str) -> tuple[bool, str]:
             if major >= 12:
                 if _has_sglang_sm120_flash_mla_impl():
                     return True, "supported via sglang SM120 flash_mla fallback"
+                if sglang_version_branch() == "legacy":
+                    return True, "supported via AIC torch fallback for legacy SM120 runtime"
                 return False, "SM120 requires sglang flash_mla SM120 fallback support in the installed runtime"
             if major not in (9, 10, 11):
                 return False, f"flash_mla_with_kvcache requires Hopper/Blackwell-class GPU; got compute capability major={major}"
@@ -593,10 +597,11 @@ def _bench_paged_mqa_logits(M: int, past_kv: int, *, batch_size: int = 1, device
     block_table = torch.arange(blocks_per_req, dtype=torch.int32, device=device)
     block_table = block_table.unsqueeze(0).expand(b, blocks_per_req).contiguous()
 
-    schedule_meta = get_paged_mqa_logits_metadata(context_lens, block_kv, _device_num_sms(device))
+    kernel_seq_lens = paged_mqa_seq_lens(context_lens)
+    schedule_meta = get_paged_mqa_logits_metadata(kernel_seq_lens, block_kv, _device_num_sms(device))
 
     def kernel_fn():
-        return fp8_paged_mqa_logits(q, kv_in, weights, context_lens, block_table, schedule_meta, int(full_c4), False)
+        return fp8_paged_mqa_logits(q, kv_in, weights, kernel_seq_lens, block_table, schedule_meta, int(full_c4), False)
 
     return _bench_cuda_graph(kernel_fn, device=device)
 
@@ -877,7 +882,14 @@ def _bench_hca_attn_torch_subprocess(
 def _bench_hca_attn(M: int, past_kv: int, *, batch_size: int = 1, tp_size: int = 1, device: str = "cuda:0") -> float:  # noqa: N803
     """HCA: each Q attends to all c128 positions (no topk cap)."""
     fallback_policy = _get_hca_torch_fallback_policy()
-    if fallback_policy == "always":
+    if (
+        fallback_policy == "always"
+        or (
+            sglang_version_branch() == "legacy"
+            and _sglang_is_sm120()
+            and not _has_sglang_sm120_flash_mla_impl()
+        )
+    ):
         return _bench_hca_attn_torch(M, past_kv, batch_size=batch_size, device=device)
 
     full_s = M + past_kv
@@ -1085,11 +1097,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-path", default=os.getcwd())
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--sglang-version-branch",
+        choices=["auto", "legacy", "current", "v0.5.10", "0.5.10", "main", "adapted"],
+        default=os.environ.get("COLLECTOR_SGLANG_VERSION_BRANCH", "auto"),
+        help="SGLang API branch. Use legacy/v0.5.10 for sglang-v0.5.10.",
+    )
     return parser
 
 
 def main():
     args = _build_arg_parser().parse_args()
+    os.environ["COLLECTOR_SGLANG_VERSION_BRANCH"] = args.sglang_version_branch
 
     if args.kernel == "all":
         kernels = list(KERNELS)

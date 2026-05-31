@@ -56,9 +56,14 @@ os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
 
 try:
     from helper import benchmark_with_power, log_perf, resolve_subprocess_visible_device
+    from collector.sglang.version_compat import (
+        build_forward_batch,
+        maybe_forward_context,
+    )
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from helper import benchmark_with_power, log_perf, resolve_subprocess_visible_device
+    from version_compat import build_forward_batch, maybe_forward_context
 
 
 # Re-export test case generators from the dedicated test_cases module so
@@ -793,7 +798,6 @@ def _build_forward_batch(model_runner, batch_size: int, seq_len: int, *, is_pref
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.chunk_cache import ChunkCache
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     model_runner.req_to_token_pool.clear()
@@ -845,8 +849,7 @@ def _build_forward_batch(model_runner, batch_size: int, seq_len: int, *, is_pref
         if saved_alloc_extend is not None:
             allocator.alloc_extend = saved_alloc_extend
 
-    model_worker_batch = batch.get_model_worker_batch()
-    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    forward_batch = build_forward_batch(batch, model_runner)
     model_runner.attn_backend.init_forward_metadata(forward_batch)
     return forward_batch
 
@@ -1079,11 +1082,12 @@ def run_dsv4_mla_module(
                     )
 
                     def kernel_func():
-                        return attention_module(
-                            x=hidden_states,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                        )
+                        with maybe_forward_context(model_runner):
+                            return attention_module(
+                                x=hidden_states,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                            )
 
                     stats = _bench_cuda_events(
                         kernel_func,
@@ -1174,6 +1178,8 @@ def run_dsv4_mla_module(
             f"[WARN] dsv4-flash {sweep_label}: SWEEP SUMMARY - {len(skipped_shapes)} of "
             f"{len(skipped_shapes) + len(results)} shapes failed: {skipped_str}"
         )
+    if skipped_shapes and not results:
+        raise RuntimeError(f"dsv4-flash {sweep_label} produced no perf rows")
     return results
 
 
@@ -1459,11 +1465,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "native h_q (V4 zero-pads), so any TP power-of-2 in [1, 32] is valid."
         ),
     )
+    parser.add_argument(
+        "--sglang-version-branch",
+        choices=["auto", "legacy", "current", "v0.5.10", "0.5.10", "main", "adapted"],
+        default=os.environ.get("COLLECTOR_SGLANG_VERSION_BRANCH", "auto"),
+        help="SGLang API branch. Use legacy/v0.5.10 for sglang-v0.5.10.",
+    )
     return parser
 
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
+    os.environ["COLLECTOR_SGLANG_VERSION_BRANCH"] = args.sglang_version_branch
 
     if args.batch_sizes is not None:
         batch_sizes = _parse_int_list(args.batch_sizes)
