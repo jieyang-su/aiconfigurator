@@ -129,7 +129,7 @@ def _patched_model_dir(model_id: str) -> str:
     original_config = _read_model_config(model_id)
     config = copy.deepcopy(original_config)
 
-    num_layers = int(os.environ.get("SGLANG_TEST_NUM_LAYERS", "2"))
+    num_layers = int(os.environ.get("SGLANG_TEST_NUM_LAYERS", "1"))
     config["num_hidden_layers"] = num_layers  # shrink depth to speed up collector init
     if config.get("architectures") != ["DeepseekV4ForCausalLM"]:
         config["architectures"] = ["DeepseekV4ForCausalLM"]
@@ -138,6 +138,14 @@ def _patched_model_dir(model_id: str) -> str:
     # ``model_type`` to a transformers-known key so AutoConfig succeeds under
     # dummy load_format without requiring a forked transformers build.
     config["model_type"] = "deepseek_v3"
+
+    # mHC benchmarks only call hc_pre/hc_post on the decoder layer. The MoE
+    # block is still constructed and dummy-initialized by SGLang, so keep the
+    # per-expert dimensions intact but shrink the routed expert count to avoid
+    # allocating tens of GiB of unused dummy expert weights.
+    min_experts = 8
+    config["n_routed_experts"] = min(int(config.get("n_routed_experts", min_experts)), min_experts)
+    config["num_experts_per_tok"] = min(int(config.get("num_experts_per_tok", 2)), 2)
 
     tmp_dir = os.path.join(
         tempfile.gettempdir(),

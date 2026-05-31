@@ -50,9 +50,10 @@ import torch
 logger = logging.getLogger(__name__)
 
 try:
-    from collector.sglang.helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
+    from collector.helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
     from collector.sglang.version_compat import paged_mqa_seq_lens, sglang_version_branch
 except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
     from version_compat import paged_mqa_seq_lens, sglang_version_branch
@@ -82,6 +83,7 @@ try:
         _build_dsv4_flash_sparse_test_cases as _build_sparse_test_cases,
     )
 except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from common_test_cases import (
         _DSV4_FLASH_MODEL_PATH as DEFAULT_MODEL,
@@ -144,6 +146,36 @@ def get_dsv4_pro_hca_attn_test_cases():
         logger.warning("Skipping dsv4 sparse kernel hca_attn: %s", reason)
         return []
     return _impl()
+
+
+_DSV4_SPARSE_GETTER_KERNELS = {
+    "get_dsv4_flash_paged_mqa_logits_test_cases": "paged_mqa_logits",
+    "get_dsv4_flash_hca_attn_test_cases": "hca_attn",
+    "get_dsv4_pro_paged_mqa_logits_test_cases": "paged_mqa_logits",
+    "get_dsv4_pro_hca_attn_test_cases": "hca_attn",
+}
+
+
+def __getattr__(name: str):
+    """Defensively expose sparse test-case getters expected by collect.py."""
+    kernel = _DSV4_SPARSE_GETTER_KERNELS.get(name)
+    if kernel is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    def _getter():
+        try:
+            common_test_cases = importlib.import_module("collector.common_test_cases")
+        except ModuleNotFoundError:
+            sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            common_test_cases = importlib.import_module("common_test_cases")
+        supported, reason = _dsv4_sparse_kernel_support_status(kernel)
+        if not supported:
+            logger.warning("Skipping dsv4 sparse kernel %s: %s", kernel, reason)
+            return []
+        return getattr(common_test_cases, name)()
+
+    return _getter
+
 
 __all__ = [
     "DEFAULT_BS_LIST",

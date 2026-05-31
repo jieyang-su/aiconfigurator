@@ -46,6 +46,7 @@ try:
         maybe_forward_context,
     )
 except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from helper import benchmark_with_power, get_sm_version, log_perf, resolve_subprocess_visible_device
     from version_compat import build_forward_batch, maybe_forward_context
