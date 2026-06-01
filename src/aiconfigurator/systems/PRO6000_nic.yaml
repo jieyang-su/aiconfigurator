@@ -1,19 +1,23 @@
-data_dir: data/h20_sxm # relative to systems_dir
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+data_dir: data/PRO6000 # relative to systems_dir
 gpu:
-  mem_bw: 4022000000000 # 4022GB/s
+  mem_bw: 1792000000000 # 1.792TB/s
   mem_bw_empirical_scaling_factor: 0.8 # some nonofficial correction based on observations, you should try to modify based on your own observations
   mem_empirical_constant_latency: 0.000003 # 3us some nonofficial correction based on observations, you should try to modify based on your own observations
   mem_capacity: 103079215104 # 96GiB
-  bfloat16_tc_flops: 148000000000000 # 148TFLOPS
-  int8_tc_flops: 296000000000000 # 296TFLOPS
-  fp8_tc_flops: 296000000000000 # 296TFLOPS
-  power: 500  # Watt
-  sm_version: 90
+  bfloat16_tc_flops: 480000000000000 # 480TFLOPS
+  int8_tc_flops: 960000000000000 # 960TFLOPS
+  fp8_tc_flops: 960000000000000 # 960TFLOPS
+  fp4_tc_flops: 1920000000000000 # 1920TFLOPS
+  power: 600  # Watt
+  sm_version: 120
 
 node:
-  num_gpus_per_node: 8
-  inter_node_bw: 50000000000  # Byte/s per GPU, single direction, 1:1 CX7 per node
-  intra_node_bw: 450000000000  # Byte/s per gpu, single direction
+  num_gpus_per_node: 2
+  inter_node_bw: 50000000000  # Byte/s per GPU, single direction, 1:1 CX7 NDR 400Gb/s per node
+  intra_node_bw: 64000000000  # Byte/s per gpu, single direction (pcie 5.0)
   pcie_bw: 64000000000  # Byte/s, single direction, pcie 5.0
   p2p_latency: 0.00001  # 10us some nonofficial correction based on observations, you should try to modify based on your own observations
 
