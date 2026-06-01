@@ -489,7 +489,7 @@ class VLLMBackend(BaseBackend):
         # max(8192, 4*isl).
         # during the loop, as b, ctx_tokens and system memory are monotonic, we can break the
         # inner loop when the system is oom.
-        b_list = [b for b in b_list_default if b <= max_batch_size]
+        b_list = sorted({b for b in [*b_list_default, max_batch_size] if b <= max_batch_size})
         ctx_tokens_list = self._get_ctx_tokens_list_for_agg_sweep(isl, ctx_stride, enable_chunked_prefill)
 
         results_df = pd.DataFrame(columns=common.ColumnsAgg)

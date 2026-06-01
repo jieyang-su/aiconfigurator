@@ -42,6 +42,54 @@ def _safe_label(label: object, fallback: str) -> str:
     return text or fallback
 
 
+def _plot_line_style(cfg: dict) -> str:
+    style = str(cfg.get("plot_line_style", "solid")).strip().lower()
+    aliases = {
+        "cycle": "cycle",
+        "-": "-",
+        "--": "--",
+        "solid": "-",
+        "line": "-",
+        "dashed": "--",
+        "dash": "--",
+        "dotted": ":",
+        "dot": ":",
+        "dashdot": "-.",
+        "dash-dot": "-.",
+    }
+    if style not in aliases:
+        raise ValueError(f"Unsupported plot_line_style={style!r}. Use solid, dashed, dotted, dashdot, or cycle.")
+    return aliases[style]
+
+
+def _plot_marker_style(cfg: dict) -> str:
+    marker = str(cfg.get("plot_marker_style", "cycle")).strip().lower()
+    aliases = {
+        "cycle": "cycle",
+        "circle": "o",
+        "o": "o",
+        "square": "s",
+        "s": "s",
+        "triangle": "^",
+        "^": "^",
+        "diamond": "D",
+        "d": "D",
+        "x": "x",
+        "plus": "P",
+        "p": "P",
+    }
+    if marker not in aliases:
+        raise ValueError(f"Unsupported plot_marker_style={marker!r}. Use cycle, circle, square, triangle, diamond, x, or plus.")
+    return aliases[marker]
+
+
+def _plot_title_prefix(cfg: dict) -> str:
+    if cfg.get("plot_title_prefix"):
+        return str(cfg["plot_title_prefix"])
+    model = str(cfg.get("model", "")).strip()
+    return model.rsplit("/", 1)[-1] if model else "AIC"
+
+
 def _env_for_cfg(cfg: dict) -> dict[str, str]:
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH")
@@ -141,10 +189,94 @@ def _copy_quant_overrides(cfg: dict) -> dict:
     return out
 
 
+def _copy_worker_tuning(worker_cfg: dict, *sources: dict) -> None:
+    for source in sources:
+        for key in ["max_batch_size", "max_num_tokens"]:
+            if key in source:
+                worker_cfg[key] = int(source[key])
+
+
+def _copy_advanced_tuning(*sources: dict) -> dict:
+    out: dict[str, object] = {}
+    for source in sources:
+        for key in [
+            "prefill_max_batch_size",
+            "decode_max_batch_size",
+            "prefill_latency_correction_scale",
+            "decode_latency_correction_scale",
+            "rate_matching_prefill_degradation_factor",
+            "rate_matching_decode_degradation_factor",
+        ]:
+            if key in source:
+                out[key] = source[key]
+    return out
+
+
 def _int_list(value: object) -> list[int]:
     if isinstance(value, list):
         return [int(v) for v in value]
     return [int(value)]
+
+
+_GPU_COUNT_KEYS = {
+    "total_gpus",
+    "num_gpu_per_worker",
+    "num_gpu_per_replica",
+    "max_gpu_per_replica",
+    "tp",
+    "pp",
+    "dp",
+    "moe_tp",
+    "moe_ep",
+}
+
+
+def _max_int_value(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, list):
+        values = [_max_int_value(item) for item in value]
+        values = [item for item in values if item is not None]
+        return max(values) if values else None
+    return None
+
+
+def _infer_total_gpus_from_parallel(parallel_cfg: object) -> int | None:
+    if not isinstance(parallel_cfg, dict):
+        return None
+
+    candidates: list[int] = []
+    for key, value in parallel_cfg.items():
+        if key in _GPU_COUNT_KEYS:
+            candidate = _max_int_value(value)
+            if candidate is not None:
+                candidates.append(candidate)
+        elif isinstance(value, dict):
+            candidate = _infer_total_gpus_from_parallel(value)
+            if candidate is not None:
+                candidates.append(candidate)
+    return max(candidates) if candidates else None
+
+
+def _resolve_total_gpus(cfg: dict) -> int:
+    if "total_gpus" in cfg:
+        return int(cfg["total_gpus"])
+    inferred = max(
+        (
+            value
+            for value in [
+                _infer_total_gpus_from_parallel(cfg.get("fixed_parallel")),
+                _infer_total_gpus_from_parallel(cfg.get("search_parallel")),
+            ]
+            if value is not None
+        ),
+        default=None,
+    )
+    if inferred is None:
+        raise ValueError("total_gpus is required when it cannot be inferred from fixed_parallel/search_parallel")
+    return inferred
 
 
 def _fixed_worker_config(cfg: dict, fixed: dict) -> dict:
@@ -167,6 +299,7 @@ def _fixed_worker_config(cfg: dict, fixed: dict) -> dict:
         worker_cfg["moe_backend"] = fixed["moe_backend"]
     if "attention_backend" in fixed:
         worker_cfg["attention_backend"] = fixed["attention_backend"]
+    _copy_worker_tuning(worker_cfg, cfg, fixed)
     return worker_cfg
 
 
@@ -174,7 +307,7 @@ def _base_exp_config(cfg: dict, system_name: str) -> dict:
     exp_cfg = {
         "mode": "patch",
         "model_path": cfg["model"],
-        "total_gpus": cfg["total_gpus"],
+        "total_gpus": _resolve_total_gpus(cfg),
         "system_name": system_name,
         "backend_name": cfg["backend"],
         "backend_version": cfg["backend_version"],
@@ -239,7 +372,7 @@ def _build_custom_experiment_yaml(cfg: dict, system_name: str) -> dict:
         _apply_exp_overrides(disagg_exp, disagg_cfg)
         disagg_exp["serving_mode"] = "disagg"
         disagg_exp["decode_system_name"] = system_name
-        replica_gpu_list = _int_list(disagg_cfg.get("num_gpu_per_replica", cfg["total_gpus"]))
+        replica_gpu_list = _int_list(disagg_cfg.get("num_gpu_per_replica", _resolve_total_gpus(cfg)))
         prefill_worker_list = _int_list(disagg_cfg["prefill_workers"])
         decode_worker_list = _int_list(disagg_cfg["decode_workers"])
         disagg_exp["config"] = {
@@ -254,6 +387,9 @@ def _build_custom_experiment_yaml(cfg: dict, system_name: str) -> dict:
                 "max_decode_worker": max(decode_worker_list),
             },
         }
+        advanced_tuning = _copy_advanced_tuning(cfg, disagg_cfg)
+        if advanced_tuning:
+            disagg_exp["config"]["advanced_tuning_config"] = advanced_tuning
         disagg_name = f"disagg_{disagg_kind}"
         exp_yaml["exps"].append(disagg_name)
         exp_yaml[disagg_name] = disagg_exp
@@ -299,7 +435,7 @@ def _run_aic(cfg: dict, system_name: str, save_dir: Path, log_path: Path) -> int
         "--model",
         cfg["model"],
         "--total-gpus",
-        str(cfg["total_gpus"]),
+        str(_resolve_total_gpus(cfg)),
         "--backend",
         cfg["backend"],
         "--backend-version",
@@ -480,6 +616,21 @@ def _merge_case_cfg(base_cfg: dict, case: dict) -> dict:
             merged[key] = value
     if "system" not in merged:
         raise ValueError(f"compare case must provide system: {case}")
+    if "total_gpus" not in case:
+        inferred = max(
+            (
+                value
+                for value in [
+                    _infer_total_gpus_from_parallel(case.get("fixed_parallel")),
+                    _infer_total_gpus_from_parallel(case.get("search_parallel")),
+                ]
+                if value is not None
+            ),
+            default=None,
+        )
+        if inferred is not None:
+            merged["total_gpus"] = inferred
+    _resolve_total_gpus(merged)
     return merged
 
 
@@ -549,13 +700,20 @@ def _plot_multi_compare(series: list[tuple[str, Path]], cfg: dict, title: str, o
     requested_y = cfg.get("y_col", "tokens/s/gpu")
     resolved_x = requested_x
     resolved_y = requested_y
+    line_style = _plot_line_style(cfg)
+    marker_style = _plot_marker_style(cfg)
+    line_cycle = ["-", "--", ":", "-."]
+    marker_cycle = ["o", "s", "^", "D", "x", "P"]
+    alpha = float(cfg.get("plot_alpha", 0.85))
 
     plt.figure(figsize=(8, 5))
-    for label, csv_path in series:
+    for idx, (label, csv_path) in enumerate(series):
         xs, ys, x_col, y_col = read_xy(csv_path, requested_x, requested_y)
         resolved_x = x_col or resolved_x
         resolved_y = y_col or resolved_y
-        plt.plot(xs, ys, "o-", label=label, markersize=4, linewidth=1.5)
+        linestyle = line_cycle[idx % len(line_cycle)] if line_style == "cycle" else line_style
+        marker = marker_cycle[idx % len(marker_cycle)] if marker_style == "cycle" else marker_style
+        plt.plot(xs, ys, marker=marker, linestyle=linestyle, label=label, markersize=4, linewidth=1.5, alpha=alpha)
 
     plt.xlabel(axis_label(requested_x, resolved_x))
     plt.ylabel(axis_label(requested_y, resolved_y))
@@ -709,12 +867,13 @@ def _run_compare_cases(cfg: dict, out_dir: Path) -> None:
                 print(f"[{label}][{mode}] unavailable")
 
     modes = sorted({mode for label_paths in case_paretos.values() for mode in label_paths})
+    title_prefix = _plot_title_prefix(cfg)
     for mode in modes:
         pareto_series = [(label, paths[mode]) for label, paths in case_paretos.items() if mode in paths]
         _write_plot_data(pareto_series, cfg, plot_dir / f"pareto_compare_{mode}.csv")
-        _plot_multi_compare(pareto_series, cfg, f"DS-V4 Flash {mode} Topology Compare", plot_dir / f"pareto_compare_{mode}.png")
+        _plot_multi_compare(pareto_series, cfg, f"{title_prefix} {mode} Topology Compare", plot_dir / f"pareto_compare_{mode}.png")
         full_series = [(label, paths[mode]) for label, paths in case_all_results.items() if mode in paths]
-        _plot_multi_compare(full_series, cfg, f"DS-V4 Flash {mode} All Candidates", plot_dir / f"full_compare_{mode}.png")
+        _plot_multi_compare(full_series, cfg, f"{title_prefix} {mode} All Candidates", plot_dir / f"full_compare_{mode}.png")
 
     _write_cases_summary(case_rows, out_dir / "compare_cases_single_point.csv")
     print("done")
@@ -766,6 +925,7 @@ def main() -> None:
     plot_dir.mkdir(parents=True, exist_ok=True)
     scaleup_label = _display_label(cfg.get("scaleup_system", ""), "scaleup")
     scaleout_label = _display_label(cfg.get("scaleout_system", ""), "scaleout")
+    title_prefix = _plot_title_prefix(cfg)
     scaleup_log = out_dir / "output_scaleup.log"
     scaleout_log = out_dir / "output_scaleout.log"
     requested_modes = _requested_modes(cfg)
@@ -813,8 +973,11 @@ def main() -> None:
                 "--scaleout-label", scaleout_label,
                 "--x-col", cfg.get("x_col", "tokens/s/user"),
                 "--y-col", cfg.get("y_col", "tokens/s/gpu"),
-                "--title", f"DS-V4 Flash {m} All Candidates",
+                "--title", f"{title_prefix} {m} All Candidates",
                 "--output", str(plot_dir / f"full_compare_{m}.png"),
+                "--line-style", cfg.get("plot_line_style", "solid"),
+                "--marker-style", cfg.get("plot_marker_style", "cycle"),
+                "--alpha", str(cfg.get("plot_alpha", 0.85)),
             ]
             full_rc = subprocess.run(full_plot_cmd, text=True, cwd=REPO_ROOT)
             if full_rc.returncode != 0:
@@ -828,8 +991,11 @@ def main() -> None:
             "--scaleout-label", scaleout_label,
             "--x-col", cfg.get("x_col", "tokens/s/user"),
             "--y-col", cfg.get("y_col", "tokens/s/gpu"),
-            "--title", f"DS-V4 Flash {m} Scale-up vs Scale-out",
+            "--title", f"{title_prefix} {m} Scale-up vs Scale-out",
             "--output", str(plot_dir / f"pareto_compare_{m}.png"),
+            "--line-style", cfg.get("plot_line_style", "solid"),
+            "--marker-style", cfg.get("plot_marker_style", "cycle"),
+            "--alpha", str(cfg.get("plot_alpha", 0.85)),
         ]
         prc = subprocess.run(plot_cmd, text=True, cwd=REPO_ROOT)
         if prc.returncode != 0:

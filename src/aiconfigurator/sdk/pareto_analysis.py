@@ -32,6 +32,7 @@ def agg_pareto(
     enable_chunked_prefill: bool = False,
     free_gpu_memory_fraction: float | None = None,
     max_seq_len: int | None = None,
+    max_batch_size: int = 512,
 ) -> pd.DataFrame:
     """
     Find Pareto front for agg.
@@ -114,7 +115,7 @@ def agg_pareto(
                 summary = sess.find_best_agg_result_under_constraints(
                     runtime_config=overwritten_runtime_config,
                     top_k=10,
-                    max_batch_size=512,
+                    max_batch_size=max_batch_size,
                     ctx_stride=512,
                     enable_chunked_prefill=enable_chunked_prefill,
                     free_gpu_memory_fraction=free_gpu_memory_fraction,

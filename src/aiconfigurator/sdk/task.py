@@ -1365,6 +1365,7 @@ class TaskRunner:
         enable_chunked_prefill = getattr(task_config, "enable_chunked_prefill", False)
         free_gpu_memory_fraction = task_config.free_gpu_memory_fraction
         max_seq_len = task_config.max_seq_len
+        max_batch_size = getattr(task_config.worker_config, "max_batch_size", 512)
         result_df = pa.agg_pareto(
             model_path=task_config.model_path,
             runtime_config=runtime_config,
@@ -1375,6 +1376,7 @@ class TaskRunner:
             enable_chunked_prefill=enable_chunked_prefill,
             free_gpu_memory_fraction=free_gpu_memory_fraction,
             max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
         )
         return {
             "pareto_df": result_df,

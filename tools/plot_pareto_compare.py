@@ -46,6 +46,47 @@ def axis_label(requested: str, resolved: str) -> str:
     return AXIS_LABELS.get(resolved, AXIS_LABELS.get(requested, requested))
 
 
+def parse_line_style(style: str) -> str:
+    normalized = style.strip().lower()
+    aliases = {
+        "cycle": "cycle",
+        "-": "-",
+        "--": "--",
+        "solid": "-",
+        "line": "-",
+        "dashed": "--",
+        "dash": "--",
+        "dotted": ":",
+        "dot": ":",
+        "dashdot": "-.",
+        "dash-dot": "-.",
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported line style {style!r}. Use solid, dashed, dotted, dashdot, or cycle.")
+    return aliases[normalized]
+
+
+def parse_marker_style(marker: str) -> str:
+    normalized = marker.strip().lower()
+    aliases = {
+        "cycle": "cycle",
+        "circle": "o",
+        "o": "o",
+        "square": "s",
+        "s": "s",
+        "triangle": "^",
+        "^": "^",
+        "diamond": "D",
+        "d": "D",
+        "x": "x",
+        "plus": "P",
+        "p": "P",
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported marker style {marker!r}. Use cycle, circle, square, triangle, diamond, x, or plus.")
+    return aliases[normalized]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scaleup-csv")
@@ -56,6 +97,9 @@ def main() -> None:
     ap.add_argument("--y-col", default="tokens/s/user")
     ap.add_argument("--title", default="Scale-up vs Scale-out Pareto")
     ap.add_argument("--output", required=True)
+    ap.add_argument("--line-style", default="solid", help="Line style: solid, dashed, dotted, dashdot, or cycle")
+    ap.add_argument("--marker-style", default="cycle", help="Marker style: cycle, circle, square, triangle, diamond, x, or plus")
+    ap.add_argument("--alpha", type=float, default=0.85)
     a = ap.parse_args()
 
     if not a.scaleup_csv and not a.scaleout_csv:
@@ -70,11 +114,19 @@ def main() -> None:
     if a.scaleout_csv:
         ox, oy, ox_col, oy_col = read_xy(Path(a.scaleout_csv), a.x_col, a.y_col)
 
+    line_style = parse_line_style(a.line_style)
+    marker_style = parse_marker_style(a.marker_style)
+    line_cycle = ["-", "--", ":", "-."]
+    marker_cycle = ["o", "s", "^", "D", "x", "P"]
     plt.figure(figsize=(8, 5))
     if a.scaleup_csv:
-        plt.plot(sx, sy, "o-", label=a.scaleup_label, markersize=4, linewidth=1.5)
+        linestyle = line_cycle[0] if line_style == "cycle" else line_style
+        marker = marker_cycle[0] if marker_style == "cycle" else marker_style
+        plt.plot(sx, sy, marker=marker, linestyle=linestyle, label=a.scaleup_label, markersize=4, linewidth=1.5, alpha=a.alpha)
     if a.scaleout_csv:
-        plt.plot(ox, oy, "o-", label=a.scaleout_label, markersize=4, linewidth=1.5)
+        linestyle = line_cycle[1] if line_style == "cycle" else line_style
+        marker = marker_cycle[1] if marker_style == "cycle" else marker_style
+        plt.plot(ox, oy, marker=marker, linestyle=linestyle, label=a.scaleout_label, markersize=4, linewidth=1.5, alpha=a.alpha)
 
     resolved_x = sx_col or ox_col or a.x_col
     resolved_y = sy_col or oy_col or a.y_col
