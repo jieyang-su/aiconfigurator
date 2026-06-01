@@ -11,7 +11,7 @@
   "isl": 2048,
   "osl": 500,
   "total_gpus": 32,
-  "out_dir": "results/test",
+  "out_dir": "results/DSV4-Pro-FP8-1024",
   "debug_comm_queries": true,
   "prefer_nccl_for_custom_allreduce": true,
   "disable_hybrid_shared_layer": true,
