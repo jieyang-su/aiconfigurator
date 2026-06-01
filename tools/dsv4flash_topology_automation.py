@@ -102,6 +102,14 @@ def _env_for_cfg(cfg: dict) -> dict[str, str]:
         env["AIC_DISABLE_HYBRID_SHARED_LAYER"] = "1"
     if cfg.get("nccl_perf_file"):
         env["AIC_NCCL_PERF_FILE"] = str(cfg["nccl_perf_file"])
+    if cfg.get("allow_unsupported_dsv4_tp"):
+        env["AIC_ALLOW_UNSUPPORTED_DSV4_TP"] = "1"
+    if cfg.get("dsv4_attention_calibrate_from"):
+        env["AIC_DSV4_ATTENTION_CALIBRATE_FROM"] = str(cfg["dsv4_attention_calibrate_from"])
+    if cfg.get("dsv4_attention_calibrate_system_pattern"):
+        env["AIC_DSV4_ATTENTION_CALIBRATE_SYSTEM_PATTERN"] = str(cfg["dsv4_attention_calibrate_system_pattern"])
+    if cfg.get("dsv4_attention_calibrate_mode"):
+        env["AIC_DSV4_ATTENTION_CALIBRATE_MODE"] = str(cfg["dsv4_attention_calibrate_mode"])
     return env
 
 
@@ -134,7 +142,11 @@ def _write_run_context(cfg: dict, system_name: str, log_path: Path, env: dict[st
         f"AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE={env.get('AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE', '')} "
         f"AIC_DEBUG_COMM_QUERIES={env.get('AIC_DEBUG_COMM_QUERIES', '')} "
         f"AIC_DISABLE_HYBRID_SHARED_LAYER={env.get('AIC_DISABLE_HYBRID_SHARED_LAYER', '')} "
-        f"AIC_NCCL_PERF_FILE={env.get('AIC_NCCL_PERF_FILE', '')}",
+        f"AIC_NCCL_PERF_FILE={env.get('AIC_NCCL_PERF_FILE', '')} "
+        f"AIC_ALLOW_UNSUPPORTED_DSV4_TP={env.get('AIC_ALLOW_UNSUPPORTED_DSV4_TP', '')} "
+        f"AIC_DSV4_ATTENTION_CALIBRATE_FROM={env.get('AIC_DSV4_ATTENTION_CALIBRATE_FROM', '')} "
+        f"AIC_DSV4_ATTENTION_CALIBRATE_SYSTEM_PATTERN={env.get('AIC_DSV4_ATTENTION_CALIBRATE_SYSTEM_PATTERN', '')} "
+        f"AIC_DSV4_ATTENTION_CALIBRATE_MODE={env.get('AIC_DSV4_ATTENTION_CALIBRATE_MODE', '')}",
     ]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as f:
