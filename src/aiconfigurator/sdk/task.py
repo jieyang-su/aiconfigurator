@@ -149,6 +149,21 @@ def _ensure_munch(obj: dict | DefaultMunch | Munch) -> DefaultMunch:
     return DefaultMunch.fromDict(obj, DefaultMunch)
 
 
+def _coerce_positive_int(value: object, default: int, *, name: str) -> int:
+    if value is None or isinstance(value, type):
+        logger.warning("Invalid %s=%r; using default %d", name, value, default)
+        return default
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using default %d", name, value, default)
+        return default
+    if coerced <= 0:
+        logger.warning("Invalid %s=%r; using default %d", name, value, default)
+        return default
+    return coerced
+
+
 def _get_database_with_optional_missing_data(
     *,
     system: str,
@@ -1365,7 +1380,11 @@ class TaskRunner:
         enable_chunked_prefill = getattr(task_config, "enable_chunked_prefill", False)
         free_gpu_memory_fraction = task_config.free_gpu_memory_fraction
         max_seq_len = task_config.max_seq_len
-        max_batch_size = getattr(task_config.worker_config, "max_batch_size", 512)
+        max_batch_size = _coerce_positive_int(
+            getattr(task_config.worker_config, "max_batch_size", None),
+            512,
+            name="worker_config.max_batch_size",
+        )
         result_df = pa.agg_pareto(
             model_path=task_config.model_path,
             runtime_config=runtime_config,

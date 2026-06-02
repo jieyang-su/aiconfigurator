@@ -18,6 +18,22 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 
+_QUANT_OVERRIDE_KEYS = [
+    "gemm_quant_mode",
+    "moe_quant_mode",
+    "kvcache_quant_mode",
+    "fmha_quant_mode",
+    "comm_quant_mode",
+]
+
+_QUANT_CLI_ARGS = {
+    "gemm_quant_mode": "--gemm-quant-mode",
+    "moe_quant_mode": "--moe-quant-mode",
+    "kvcache_quant_mode": "--kvcache-quant-mode",
+    "fmha_quant_mode": "--fmha-quant-mode",
+    "comm_quant_mode": "--comm-quant-mode",
+}
+
 
 def _display_label(system_name: str, fallback: str) -> str:
     return system_name or fallback
@@ -136,6 +152,10 @@ def _write_run_context(cfg: dict, system_name: str, log_path: Path, env: dict[st
     lines = [
         f"[automation-context] label={cfg.get('label', '')}",
         f"[automation-context] system={system_name}",
+        f"[automation-context] backend={cfg.get('backend', '')}",
+        f"[automation-context] backend_version={cfg.get('backend_version', '')}",
+        "[automation-context] quant "
+        + " ".join(f"{key}={cfg.get(key, '')}" for key in _QUANT_OVERRIDE_KEYS),
         f"[automation-context] total_gpus={cfg.get('total_gpus', '')}",
         f"[automation-context] nccl_path={_resolve_case_nccl_path(cfg, system_name)}",
         "[automation-context] env "
@@ -189,16 +209,17 @@ def find_result_csv_by_mode(root: Path, filename: str) -> dict[str, Path]:
 
 def _copy_quant_overrides(cfg: dict) -> dict:
     out: dict[str, object] = {}
-    for key in [
-        "gemm_quant_mode",
-        "moe_quant_mode",
-        "kvcache_quant_mode",
-        "fmha_quant_mode",
-        "comm_quant_mode",
-    ]:
+    for key in _QUANT_OVERRIDE_KEYS:
         if key in cfg:
             out[key] = cfg[key]
     return out
+
+
+def _append_quant_cli_args(cmd: list[str], cfg: dict) -> None:
+    for key in _QUANT_OVERRIDE_KEYS:
+        value = cfg.get(key)
+        if value is not None:
+            cmd.extend([_QUANT_CLI_ARGS[key], str(value)])
 
 
 def _copy_worker_tuning(worker_cfg: dict, *sources: dict) -> None:
@@ -456,8 +477,6 @@ def _run_aic(cfg: dict, system_name: str, save_dir: Path, log_path: Path) -> int
         str(cfg["isl"]),
         "--osl",
         str(cfg["osl"]),
-        "--gemm-quant-mode",
-        cfg["gemm_quant_mode"],
         "--database-mode",
         cfg["database_mode"],
         "--ttft",
@@ -469,6 +488,7 @@ def _run_aic(cfg: dict, system_name: str, save_dir: Path, log_path: Path) -> int
         "--save-dir",
         str(save_dir),
     ]
+    _append_quant_cli_args(cmd, cfg)
     return run_cmd(cmd, log_path, cwd=REPO_ROOT, env=env)
 
 
@@ -789,9 +809,32 @@ def _write_plot_data(series: list[tuple[str, Path]], cfg: dict, output_csv: Path
     print(output_csv)
 
 
-def _write_cases_summary(case_rows: dict[str, dict[str, dict[str, str] | None]], output_csv: Path) -> None:
+def _write_cases_summary(
+    case_rows: dict[str, dict[str, dict[str, str] | None]],
+    case_cfgs: dict[str, dict],
+    output_csv: Path,
+) -> None:
     labels = list(case_rows)
     rows: list[dict[str, str]] = []
+    config_keys = [
+        "system",
+        "backend",
+        "backend_version",
+        "database_mode",
+        *_QUANT_OVERRIDE_KEYS,
+    ]
+    for key in config_keys:
+        row = {"mode": "config", "metric": key}
+        baseline = ""
+        for idx, label in enumerate(labels):
+            value = str(case_cfgs.get(label, {}).get(key, ""))
+            row[label] = value
+            if idx == 0:
+                baseline = value
+            else:
+                row[f"{label}_minus_{labels[0]}"] = "" if value == baseline else f"{value} != {baseline}"
+        rows.append(row)
+
     metric_keys = [
         ("best_throughput", ("tokens/s/gpu_cluster",)),
         ("per_gpu_throughput", ("tokens/s/gpu",)),
@@ -847,11 +890,13 @@ def _run_compare_cases(cfg: dict, out_dir: Path) -> None:
     case_paretos: dict[str, dict[str, Path]] = {}
     case_all_results: dict[str, dict[str, Path]] = {}
     case_rows: dict[str, dict[str, dict[str, str] | None]] = {}
+    case_cfgs: dict[str, dict] = {}
 
     for idx, case in enumerate(cases, start=1):
         label = _safe_label(case.get("label"), f"case_{idx}")
         case_cfg = _merge_case_cfg(cfg, case)
         case_cfg["label"] = label
+        case_cfgs[label] = case_cfg
         requested_modes = _requested_modes(case_cfg)
         run_dir = out_dir / "runs" / label
         log_path = out_dir / f"output_{label}.log"
@@ -887,7 +932,7 @@ def _run_compare_cases(cfg: dict, out_dir: Path) -> None:
         full_series = [(label, paths[mode]) for label, paths in case_all_results.items() if mode in paths]
         _plot_multi_compare(full_series, cfg, f"{title_prefix} {mode} All Candidates", plot_dir / f"full_compare_{mode}.png")
 
-    _write_cases_summary(case_rows, out_dir / "compare_cases_single_point.csv")
+    _write_cases_summary(case_rows, case_cfgs, out_dir / "compare_cases_single_point.csv")
     print("done")
 
 

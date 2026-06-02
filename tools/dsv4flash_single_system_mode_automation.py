@@ -17,6 +17,22 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 
+_QUANT_OVERRIDE_KEYS = [
+    "gemm_quant_mode",
+    "moe_quant_mode",
+    "kvcache_quant_mode",
+    "fmha_quant_mode",
+    "comm_quant_mode",
+]
+
+_QUANT_CLI_ARGS = {
+    "gemm_quant_mode": "--gemm-quant-mode",
+    "moe_quant_mode": "--moe-quant-mode",
+    "kvcache_quant_mode": "--kvcache-quant-mode",
+    "fmha_quant_mode": "--fmha-quant-mode",
+    "comm_quant_mode": "--comm-quant-mode",
+}
+
 
 def _resolve_perf_source_from_cfg(cfg: dict, system_name: str) -> dict[str, str] | None:
     systems_path = Path(cfg["systems_path"])
@@ -72,6 +88,10 @@ def _build_automation_context_lines(cfg: dict, system_name: str, env: dict[str, 
         f"[automation-context] sys.executable={sys.executable}",
         f"[automation-context] aiconfigurator.__file__={_resolve_aiconfigurator_file(env)}",
         f"[automation-context] resolved systems path={systems_path}",
+        f"[automation-context] backend={cfg.get('backend', '')}",
+        f"[automation-context] backend_version={cfg.get('backend_version', '')}",
+        "[automation-context] quant "
+        + " ".join(f"{key}={cfg.get(key, '')}" for key in _QUANT_OVERRIDE_KEYS),
     ]
     if perf_source is None:
         lines.append("[automation-context] perf file source=<unresolved>")
@@ -133,16 +153,17 @@ def find_best_config_by_mode(root: Path) -> dict[str, Path]:
 
 def _copy_quant_overrides(cfg: dict) -> dict:
     out: dict[str, object] = {}
-    for key in [
-        "gemm_quant_mode",
-        "moe_quant_mode",
-        "kvcache_quant_mode",
-        "fmha_quant_mode",
-        "comm_quant_mode",
-    ]:
+    for key in _QUANT_OVERRIDE_KEYS:
         if key in cfg:
             out[key] = cfg[key]
     return out
+
+
+def _append_quant_cli_args(cmd: list[str], cfg: dict) -> None:
+    for key in _QUANT_OVERRIDE_KEYS:
+        value = cfg.get(key)
+        if value is not None:
+            cmd.extend([_QUANT_CLI_ARGS[key], str(value)])
 
 
 def _int_list(value: object) -> list[int]:
@@ -320,8 +341,6 @@ def _run_aic(cfg: dict, system_name: str, save_dir: Path, log_path: Path) -> int
         str(cfg["isl"]),
         "--osl",
         str(cfg["osl"]),
-        "--gemm-quant-mode",
-        cfg["gemm_quant_mode"],
         "--database-mode",
         cfg["database_mode"],
         "--ttft",
@@ -333,6 +352,7 @@ def _run_aic(cfg: dict, system_name: str, save_dir: Path, log_path: Path) -> int
         "--save-dir",
         str(save_dir),
     ]
+    _append_quant_cli_args(cmd, cfg)
     return run_cmd(cmd, log_path, cwd=REPO_ROOT, env=env)
 
 
