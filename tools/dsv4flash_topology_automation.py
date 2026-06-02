@@ -106,6 +106,56 @@ def _plot_title_prefix(cfg: dict) -> str:
     return model.rsplit("/", 1)[-1] if model else "AIC"
 
 
+def _as_float(value: object, default: float | None = None) -> float | None:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _gpu_hourly_cost_usd(label: str, case_cfg: dict | None, cfg: dict) -> float | None:
+    """Resolve $/GPU/h for a plotted series.
+
+    ``gpu_hourly_cost_usd`` may be:
+      - a number at case level or top level
+      - a dict at top level, matched by case label/system/backend/model substring
+    """
+    case_cfg = case_cfg or {}
+    case_cost = _as_float(case_cfg.get("gpu_hourly_cost_usd"))
+    if case_cost is not None:
+        return case_cost
+
+    raw_costs = cfg.get("gpu_hourly_cost_usd", cfg.get("gpu_hourly_costs_usd"))
+    scalar_cost = _as_float(raw_costs)
+    if scalar_cost is not None:
+        return scalar_cost
+
+    if isinstance(raw_costs, dict):
+        match_text = " ".join(
+            str(case_cfg.get(key, ""))
+            for key in ("label", "system", "backend", "model", "backend_version")
+        )
+        match_text = f"{label} {match_text}".lower()
+        default_cost = _as_float(raw_costs.get("default"))
+        for pattern, value in raw_costs.items():
+            if str(pattern).lower() == "default":
+                continue
+            if str(pattern).lower() in match_text:
+                return _as_float(value, default_cost)
+        return default_cost
+
+    # Reasonable defaults for current perf-database compare configs. Keep this
+    # as a fallback so old JSON files can produce the cost plot.
+    match_text = f"{label} {case_cfg.get('system', '')}".lower()
+    if "h20" in match_text:
+        return 1.0
+    if "pro6000" in match_text or "r6000" in match_text:
+        return 0.75
+    return None
+
+
 def _env_for_cfg(cfg: dict) -> dict[str, str]:
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH")
@@ -809,6 +859,143 @@ def _write_plot_data(series: list[tuple[str, Path]], cfg: dict, output_csv: Path
     print(output_csv)
 
 
+def _write_cost_plot_data(
+    series: list[tuple[str, Path]],
+    case_cfgs: dict[str, dict],
+    cfg: dict,
+    output_csv: Path,
+) -> None:
+    if not series:
+        return
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from tools.plot_pareto_compare import X_CANDIDATES, pick_col
+
+    requested_x = cfg.get("x_col", "tokens/s/user")
+    rows: list[dict[str, str]] = []
+    original_fields: list[str] = []
+
+    for label, csv_path in series:
+        case_cfg = case_cfgs.get(label, {})
+        gpu_cost = _gpu_hourly_cost_usd(label, case_cfg, cfg)
+        if gpu_cost is None:
+            print(f"skip cost plot series={label}: cannot resolve gpu_hourly_cost_usd")
+            continue
+        with csv_path.open(encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                raise ValueError(f"CSV has no header: {csv_path}")
+            x_col = pick_col(reader.fieldnames, requested_x, X_CANDIDATES)
+            tput_col = pick_col(reader.fieldnames, "tokens/s/gpu", ["tokens/s/gpu", "per_gpu_throughput"])
+            for field in reader.fieldnames:
+                if field not in original_fields:
+                    original_fields.append(field)
+            point_index = 0
+            for row in reader:
+                x_value = _as_float(row.get(x_col))
+                tput_per_gpu = _as_float(row.get(tput_col))
+                if x_value is None or tput_per_gpu is None or tput_per_gpu <= 0:
+                    continue
+                cost_per_million = gpu_cost / (tput_per_gpu * 3600.0) * 1_000_000.0
+                out_row = {
+                    "series_label": label,
+                    "point_index": str(point_index),
+                    "x": f"{x_value:.6g}",
+                    "y": f"{cost_per_million:.6g}",
+                    "x_col": x_col,
+                    "y_col": "cost_per_million_output_tokens_usd",
+                    "source_csv": str(csv_path),
+                    "gpu_hourly_cost_usd": f"{gpu_cost:.6g}",
+                    "tput_per_gpu_col": tput_col,
+                    "tput_per_gpu": f"{tput_per_gpu:.6g}",
+                }
+                out_row.update(row)
+                rows.append(out_row)
+                point_index += 1
+
+    fieldnames = [
+        "series_label",
+        "point_index",
+        "x",
+        "y",
+        "x_col",
+        "y_col",
+        "source_csv",
+        "gpu_hourly_cost_usd",
+        "tput_per_gpu_col",
+        "tput_per_gpu",
+    ]
+    fieldnames.extend(field for field in original_fields if field not in fieldnames)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(output_csv)
+
+
+def _plot_cost_compare(series: list[tuple[str, Path]], case_cfgs: dict[str, dict], cfg: dict, title: str, output: Path) -> None:
+    if not series:
+        return
+    import matplotlib.pyplot as plt
+
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from tools.plot_pareto_compare import X_CANDIDATES, axis_label, pick_col
+
+    requested_x = cfg.get("x_col", "tokens/s/user")
+    resolved_x = requested_x
+    line_style = _plot_line_style(cfg)
+    marker_style = _plot_marker_style(cfg)
+    line_cycle = ["-", "--", ":", "-."]
+    marker_cycle = ["o", "s", "^", "D", "x", "P"]
+    alpha = float(cfg.get("plot_alpha", 0.85))
+    plotted = False
+
+    plt.figure(figsize=(8, 5))
+    for idx, (label, csv_path) in enumerate(series):
+        case_cfg = case_cfgs.get(label, {})
+        gpu_cost = _gpu_hourly_cost_usd(label, case_cfg, cfg)
+        if gpu_cost is None:
+            print(f"skip cost plot series={label}: cannot resolve gpu_hourly_cost_usd")
+            continue
+        xs: list[float] = []
+        ys: list[float] = []
+        with csv_path.open(encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                raise ValueError(f"CSV has no header: {csv_path}")
+            x_col = pick_col(reader.fieldnames, requested_x, X_CANDIDATES)
+            tput_col = pick_col(reader.fieldnames, "tokens/s/gpu", ["tokens/s/gpu", "per_gpu_throughput"])
+            resolved_x = x_col or resolved_x
+            for row in reader:
+                x_value = _as_float(row.get(x_col))
+                tput_per_gpu = _as_float(row.get(tput_col))
+                if x_value is None or tput_per_gpu is None or tput_per_gpu <= 0:
+                    continue
+                xs.append(x_value)
+                ys.append(gpu_cost / (tput_per_gpu * 3600.0) * 1_000_000.0)
+        if not xs:
+            continue
+        linestyle = line_cycle[idx % len(line_cycle)] if line_style == "cycle" else line_style
+        marker = marker_cycle[idx % len(marker_cycle)] if marker_style == "cycle" else marker_style
+        plt.plot(xs, ys, marker=marker, linestyle=linestyle, label=label, markersize=4, linewidth=1.5, alpha=alpha)
+        plotted = True
+
+    if not plotted:
+        plt.close()
+        return
+    plt.xlabel(axis_label(requested_x, resolved_x))
+    plt.ylabel("Cost per Million Output Tokens ($)")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output, dpi=150)
+    plt.close()
+    print(output)
+
+
 def _write_cases_summary(
     case_rows: dict[str, dict[str, dict[str, str] | None]],
     case_cfgs: dict[str, dict],
@@ -929,6 +1116,14 @@ def _run_compare_cases(cfg: dict, out_dir: Path) -> None:
         pareto_series = [(label, paths[mode]) for label, paths in case_paretos.items() if mode in paths]
         _write_plot_data(pareto_series, cfg, plot_dir / f"pareto_compare_{mode}.csv")
         _plot_multi_compare(pareto_series, cfg, f"{title_prefix} {mode} Topology Compare", plot_dir / f"pareto_compare_{mode}.png")
+        _write_cost_plot_data(pareto_series, case_cfgs, cfg, plot_dir / f"pareto_cost_compare_{mode}.csv")
+        _plot_cost_compare(
+            pareto_series,
+            case_cfgs,
+            cfg,
+            f"{title_prefix} {mode} Cost per Million Output Tokens",
+            plot_dir / f"pareto_cost_compare_{mode}.png",
+        )
         full_series = [(label, paths[mode]) for label, paths in case_all_results.items() if mode in paths]
         _plot_multi_compare(full_series, cfg, f"{title_prefix} {mode} All Candidates", plot_dir / f"full_compare_{mode}.png")
 

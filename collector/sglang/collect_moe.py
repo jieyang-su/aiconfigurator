@@ -481,7 +481,7 @@ def get_moe_test_cases():
                 )
             ):
                 # SGLang 0.5.10 uses the default Triton fp8 block MoE config for
-                # MiniMax-M2.5 on SM120. For these token counts that config
+                # MiniMax-M2.x on SM120. For these token counts that config
                 # requires 144 KiB shared memory, above the 99 KiB limit.
                 continue
 

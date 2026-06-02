@@ -1,8 +1,8 @@
 {
   "systems_path": "src/aiconfigurator/systems",
-  "model": "moonshotai/Kimi-K2.5",
+  "model": "MiniMaxAI/MiniMax-M2.5",
   "backend": "sglang",
-  "backend_version": "0.5.12-kimi2.5",
+  "backend_version": "0.5.12-minimax2.5",
   "gemm_quant_mode": "fp8_block",
   "kvcache_quant_mode": "bfloat16",
   "fmha_quant_mode": "bfloat16",
@@ -15,7 +15,7 @@
   "isl": 2048,
   "osl": 500,
   "total_gpus": 32,
-  "out_dir": "results/Kimi-K2.5-1024",
+  "out_dir": "results/minimax-m2.5-1024",
   "debug_comm_queries": true,
   "prefer_nccl_for_custom_allreduce": true,
   "disable_hybrid_shared_layer": true,
@@ -25,6 +25,10 @@
   "plot_marker_style": "cycle",
   "plot_alpha": 0.82,
   "plot_title_prefix": "KIMI2.5-1024",
+  "gpu_hourly_cost_usd": {
+    "h20": 1.0,
+    "PRO6000": 0.75
+  },
   "compare_cases": [
     {
       "label": "h20_sxm_32",

@@ -58,12 +58,14 @@ except ModuleNotFoundError:
 
 SUPPORTED_MODELS: dict[str, str] = {
     "deepseek-ai/DeepSeek-V3": "mla",
+    "deepseek-ai/DeepSeek-V3.1": "mla",
     "deepseek-ai/DeepSeek-V3.2": "dsa",
     "zai-org/GLM-5": "dsa",
 }
 
 MODEL_ARCHITECTURE: dict[str, str] = {
     "deepseek-ai/DeepSeek-V3": "DeepseekV3ForCausalLM",
+    "deepseek-ai/DeepSeek-V3.1": "DeepseekV3ForCausalLM",
     "deepseek-ai/DeepSeek-V3.2": "DeepseekV32ForCausalLM",
     "zai-org/GLM-5": "GlmMoeDsaForCausalLM",
 }
@@ -72,6 +74,7 @@ MODEL_ARCHITECTURE: dict[str, str] = {
 # and to always override correctly when head_num != native.
 MODEL_NATIVE_HEADS: dict[str, int] = {
     "deepseek-ai/DeepSeek-V3": 128,
+    "deepseek-ai/DeepSeek-V3.1": 128,
     "deepseek-ai/DeepSeek-V3.2": 128,
     "zai-org/GLM-5": 64,
 }

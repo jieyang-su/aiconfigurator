@@ -30,6 +30,7 @@ def _filter_model_config_list(model_config_list: list[list]) -> list[list]:
 
 _WIDEEP_MOE_MODEL_NAMES: set[str] = {
     "deepseek-ai/DeepSeek-V3",
+    "deepseek-ai/DeepSeek-V3.1",
     "deepseek-ai/DeepSeek-V3.2",
     "/opt/model/DeepSeek-V3.2",
     "deepseek-ai/DeepSeek-V4-Flash",
@@ -39,6 +40,8 @@ _WIDEEP_MOE_MODEL_NAMES: set[str] = {
     "zai-org/GLM-5",
     "MiniMaxAI/MiniMax-M2.5",
     "nvidia/MiniMax-M2.5-NVFP4",
+    "MiniMaxAI/MiniMax-M2.7",
+    "nvidia/MiniMax-M2.7-NVFP4",
     "moonshotai/Kimi-K2-Instruct",
     "moonshotai/Kimi-K2.5",
     "nvidia/Kimi-K2.5-NVFP4",
@@ -58,6 +61,7 @@ _MOE_MODEL_CONFIGS: list[list] = [
     [4096, 14336, 2, 8, "mistralai/Mixtral-8x7B-v0.1"],  # mixtral_8x7b
     [6144, 16384, 2, 8, "mistralai/Mixtral-8x22B-v0.1"],  # mixtral_8x22b
     [7168, 2048, 8, 256, "deepseek-ai/DeepSeek-V3"],  # deepseekv3, will have 1 shared expert, dsv32
+    [7168, 2048, 8, 256, "deepseek-ai/DeepSeek-V3.1"],  # deepseekv3.1, same shape as deepseekv3
     [4096, 2048, 6, 256, "deepseek-ai/DeepSeek-V4-Flash"],  # deepseekv4, 1 shared expert
     [7168, 3072, 6, 384, "deepseek-ai/DeepSeek-V4-Pro"],  # deepseekv4, 1 shared expert
     [4096, 2048, 6, 256, "sgl-project/DeepSeek-V4-Flash-FP8"],  # deepseekv4, 1 shared expert
@@ -68,7 +72,10 @@ _MOE_MODEL_CONFIGS: list[list] = [
     [6144, 2560, 8, 160, "Qwen/Qwen3-Coder-480B-A35B-Instruct"],  # qwen3-moe, 480b-a35b
     [7168, 2048, 8, 384, "moonshotai/Kimi-K2-Instruct"],  # kimi k2
     [7168, 2048, 8, 384, "nvidia/Kimi-K2.5-NVFP4"],  # kimi k2.5 nvfp4 (same shape, separate collection for fp4 kernels)
-    [3072, 1536, 8, 256, "MiniMaxAI/MiniMax-M2.5"],  # minimax m2.5 (also covers nvidia/MiniMax-M2.5-NVFP4)
+    [3072, 1536, 8, 256, "MiniMaxAI/MiniMax-M2.5"],  # minimax m2.5
+    [3072, 1536, 8, 256, "nvidia/MiniMax-M2.5-NVFP4"],  # minimax m2.5 nvfp4
+    [3072, 1536, 8, 256, "MiniMaxAI/MiniMax-M2.7"],  # minimax m2.7, same MoE shape as m2.5
+    [3072, 1536, 8, 256, "nvidia/MiniMax-M2.7-NVFP4"],  # minimax m2.7 nvfp4
     [2880, 2880, 4, 128, "openai/gpt-oss-120b"],
     [2880, 2880, 4, 32, "openai/gpt-oss-20b"],
     [2688, 1856, 6, 128, "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"],  # nemotron-3 nano (uses relu2, non-gated)
@@ -85,6 +92,7 @@ _MOE_MODEL_CONFIGS: list[list] = [
 # MLA: [num_heads, q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, model_name]
 _MLA_MODEL_CONFIGS: list[list] = [
     [128, 1536, 512, 128, 64, 128, "deepseek-ai/DeepSeek-V3"],
+    [128, 1536, 512, 128, 64, 128, "deepseek-ai/DeepSeek-V3.1"],  # same MLA dims as DSV3
     [64, 1536, 512, 128, 64, 128, "moonshotai/Kimi-K2.5"],  # kimi k2.5: same MLA dims as DSV3 except num_heads=64
 ]
 

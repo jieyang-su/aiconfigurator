@@ -120,12 +120,15 @@ def _infer_model_name_from_local_path(model_path: str, all_models: list[str]) ->
 
     model_type = str(config.get("model_type", "")).lower()
     architectures = [str(arch).lower() for arch in config.get("architectures", [])]
+    normalized_path = _normalize_model_token(str(path))
 
     if model_type == "deepseek_v32" or "deepseekv32forcausallm" in architectures:
         return "deepseek-ai/DeepSeek-V3.2"
     if model_type == "glm_moe_dsa" or "glmmoedsaforcausallm" in architectures:
         return "zai-org/GLM-5"
     if model_type == "deepseek_v3" or "deepseekv3forcausallm" in architectures:
+        if "deepseekv31" in normalized_path:
+            return "deepseek-ai/DeepSeek-V3.1"
         return "deepseek-ai/DeepSeek-V3"
 
     return None
