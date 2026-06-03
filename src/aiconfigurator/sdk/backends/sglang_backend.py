@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import os
 from collections import defaultdict
 
 import numpy as np
@@ -20,6 +21,13 @@ from aiconfigurator.sdk.rust_engine_step import (
 )
 
 logger = logging.getLogger(__name__)
+
+def _debug_exp_estimate_enabled() -> bool:
+    return os.getenv("AIC_DEBUG_EXP_ESTIMATE_DIFF", "0") == "1"
+
+
+def _debug_agg_prune_enabled() -> bool:
+    return os.getenv("AIC_DEBUG_AGG_PRUNE", "0") == "1"
 
 
 class SGLANGBackend(BaseBackend):
@@ -47,6 +55,20 @@ class SGLANGBackend(BaseBackend):
         gen_seq_imbalance_correction_scale = runtime_config.gen_seq_imbalance_correction_scale
         ctx_tokens = kwargs.get("ctx_tokens")
         assert ctx_tokens is not None, "ctx_tokens is required"
+
+        if _debug_exp_estimate_enabled():
+            logger.info(
+                "[exp-estimate-debug] run_agg inputs: isl=%s osl=%s b=%s ctx_tokens=%s "
+                "engine_step_backend=%s ctx_seq_imbalance_correction_scale=%s "
+                "gen_seq_imbalance_correction_scale=%s",
+                isl,
+                osl,
+                b,
+                ctx_tokens,
+                engine_step_backend_key,
+                ctx_seq_imbalance_correction_scale,
+                gen_seq_imbalance_correction_scale,
+            )
         balance_score = isl * b / ctx_tokens / osl
 
         cache_by_ctx_tokens = self._agg_cache[isl][osl][b]
@@ -421,6 +443,26 @@ class SGLANGBackend(BaseBackend):
             summary.set_summary_df(result)
             summary.set_result_dict(result_dict)
 
+            if _debug_exp_estimate_enabled():
+                logger.info(
+                    "[exp-estimate-debug] run_agg output: tp=%s pp=%s dp=%s moe_tp=%s moe_ep=%s "
+                    "b=%s ctx_tokens=%s ttft=%.3f tpot=%.3f tokens_s_gpu=%.3f tokens_s_user=%.3f "
+                    "request_rate=%.3f memory=%.3f",
+                    tp,
+                    pp,
+                    dp,
+                    moe_tp,
+                    moe_ep,
+                    b,
+                    ctx_tokens,
+                    result_dict["ttft"],
+                    result_dict["tpot"],
+                    result_dict["tokens/s/gpu"],
+                    result_dict["tokens/s/user"],
+                    result_dict["request_rate"],
+                    result_dict["memory"],
+                )
+
             # Store per-ops latency breakdown
             per_ops_data["scheduling"] = {
                 "num_mix_steps": float(num_mix_steps),
@@ -489,22 +531,31 @@ class SGLANGBackend(BaseBackend):
         # max(8192, 4*isl).
         # during the loop, as b, ctx_tokens and system memory are monotonic, we can break the
         # inner loop when the system is oom.
-        b_list = [b for b in b_list_default if b <= max_batch_size]
+        b_list = sorted({b for b in [*b_list_default, max_batch_size] if b <= max_batch_size})
         ctx_tokens_list = self._get_ctx_tokens_list_for_agg_sweep(isl, ctx_stride, enable_chunked_prefill)
 
         results_df = pd.DataFrame(columns=common.ColumnsAgg)
         results_dict_list = []
         results_per_ops_source: list[dict | None] = []  # aligned with results_dict_list
+        prune_stats: dict[int, dict[str, int]] = {}
+
+        def _inc_stat(b: int, reason: str) -> None:
+            if b not in prune_stats:
+                prune_stats[b] = {}
+            prune_stats[b][reason] = prune_stats[b].get(reason, 0) + 1
+
         capped_b = []
         all_oom = True
         for b in b_list:
             for ctx_tokens in ctx_tokens_list:
                 if b - np.ceil(ctx_tokens / isl) < 0:  # allow b==1
+                    _inc_stat(b, "ctx_invalid_b_lt_ctx_reqs")
                     break
 
                 if b > 1 and (
                     b - np.ceil(ctx_tokens / isl) < 1
                 ):  # general case, to ensure there's at least one gen req
+                    _inc_stat(b, "ctx_invalid_no_gen_req")
                     break
 
                 # filter out repeated records for balance score correction
@@ -512,6 +563,7 @@ class SGLANGBackend(BaseBackend):
                 if balance_score > 1:
                     gen_tokens = b // balance_score
                     if gen_tokens > 1 and gen_tokens in capped_b:
+                        _inc_stat(b, "capped_b_dedup")
                         continue
                     else:
                         capped_b.append(gen_tokens)
@@ -531,12 +583,38 @@ class SGLANGBackend(BaseBackend):
                 )
 
                 if summary.check_oom() or summary.check_kv_cache_oom():
+                    if summary.check_oom():
+                        _inc_stat(b, "oom")
+                    if summary.check_kv_cache_oom():
+                        _inc_stat(b, "kv_cache_oom")
                     break  # larger ctx tokens will cause oom
                 all_oom = False
                 result_dict = summary.get_result_dict()
                 if result_dict and result_dict["tpot"] <= tpot and result_dict["ttft"] <= ttft:
                     results_dict_list.append(result_dict)
                     results_per_ops_source.append(summary.get_per_ops_source())
+                    _inc_stat(b, "kept")
+                else:
+                    _inc_stat(b, "sla_filtered")
+
+        if _debug_agg_prune_enabled() and prune_stats:
+            parallel = (
+                f"tp{model.config.tp_size}pp{model.config.pp_size}dp{model.config.attention_dp_size}"
+                f"etp{model.config.moe_tp_size}ep{model.config.moe_ep_size}"
+            )
+            logger.warning(
+                "[agg-prune] system=%s parallel=%s isl=%s osl=%s ttft<=%s tpot<=%s",
+                database.system,
+                parallel,
+                isl,
+                osl,
+                ttft,
+                tpot,
+            )
+            for b in sorted(prune_stats.keys(), reverse=True):
+                stats = prune_stats[b]
+                reason_str = ", ".join(f"{k}:{v}" for k, v in sorted(stats.items()))
+                logger.warning("[agg-prune] b=%s %s", b, reason_str)
 
         if results_dict_list:
             results_df = pd.DataFrame(results_dict_list, columns=common.ColumnsAgg).round(3)

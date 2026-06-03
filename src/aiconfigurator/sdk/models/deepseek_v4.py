@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import os
 from typing import ClassVar
 
 import aiconfigurator.sdk.operations as ops
@@ -87,6 +88,13 @@ class DeepSeekV4Model(BaseModel):
             else self.config.workload_distribution
         )
         local_heads = self._num_heads // tp_size
+        allow_unsupported_tp = os.environ.get("AIC_ALLOW_UNSUPPORTED_DSV4_TP") == "1"
+        unsupported_tp = tp_size > deepseek_v4_cfg.o_groups or deepseek_v4_cfg.o_groups % tp_size != 0
+        if unsupported_tp and not allow_unsupported_tp:
+            raise ValueError(
+                f"DeepSeek-V4 attention TP size {tp_size} is not supported by o_groups={deepseek_v4_cfg.o_groups}; "
+                "pick a TP size that evenly divides o_groups."
+            )
         local_o_groups = max(1, deepseek_v4_cfg.o_groups // tp_size)
         local_moe_inter_size = self._moe_inter_size // tp_size
 
@@ -120,6 +128,7 @@ class DeepSeekV4Model(BaseModel):
                     fmha_quant_mode,
                     gemm_quant_mode,
                     architecture=self.architecture,
+                    native_num_heads=self._num_heads,
                 )
                 for ratio, count in ratio_counts.items()
                 if count > 0

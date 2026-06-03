@@ -440,6 +440,19 @@ def _add_estimate_mode_arguments(parser):
         default=None,
         help="Context tokens budget for IFB scheduling. Default: same as ISL.",
     )
+    parser.add_argument(
+        "--nextn",
+        type=int,
+        default=0,
+        help="Number of draft tokens for MTP (Multi-Token Prediction) speculative decoding. Default: 0.",
+    )
+    parser.add_argument(
+        "--nextn-accept-rates",
+        type=str,
+        default="0.85,0.3,0,0,0",
+        help="Comma-separated acceptance rates for MTP draft tokens (5 values). "
+        "Only the first --nextn values are used.",
+    )
 
     # Shared parallelism defaults (also used as fallback for prefill/decode-specific args)
     parser.add_argument("--tp-size", type=int, default=1, help="Tensor parallelism size. Default: 1.")
@@ -1601,6 +1614,8 @@ def _print_per_ops_latency(per_ops_data: dict) -> None:
 
 def _run_estimate_mode(args):
     """Run the estimate mode to predict TTFT, TPOT, and power for a single config."""
+    import aiconfigurator
+
     from aiconfigurator.cli.api import cli_estimate
 
     estimate_mode = args.estimate_mode
@@ -1615,6 +1630,26 @@ def _run_estimate_mode(args):
         args.batch_size,
     )
 
+    resolved_systems_paths = perf_database.get_systems_paths()
+    perf_source = perf_database.resolve_perf_data_source(
+        system=args.system,
+        backend=args.backend,
+        version=args.backend_version,
+        systems_paths=resolved_systems_paths,
+    )
+    logger.info("[estimate-context] sys.executable=%s", sys.executable)
+    logger.info("[estimate-context] aiconfigurator.__file__=%s", aiconfigurator.__file__)
+    logger.info("[estimate-context] resolved systems paths=%s", resolved_systems_paths)
+    if perf_source is None:
+        logger.info("[estimate-context] perf file source=<unresolved>")
+    else:
+        logger.info(
+            "[estimate-context] perf file source: systems_root=%s system_yaml=%s data_path=%s",
+            perf_source["systems_root"],
+            perf_source["system_yaml_path"],
+            perf_source["data_path"],
+        )
+
     # Build kwargs shared between agg and disagg
     estimate_kwargs = dict(
         model_path=args.model_path,
@@ -1627,6 +1662,8 @@ def _run_estimate_mode(args):
         osl=args.osl,
         batch_size=args.batch_size,
         ctx_tokens=args.ctx_tokens,
+        nextn=args.nextn,
+        nextn_accept_rates=[float(x) for x in args.nextn_accept_rates.split(",")],
         tp_size=args.tp_size,
         pp_size=args.pp_size,
         attention_dp_size=args.attention_dp_size,
@@ -1822,10 +1859,13 @@ def main(args):
         **execute_kwargs,
     )
 
+    all_results = {exp_name: df for exp_name, df in pareto_fronts.items()}
+
     if args.save_dir:
         save_results(
             args=args,
             best_configs=best_configs,
+            all_results=all_results,
             pareto_fronts=pareto_fronts,
             task_configs=task_configs,
             save_dir=args.save_dir,

@@ -120,12 +120,15 @@ def _infer_model_name_from_local_path(model_path: str, all_models: list[str]) ->
 
     model_type = str(config.get("model_type", "")).lower()
     architectures = [str(arch).lower() for arch in config.get("architectures", [])]
+    normalized_path = _normalize_model_token(str(path))
 
     if model_type == "deepseek_v32" or "deepseekv32forcausallm" in architectures:
         return "deepseek-ai/DeepSeek-V3.2"
     if model_type == "glm_moe_dsa" or "glmmoedsaforcausallm" in architectures:
         return "zai-org/GLM-5"
     if model_type == "deepseek_v3" or "deepseekv3forcausallm" in architectures:
+        if "deepseekv31" in normalized_path:
+            return "deepseek-ai/DeepSeek-V3.1"
         return "deepseek-ai/DeepSeek-V3"
 
     return None
@@ -940,9 +943,11 @@ def collect_sglang(
 
     try:
         from importlib.metadata import version as get_version
+        from collector.sglang.version_compat import sglang_version_branch
 
         version = get_version("sglang")
         logger.info(f"SGLang version: {version}")
+        logger.info(f"SGLang collector branch: {sglang_version_branch()}")
     except Exception:
         logger.exception("SGLang is not installed")
         return
@@ -1169,9 +1174,19 @@ def main():
         action="store_true",
         help="Profile the collector run and save output ",
     )
+    parser.add_argument(
+        "--sglang-version-branch",
+        choices=["auto", "legacy", "current", "v0.5.10", "0.5.10", "main", "adapted"],
+        default="auto",
+        help="SGLang API branch for AIC compatibility. Use 'legacy' or "
+        "'v0.5.10' for sglang-v0.5.10; use 'current' or 'main' for the "
+        "adapted sglang tree. Default: auto-detect.",
+    )
     args = parser.parse_args()
     ops = args.ops
     _dsv4_auto_expand = False
+
+    os.environ["COLLECTOR_SGLANG_VERSION_BRANCH"] = args.sglang_version_branch
 
     if args.model_path:
         from collector.common_test_cases import get_all_model_names
@@ -1205,9 +1220,15 @@ def main():
         # MoE, and mHC.  All other models keep the default behaviour: run
         # every op and let each get_func's ``_filter_model_config_list``
         # filter cases at the test-case level.
-        if args.ops is None and args.model_path == "sgl-project/DeepSeek-V4-Flash-FP8":
-            dsv4_flash_ops = [name for name in _all_op_names() if name.startswith("dsv4_flash_")]
-            ops = dsv4_flash_ops + ["gemm", "moe", "mhc_module"]
+        if args.ops is None and args.model_path in {
+            "deepseek-ai/DeepSeek-V4-Flash",
+            "deepseek-ai/DeepSeek-V4-Pro",
+            "sgl-project/DeepSeek-V4-Flash-FP8",
+            "sgl-project/DeepSeek-V4-Pro-FP8",
+        }:
+            dsv4_prefix = "dsv4_pro_" if "Pro" in args.model_path else "dsv4_flash_"
+            dsv4_ops = [name for name in _all_op_names() if name.startswith(dsv4_prefix)]
+            ops = dsv4_ops + ["gemm", "moe", "mhc_module"]
             _dsv4_auto_expand = True
     else:
         os.environ.pop("COLLECTOR_MODEL_PATH", None)
@@ -1218,7 +1239,7 @@ def main():
         # Use short label when V4-Flash auto-expanded ops to several names
         # (the joined scope may exceed Linux filename length limit).
         if _dsv4_auto_expand:
-            log_scope = ["dsv4_flash"]
+            log_scope = ["dsv4_pro" if args.model_path and "Pro" in args.model_path else "dsv4_flash"]
         else:
             log_scope = ops if ops else ["all"]
         logger = setup_logging(scope=log_scope, debug=args.debug)

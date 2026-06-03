@@ -1,0 +1,35 @@
+agg_sgl-project/DeepSeek-V4-Flash-FP8_rtx_pro_6000_scaleout_8x4_sglang_0.5.10.post2_2048_500_0_10000_1000:
+  attention_backend: flashinfer
+  backend_name: sglang
+  backend_version: 0.5.10.post2
+  config:
+    nextn: 1
+    nextn_accept_rates: [0.85, 0.3, 0.0, 0.0, 0.0]
+    worker_config:
+      backend_name: sglang
+      backend_version: 0.5.10.post2
+      comm_quant_mode: half
+      dp_list: [1, 2, 4, 8, 16, 32]
+      fmha_quant_mode: bfloat16
+      gemm_quant_mode: fp8_block
+      kvcache_quant_mode: fp8
+      moe_ep_list: [1, 2, 4, 8, 16, 32]
+      moe_quant_mode: fp8_block
+      moe_tp_list: [1]
+      num_gpu_per_worker: [1, 2, 4, 8, 16, 32]
+      pp_list: [1]
+      system_name: rtx_pro_6000_scaleout_8x4
+      tp_list: [1, 2, 4, 8, 16, 32]
+  enable_wideep: false
+  isl: 2048
+  mode: patch
+  model_path: sgl-project/DeepSeek-V4-Flash-FP8
+  moe_backend: null
+  osl: 500
+  prefix: 0
+  profiles: []
+  serving_mode: agg
+  system_name: rtx_pro_6000_scaleout_8x4
+  total_gpus: 32
+  tpot: 1000
+  ttft: 10000

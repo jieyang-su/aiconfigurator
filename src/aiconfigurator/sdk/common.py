@@ -342,6 +342,7 @@ DefaultHFModels = {
     "deepseek-ai/DeepSeek-R1",
     # DeepSeek V3/V3.1 Models
     "deepseek-ai/DeepSeek-V3",
+    "deepseek-ai/DeepSeek-V3.1",
     "nvidia/DeepSeek-V3.1-NVFP4",
     # Kimi K2.5 Models
     "moonshotai/Kimi-K2.5",
@@ -680,11 +681,17 @@ class PerfDataFilename(Enum):
     dsv4_flash_hca_context_module = "dsv4_flash_hca_context_module_perf.txt"
     dsv4_flash_csa_generation_module = "dsv4_flash_csa_generation_module_perf.txt"
     dsv4_flash_hca_generation_module = "dsv4_flash_hca_generation_module_perf.txt"
-    # V4-Flash sparse-kernel data (kernel-level past_kv Δ correction).
-    # Indexed by ``arch -> tp -> past_kv -> isl -> bs``.
+    dsv4_pro_csa_context_module = "dsv4_pro_csa_context_module_perf.txt"
+    dsv4_pro_hca_context_module = "dsv4_pro_hca_context_module_perf.txt"
+    dsv4_pro_csa_generation_module = "dsv4_pro_csa_generation_module_perf.txt"
+    dsv4_pro_hca_generation_module = "dsv4_pro_hca_generation_module_perf.txt"
+    # V4-Flash/Pro sparse-kernel data (kernel-level past_kv Δ correction).
+    # Indexed by ``arch -> native_heads -> tp -> past_kv -> isl -> bs``.
     # topk_512 and csa_attn are modeled analytically — no CSV needed.
     dsv4_flash_paged_mqa_logits_module = "dsv4_flash_paged_mqa_logits_module_perf.txt"
     dsv4_flash_hca_attn_module = "dsv4_flash_hca_attn_module_perf.txt"
+    dsv4_pro_paged_mqa_logits_module = "dsv4_pro_paged_mqa_logits_module_perf.txt"
+    dsv4_pro_hca_attn_module = "dsv4_pro_hca_attn_module_perf.txt"
 
 
 QuantMapping = namedtuple("QuantMapping", ["memory", "compute", "name"])

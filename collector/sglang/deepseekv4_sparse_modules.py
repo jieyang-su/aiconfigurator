@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
+import json
 import logging
 import math
 import multiprocessing as mp
@@ -49,10 +50,13 @@ import torch
 logger = logging.getLogger(__name__)
 
 try:
-    from collector.sglang.helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
+    from collector.helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
+    from collector.sglang.version_compat import paged_mqa_seq_lens, sglang_version_branch
 except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from helper import EXIT_CODE_RESTART, benchmark_with_power, log_perf
+    from version_compat import paged_mqa_seq_lens, sglang_version_branch
 
 # Re-export test case generators from the centralised common_test_cases
 # module so collect.py's registry can resolve them via getattr on this module.
@@ -79,6 +83,7 @@ try:
         _build_dsv4_flash_sparse_test_cases as _build_sparse_test_cases,
     )
 except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from common_test_cases import (
         _DSV4_FLASH_MODEL_PATH as DEFAULT_MODEL,
@@ -123,6 +128,55 @@ def get_dsv4_flash_hca_attn_test_cases():
     return _impl()
 
 
+def get_dsv4_pro_paged_mqa_logits_test_cases():
+    from collector.common_test_cases import get_dsv4_pro_paged_mqa_logits_test_cases as _impl
+
+    supported, reason = _dsv4_sparse_kernel_support_status("paged_mqa_logits")
+    if not supported:
+        logger.warning("Skipping dsv4 sparse kernel paged_mqa_logits: %s", reason)
+        return []
+    return _impl()
+
+
+def get_dsv4_pro_hca_attn_test_cases():
+    from collector.common_test_cases import get_dsv4_pro_hca_attn_test_cases as _impl
+
+    supported, reason = _dsv4_sparse_kernel_support_status("hca_attn")
+    if not supported:
+        logger.warning("Skipping dsv4 sparse kernel hca_attn: %s", reason)
+        return []
+    return _impl()
+
+
+_DSV4_SPARSE_GETTER_KERNELS = {
+    "get_dsv4_flash_paged_mqa_logits_test_cases": "paged_mqa_logits",
+    "get_dsv4_flash_hca_attn_test_cases": "hca_attn",
+    "get_dsv4_pro_paged_mqa_logits_test_cases": "paged_mqa_logits",
+    "get_dsv4_pro_hca_attn_test_cases": "hca_attn",
+}
+
+
+def __getattr__(name: str):
+    """Defensively expose sparse test-case getters expected by collect.py."""
+    kernel = _DSV4_SPARSE_GETTER_KERNELS.get(name)
+    if kernel is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    def _getter():
+        try:
+            common_test_cases = importlib.import_module("collector.common_test_cases")
+        except ModuleNotFoundError:
+            sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            common_test_cases = importlib.import_module("common_test_cases")
+        supported, reason = _dsv4_sparse_kernel_support_status(kernel)
+        if not supported:
+            logger.warning("Skipping dsv4 sparse kernel %s: %s", kernel, reason)
+            return []
+        return getattr(common_test_cases, name)()
+
+    return _getter
+
+
 __all__ = [
     "DEFAULT_BS_LIST",
     "DEFAULT_ISL_LIST",
@@ -133,6 +187,8 @@ __all__ = [
     "_build_sparse_test_cases",
     "get_dsv4_flash_hca_attn_test_cases",
     "get_dsv4_flash_paged_mqa_logits_test_cases",
+    "get_dsv4_pro_hca_attn_test_cases",
+    "get_dsv4_pro_paged_mqa_logits_test_cases",
     "run_dsv4_sparse_kernel_worker",
 ]
 
@@ -167,6 +223,34 @@ PAGE_SIZE_C128 = PAGE_SIZE_MODEL // 128  # c128 extra cache page size (=2)
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 DEFAULT_ARCHITECTURE = "DeepseekV4ForCausalLM"
+_MODEL_CONFIG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "src",
+    "aiconfigurator",
+    "model_configs",
+)
+
+
+def _load_aic_cached_model_config(model_id: str) -> dict | None:
+    config_file = os.path.join(_MODEL_CONFIG_DIR, f"{model_id.replace('/', '--')}_config.json")
+    if not os.path.isfile(config_file):
+        return None
+    with open(config_file) as f:
+        return json.load(f)
+
+
+def _dsv4_num_attention_heads(model_path: str) -> int:
+    if os.path.isdir(model_path):
+        config_file = os.path.join(model_path, "config.json")
+        if os.path.isfile(config_file):
+            with open(config_file) as f:
+                return int(json.load(f).get("num_attention_heads", 64))
+    cached_config = _load_aic_cached_model_config(model_path)
+    if cached_config is not None:
+        return int(cached_config.get("num_attention_heads", 64))
+    return 128 if "Pro" in model_path else 64
+
+
 _HCA_TORCH_FALLBACK_ENV = "COLLECTOR_DSV4_HCA_TORCH_FALLBACK"
 
 
@@ -227,7 +311,21 @@ def _has_sglang_sm120_paged_mqa_impl() -> bool:
 
 
 def _has_sglang_sm120_flash_mla_impl() -> bool:
-    return _has_module("sglang.srt.layers.attention.flash_mla_sm120_fallback")
+    return _has_module("sglang.srt.layers.attention.flash_mla_sm120") or _has_module(
+        "sglang.srt.layers.attention.flash_mla_sm120_fallback"
+    )
+
+
+def _import_dsv4_sm120_flash_mla_impl() -> Callable:
+    """Return the SM120 FlashMLA entrypoint across local SGLang forks."""
+    try:
+        from sglang.srt.layers.attention.flash_mla_sm120 import flash_mla_with_kvcache_sm120
+
+        return flash_mla_with_kvcache_sm120
+    except ModuleNotFoundError:
+        from sglang.srt.layers.attention.flash_mla_sm120_fallback import flash_mla_with_kvcache_entrypoint
+
+        return lambda **kwargs: flash_mla_with_kvcache_entrypoint(backend="kernel", **kwargs)
 
 
 def _import_dsv4_sm120_paged_mqa_impl() -> tuple[Callable, Callable]:
@@ -280,6 +378,21 @@ KERNEL_TO_DEFAULT_FILENAME = {
 }
 
 
+def _dsv4_family_from_model_or_path(model_path: str, perf_filename: str | None = None) -> str:
+    basename = os.path.basename(perf_filename or "")
+    if basename.startswith("dsv4_pro") or "Pro" in model_path:
+        return "dsv4_pro"
+    return "dsv4_flash"
+
+
+def _kernel_op_name(kernel: str, family: str) -> str:
+    return f"{family}_{kernel}_module"
+
+
+def _kernel_default_filename(kernel: str, family: str) -> str:
+    return f"{family}_{kernel}_module_perf.txt"
+
+
 def _dsv4_sparse_kernel_support_status(kernel: str) -> tuple[bool, str]:
     """Return ``(supported, reason)`` for a DSV4 sparse kernel."""
     if os.environ.get("COLLECTOR_FORCE_DSV4_FLASH_SPARSE") == "1":
@@ -290,6 +403,8 @@ def _dsv4_sparse_kernel_support_status(kernel: str) -> tuple[bool, str]:
             if major >= 12:
                 if _has_sglang_sm120_flash_mla_impl():
                     return True, "supported via sglang SM120 flash_mla fallback"
+                if sglang_version_branch() == "legacy":
+                    return True, "supported via AIC torch fallback for legacy SM120 runtime"
                 return False, "SM120 requires sglang flash_mla SM120 fallback support in the installed runtime"
             if major not in (9, 10, 11):
                 return False, f"flash_mla_with_kvcache requires Hopper/Blackwell-class GPU; got compute capability major={major}"
@@ -528,10 +643,11 @@ def _bench_paged_mqa_logits(M: int, past_kv: int, *, batch_size: int = 1, device
     block_table = torch.arange(blocks_per_req, dtype=torch.int32, device=device)
     block_table = block_table.unsqueeze(0).expand(b, blocks_per_req).contiguous()
 
-    schedule_meta = get_paged_mqa_logits_metadata(context_lens, block_kv, _device_num_sms(device))
+    kernel_seq_lens = paged_mqa_seq_lens(context_lens)
+    schedule_meta = get_paged_mqa_logits_metadata(kernel_seq_lens, block_kv, _device_num_sms(device))
 
     def kernel_fn():
-        return fp8_paged_mqa_logits(q, kv_in, weights, context_lens, block_table, schedule_meta, int(full_c4), False)
+        return fp8_paged_mqa_logits(q, kv_in, weights, kernel_seq_lens, block_table, schedule_meta, int(full_c4), False)
 
     return _bench_cuda_graph(kernel_fn, device=device)
 
@@ -647,9 +763,7 @@ def _bench_flash_mla_sparse(
       3. FlashMLA always receives h_q=64 (kernel only supports {64, 128}).
     """
     if _sglang_is_sm120():
-        from sglang.srt.layers.attention.flash_mla_sm120_fallback import flash_mla_with_kvcache_entrypoint
-
-        flash_mla_with_kvcache = lambda **kwargs: flash_mla_with_kvcache_entrypoint(backend="kernel", **kwargs)
+        flash_mla_with_kvcache = _import_dsv4_sm120_flash_mla_impl()
         sched_meta = None
     else:
         from flash_mla import flash_mla_with_kvcache, get_mla_metadata
@@ -812,7 +926,14 @@ def _bench_hca_attn_torch_subprocess(
 def _bench_hca_attn(M: int, past_kv: int, *, batch_size: int = 1, tp_size: int = 1, device: str = "cuda:0") -> float:  # noqa: N803
     """HCA: each Q attends to all c128 positions (no topk cap)."""
     fallback_policy = _get_hca_torch_fallback_policy()
-    if fallback_policy == "always":
+    if (
+        fallback_policy == "always"
+        or (
+            sglang_version_branch() == "legacy"
+            and _sglang_is_sm120()
+            and not _has_sglang_sm120_flash_mla_impl()
+        )
+    ):
         return _bench_hca_attn_torch(M, past_kv, batch_size=batch_size, device=device)
 
     full_s = M + past_kv
@@ -854,9 +975,9 @@ _BENCH_FN = {
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _make_perf_filename(kernel: str, output_path: str) -> str:
+def _make_perf_filename(kernel: str, output_path: str, family: str = "dsv4_flash") -> str:
     if os.path.isdir(output_path) or not output_path.endswith(".txt"):
-        return os.path.join(output_path, KERNEL_TO_DEFAULT_FILENAME[kernel])
+        return os.path.join(output_path, _kernel_default_filename(kernel, family))
     return output_path
 
 
@@ -873,6 +994,7 @@ def _write_row(
     model_path: str = DEFAULT_MODEL,
     architecture: str = DEFAULT_ARCHITECTURE,
     power_stats: dict | None = None,
+    family: str = "dsv4_flash",
 ) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(perf_filename)) or ".", exist_ok=True)
 
@@ -900,7 +1022,7 @@ def _write_row(
         framework="SGLang",
         version="kernel-level",
         device_name=device_name,
-        op_name=KERNEL_TO_OP_NAME[kernel],
+        op_name=_kernel_op_name(kernel, family),
         kernel_source=KERNEL_TO_KERNEL_SOURCE[kernel],
         perf_filename=perf_filename,
         power_stats=power_stats,
@@ -946,7 +1068,11 @@ def run_dsv4_sparse_kernel_worker(
     # one op — always derive the directory from the bound path and dispatch
     # to ``dsv4_flash_{kernel}_module_perf.txt`` per the case's ``kernel``.
     output_dir = os.path.dirname(perf_filename) or os.getcwd()
-    perf_path = _make_perf_filename(kernel, output_dir)
+    family = _dsv4_family_from_model_or_path(model_path, perf_filename)
+    perf_path = _make_perf_filename(kernel, output_dir, family)
+
+    global N_HEADS_Q
+    N_HEADS_Q = _dsv4_num_attention_heads(model_path)
 
     M = bs * isl  # noqa: N806
     print(f"[dsv4-sparse {kernel}] bs={bs} isl={isl} past_kv={past_kv} tp={tp_size} (M={M}) → {perf_path}")
@@ -985,6 +1111,7 @@ def run_dsv4_sparse_kernel_worker(
         device_name=device_name,
         model_path=model_path,
         power_stats=power_stats,
+        family=family,
     )
     power_str = f", power={power_stats['power']:.1f}W" if power_stats and power_stats.get("power") is not None else ""
     backend_str = f", backend={backend_name}" if backend_name else ""
@@ -1014,11 +1141,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-path", default=os.getcwd())
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--sglang-version-branch",
+        choices=["auto", "legacy", "current", "v0.5.10", "0.5.10", "main", "adapted"],
+        default=os.environ.get("COLLECTOR_SGLANG_VERSION_BRANCH", "auto"),
+        help="SGLang API branch. Use legacy/v0.5.10 for sglang-v0.5.10.",
+    )
     return parser
 
 
 def main():
     args = _build_arg_parser().parse_args()
+    os.environ["COLLECTOR_SGLANG_VERSION_BRANCH"] = args.sglang_version_branch
 
     if args.kernel == "all":
         kernels = list(KERNELS)
@@ -1038,7 +1172,7 @@ def main():
     print(f"Running {len(cases)} sparse-kernel test cases on {args.device}")
     for case in cases:
         bs, isl, past_kv, tp, kernel = case[:5]
-        perf_path = _make_perf_filename(kernel, args.output_path)
+        perf_path = _make_perf_filename(kernel, args.output_path, _dsv4_family_from_model_or_path(args.model_path))
         run_dsv4_sparse_kernel_worker(
             bs,
             isl,

@@ -27,4 +27,4 @@ misc:
     4: 411041792 # 392MB
     8: 411041792 # 392MB
   other_mem: 3758096384 # increase from 551MB to 3.5GB for safer deployment, this will cover part of the inaccurate mem calc.
-  nccl_version: '2.27.3'
+  nccl_version: '2.28.9'

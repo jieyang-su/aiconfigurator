@@ -627,6 +627,25 @@ def test_taskrunner_runs_agg_and_disagg():
     assert isinstance(disagg_result["pareto_df"], pd.DataFrame)
 
 
+def test_taskrunner_runtime_tpot_uses_default_sweep_when_missing():
+    resolved = TaskRunner._resolve_runtime_tpot(SimpleNamespace(tpot=None))
+    expected = list(range(1, 20, 1)) + list(range(20, 300, 5))
+    assert resolved == expected
+
+
+def test_taskrunner_runtime_tpot_appends_scalar_to_default_sweep():
+    resolved = TaskRunner._resolve_runtime_tpot(SimpleNamespace(tpot=1000.0))
+    expected = list(range(1, 20, 1)) + list(range(20, 300, 5))
+    assert resolved[:-1] == expected
+    assert resolved[-1] == 1000.0
+
+
+def test_taskrunner_runtime_tpot_uses_explicit_list_sweep():
+    explicit_sweep = [128.0, 256.0, 512.0, 1000.0]
+    resolved = TaskRunner._resolve_runtime_tpot(SimpleNamespace(tpot=explicit_sweep))
+    assert resolved == explicit_sweep
+
+
 def test_sglang_moe_configs():
     """Test sglang MoE configurations for different scenarios."""
     # Test 1: sglang + MoE + wideep + disagg

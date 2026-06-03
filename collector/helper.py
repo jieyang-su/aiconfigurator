@@ -3,6 +3,7 @@
 
 import csv
 import functools
+import hashlib
 import heapq
 import json
 import logging
@@ -456,6 +457,22 @@ _LOGGING_CONFIGURED = False
 _LOG_DIR = None
 
 
+def _build_log_dir_name(scope: list[str], time_stamp: str, max_component_len: int = 200) -> str:
+    """Build a filesystem-safe log directory name from scope + timestamp.
+
+    The final path component must stay below typical filesystem limits
+    (255 bytes on Linux). For long scope lists, keep a readable prefix
+    and append a stable hash suffix.
+    """
+    tokens = [str(item).strip() for item in (scope or ["all"]) if str(item).strip()]
+    base = "+".join(tokens) if tokens else "all"
+    if len(base) > max_component_len:
+        digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
+        head_len = max_component_len - len(digest) - 1
+        base = f"{base[:head_len]}_{digest}"
+    return f"{base}_{time_stamp}"
+
+
 def setup_logging(scope=["all"], debug=False, worker_id=None):
     """
     Setup structured logging - auto-configures based on process type
@@ -540,9 +557,9 @@ def setup_logging(scope=["all"], debug=False, worker_id=None):
 
     # Create log directory
     time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _LOG_DIR = Path(f"{'+'.join(scope)}_{time_stamp}")
+    _LOG_DIR = Path(_build_log_dir_name(scope, time_stamp))
     if not _LOG_DIR.is_dir():
-        _LOG_DIR.mkdir()
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     # Set environment variables for workers
     os.environ["COLLECTOR_DEBUG"] = "true" if debug else "false"

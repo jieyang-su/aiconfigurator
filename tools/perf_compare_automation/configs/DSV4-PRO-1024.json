@@ -1,0 +1,186 @@
+{
+  "systems_path": "src/aiconfigurator/systems",
+  "model": "sgl-project/DeepSeek-V4-Pro-FP8",
+  "backend": "sglang",
+  "backend_version": "0.5.10.post2",
+  "gemm_quant_mode": "fp8_block",
+  "database_mode": "HYBRID",
+  "ttft": 10000,
+  "tpot": 1000,
+  "max_batch_size": 1024,
+  "isl": 2048,
+  "osl": 500,
+  "prefix": 0,
+  "out_dir": "results/DSV4-Pro-FP8-1024",
+  "debug_comm_queries": true,
+  "prefer_nccl_for_custom_allreduce": true,
+  "disable_hybrid_shared_layer": true,
+  "x_col": "tokens/s/user",
+  "y_col": "tokens/s/gpu",
+  "plot_line_style": "cycle",
+  "plot_marker_style": "cycle",
+  "plot_alpha": 0.82,
+  "plot_title_prefix": "DeepSeek-V4-Pro-FP8",
+  "compare_cases": [
+    {
+      "label": "h20_sxm_32",
+      "system": "h20_sxm",
+      "nccl_perf_file": "nccl_perf.txt",
+      "search_parallel": {
+        "agg": {
+          "num_gpu_per_worker": [1, 2, 4, 8, 16, 32],
+          "tp": [1, 2, 4, 8, 16],
+          "pp": [1],
+          "dp": [1, 2, 4, 8, 16, 32],
+          "moe_tp": [1],
+          "moe_ep": [1, 2, 4, 8, 16, 32]
+        },
+        "disagg": {
+            "enable_wideep": true,
+            "moe_backend": "deepep_moe",
+            "num_gpu_per_replica": [1, 2, 4, 8, 16, 32],
+            "prefill_workers": [1, 2, 4, 8, 16],
+            "decode_workers": [1, 2, 4, 8, 16],
+            "prefill": {
+                "enable_wideep": true,
+                "num_gpu_per_worker": [1,2, 4, 8, 16],
+                "tp": [1, 2, 4, 8, 16],
+                "pp": [1],
+                "dp": [1, 2, 4, 8, 16],
+                "moe_tp": [1],
+                "moe_ep": [1, 2, 4, 8, 16]
+            },
+            "decode": {
+                "enable_wideep": true,
+                "num_gpu_per_worker": [1, 2, 4, 8, 16],
+                "tp": [1, 2, 4, 8, 16],
+                "pp": [1],
+                "dp": [1, 2, 4, 8, 16],
+                "moe_tp": [1],
+                "moe_ep": [1, 2, 4, 8, 16]
+            }
+        }
+      }
+    },
+    {
+      "label": "PRO6000_clos32",
+      "system": "PRO6000_clos32",
+      "nccl_perf_file": "PRO6000_clos32_deg_0.85_nccl_perf.txt",
+      "search_parallel": {
+        "agg": {
+          "num_gpu_per_worker": [1, 2, 4, 8, 16, 32],
+          "tp": [1, 2, 4, 8, 16],
+          "pp": [1],
+          "dp": [1, 2, 4, 8, 16, 32],
+          "moe_tp": [1],
+          "moe_ep": [1, 2, 4, 8, 16, 32]
+        },
+        "disagg": {
+            "enable_wideep": true,
+            "moe_backend": "deepep_moe",
+            "num_gpu_per_replica": [1, 2, 4, 8, 16, 32],
+            "prefill_workers": [1, 2, 4, 8, 16],
+            "decode_workers": [1, 2, 4, 8, 16],
+            "prefill": {
+                "enable_wideep": true,
+                "num_gpu_per_worker": [1,2, 4, 8, 16],
+                "tp": [1, 2, 4, 8, 16],
+                "pp": [1],
+                "dp": [1, 2, 4, 8, 16],
+                "moe_tp": [1],
+                "moe_ep": [1, 2, 4, 8, 16]
+            },
+            "decode": {
+                "enable_wideep": true,
+                "num_gpu_per_worker": [1, 2, 4, 8, 16],
+                "tp": [1, 2, 4, 8, 16],
+                "pp": [1],
+                "dp": [1, 2, 4, 8, 16],
+                "moe_tp": [1],
+                "moe_ep": [1, 2, 4, 8, 16]
+            }
+        }
+      }
+    },
+    {
+      "label": "PRO6000_clos144",
+      "system": "PRO6000_clos144",
+      "nccl_perf_file": "PRO6000_clos144_deg_0.85_nccl_perf.txt",
+      "search_parallel": {
+        "agg": {
+          "num_gpu_per_worker": [1, 2, 4, 8, 16, 32, 64, 128, 144],
+          "tp": [1, 2, 4, 8, 16],
+          "pp": [1],
+          "dp": [1, 2, 4, 8, 16, 32, 64, 128, 144],
+          "moe_tp": [1],
+          "moe_ep": [1, 2, 4, 8, 16, 32, 64, 128, 144]
+        },
+        "disagg": {
+            "enable_wideep": true,
+            "moe_backend": "deepep_moe",
+            "num_gpu_per_replica": [1, 2, 4, 8, 16, 32, 64],
+            "prefill_workers": [1, 2, 4, 8, 16, 32, 64],
+            "decode_workers": [1, 2, 4, 8, 16, 32, 64],
+            "prefill": {
+                "enable_wideep": true,
+                "num_gpu_per_worker": [1,2, 4, 8, 16, 32, 64],
+                "tp": [1, 2, 4, 8, 16],
+                "pp": [1],
+                "dp": [1, 2, 4, 8, 16, 32, 64],
+                "moe_tp": [1],
+                "moe_ep": [1, 2, 4, 8, 16, 32, 64]
+            },
+            "decode": {
+                "enable_wideep": true,
+                "num_gpu_per_worker": [1, 2, 4, 8, 16, 32, 64],
+                "tp": [1, 2, 4, 8, 16],
+                "pp": [1],
+                "dp": [1, 2, 4, 8, 16, 32, 64],
+                "moe_tp": [1],
+                "moe_ep": [1, 2, 4, 8, 16, 32, 64]
+            }
+        }
+      }
+    },
+    {
+      "label": "PRO6000_nic",
+      "system": "PRO6000_nic",
+      "nccl_perf_file": "PRO6000_nic_nccl_perf.txt",
+      "search_parallel": {
+        "agg": {
+          "num_gpu_per_worker": [1, 2, 4, 8, 16, 32, 64, 128, 256],
+          "tp": [1, 2, 4, 8, 16],
+          "pp": [1],
+          "dp": [1, 2, 4, 8, 16, 32, 64, 128, 256],
+          "moe_tp": [1],
+          "moe_ep": [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        },
+        "disagg": {
+            "enable_wideep": true,
+            "moe_backend": "deepep_moe",
+            "num_gpu_per_replica": [1, 2, 4, 8, 16, 32, 64, 128],
+            "prefill_workers": [1, 2, 4, 8, 16, 32, 64, 128],
+            "decode_workers": [1, 2, 4, 8, 16, 32, 64, 128],
+            "prefill": {
+                "enable_wideep": true,
+                "num_gpu_per_worker": [1,2, 4, 8, 16, 32, 64, 128],
+                "tp": [1, 2, 4, 8, 16],
+                "pp": [1],
+                "dp": [1, 2, 4, 8, 16, 32, 64, 128],
+                "moe_tp": [1],
+                "moe_ep": [1, 2, 4, 8, 16, 32, 64, 128]
+            },
+            "decode": {
+                "enable_wideep": true,
+                "num_gpu_per_worker": [1, 2, 4, 8, 16, 32, 64, 128],
+                "tp": [1, 2, 4, 8, 16],
+                "pp": [1],
+                "dp": [1, 2, 4, 8, 16, 32, 64, 128],
+                "moe_tp": [1],
+                "moe_ep": [1, 2, 4, 8, 16, 32, 64, 128]
+            }
+        }
+      }
+    }
+  ]
+}

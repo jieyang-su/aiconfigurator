@@ -54,6 +54,12 @@ class PerfFile(str, Enum):
     # perf_database — no CSV is collected for them.
     DSV4_FLASH_PAGED_MQA_LOGITS_MODULE = "dsv4_flash_paged_mqa_logits_module_perf.txt"
     DSV4_FLASH_HCA_ATTN_MODULE = "dsv4_flash_hca_attn_module_perf.txt"
+    DSV4_PRO_CSA_CONTEXT_MODULE = "dsv4_pro_csa_context_module_perf.txt"
+    DSV4_PRO_HCA_CONTEXT_MODULE = "dsv4_pro_hca_context_module_perf.txt"
+    DSV4_PRO_CSA_GENERATION_MODULE = "dsv4_pro_csa_generation_module_perf.txt"
+    DSV4_PRO_HCA_GENERATION_MODULE = "dsv4_pro_hca_generation_module_perf.txt"
+    DSV4_PRO_PAGED_MQA_LOGITS_MODULE = "dsv4_pro_paged_mqa_logits_module_perf.txt"
+    DSV4_PRO_HCA_ATTN_MODULE = "dsv4_pro_hca_attn_module_perf.txt"
     NCCL = "nccl_perf.txt"
     CUSTOM_ALLREDUCE = "custom_allreduce_perf.txt"
     TRTLLM_ALLTOALL = "trtllm_alltoall_perf.txt"

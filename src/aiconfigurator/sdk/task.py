@@ -149,6 +149,21 @@ def _ensure_munch(obj: dict | DefaultMunch | Munch) -> DefaultMunch:
     return DefaultMunch.fromDict(obj, DefaultMunch)
 
 
+def _coerce_positive_int(value: object, default: int, *, name: str) -> int:
+    if value is None or isinstance(value, type):
+        logger.warning("Invalid %s=%r; using default %d", name, value, default)
+        return default
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using default %d", name, value, default)
+        return default
+    if coerced <= 0:
+        logger.warning("Invalid %s=%r; using default %d", name, value, default)
+        return default
+    return coerced
+
+
 def _get_database_with_optional_missing_data(
     *,
     system: str,
@@ -593,6 +608,8 @@ class TaskConfigFactory:
             "max_gpu_per_replica": 128,
             "max_prefill_worker": 32,
             "max_decode_worker": 32,
+            "prefill_num_worker_list": None,
+            "decode_num_worker_list": None,
             "max_prefill_gpus": None,
             "max_decode_gpus": None,
         }
@@ -1223,6 +1240,8 @@ class TaskConfig:
 
 
 class TaskRunner:
+    _DEFAULT_TPOT_SWEEP: ClassVar[list[float]] = list(range(1, 20, 1)) + list(range(20, 300, 5))
+
     @staticmethod
     def _get_database(system: str, backend: str, version: str, database_mode: str | None = None):
         """Fetch a database from the global cache.
@@ -1254,6 +1273,36 @@ class TaskRunner:
                 db.set_default_database_mode(mode)
         return db
 
+    @classmethod
+    def _resolve_runtime_tpot(cls, runtime_config: DefaultMunch) -> float | list[float]:
+        """Resolve TPOT targets for runtime sweeps.
+
+        Backward-compatible behavior keeps the historical default sweep. If user
+        provides a scalar TPOT, append it to the default sweep so higher targets
+        (for example 1000ms) are considered without shrinking the baseline search.
+        If user provides a list/tuple/set, use that explicit sweep directly.
+        """
+
+        configured_tpot = getattr(runtime_config, "tpot", None)
+        default_sweep = list(cls._DEFAULT_TPOT_SWEEP)
+
+        if isinstance(configured_tpot, list):
+            return configured_tpot or default_sweep
+        if isinstance(configured_tpot, (tuple, set)):
+            explicit_sweep = list(configured_tpot)
+            return explicit_sweep or default_sweep
+        if configured_tpot is None:
+            return default_sweep
+
+        if isinstance(configured_tpot, int | float):
+            if configured_tpot <= 0:
+                return default_sweep
+            if configured_tpot in default_sweep:
+                return default_sweep
+            return [*default_sweep, configured_tpot]
+
+        return default_sweep
+
     def run_agg(self, task_config: DefaultMunch) -> dict[str, pd.DataFrame | None]:
         logger.debug("Task %s: Setting up runtime config", task_config.task_name)
         runtime_config = config.RuntimeConfig(
@@ -1261,7 +1310,7 @@ class TaskRunner:
             osl=task_config.runtime_config.osl,
             prefix=task_config.runtime_config.prefix,
             ttft=task_config.runtime_config.ttft,
-            tpot=list(range(1, 20, 1)) + list(range(20, 300, 5)),
+            tpot=self._resolve_runtime_tpot(task_config.runtime_config),
             request_latency=getattr(task_config.runtime_config, "request_latency", None),
             engine_step_backend=getattr(task_config.runtime_config, "engine_step_backend", None),
         )
@@ -1331,6 +1380,11 @@ class TaskRunner:
         enable_chunked_prefill = getattr(task_config, "enable_chunked_prefill", False)
         free_gpu_memory_fraction = task_config.free_gpu_memory_fraction
         max_seq_len = task_config.max_seq_len
+        max_batch_size = _coerce_positive_int(
+            getattr(task_config.worker_config, "max_batch_size", None),
+            512,
+            name="worker_config.max_batch_size",
+        )
         result_df = pa.agg_pareto(
             model_path=task_config.model_path,
             runtime_config=runtime_config,
@@ -1341,6 +1395,7 @@ class TaskRunner:
             enable_chunked_prefill=enable_chunked_prefill,
             free_gpu_memory_fraction=free_gpu_memory_fraction,
             max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
         )
         return {
             "pareto_df": result_df,
@@ -1353,7 +1408,7 @@ class TaskRunner:
             osl=task_config.runtime_config.osl,
             prefix=task_config.runtime_config.prefix,
             ttft=task_config.runtime_config.ttft,
-            tpot=list(range(1, 20, 1)) + list(range(20, 300, 5)),
+            tpot=self._resolve_runtime_tpot(task_config.runtime_config),
             request_latency=getattr(task_config.runtime_config, "request_latency", None),
             engine_step_backend=getattr(task_config.runtime_config, "engine_step_backend", None),
         )
@@ -1530,6 +1585,8 @@ class TaskRunner:
             decode_parallel_config_list=decode_parallel_config_list,
             num_gpu_list=task_config.replica_config.num_gpu_per_replica,
             max_num_gpu=task_config.replica_config.max_gpu_per_replica,
+            prefill_num_worker_list=task_config.replica_config.get("prefill_num_worker_list"),
+            decode_num_worker_list=task_config.replica_config.get("decode_num_worker_list"),
             prefill_max_num_worker=task_config.replica_config.max_prefill_worker,
             decode_max_num_worker=task_config.replica_config.max_decode_worker,
             max_prefill_gpus=task_config.replica_config.get("max_prefill_gpus"),

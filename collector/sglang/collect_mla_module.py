@@ -41,9 +41,15 @@ os.environ.setdefault("SGLANG_APPLY_CONFIG_BACKUP", "none")
 
 try:
     from helper import benchmark_with_power, get_sm_version, log_perf, resolve_subprocess_visible_device
+    from collector.sglang.version_compat import (
+        build_forward_batch,
+        maybe_forward_context,
+    )
 except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from helper import benchmark_with_power, get_sm_version, log_perf, resolve_subprocess_visible_device
+    from version_compat import build_forward_batch, maybe_forward_context
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -52,12 +58,14 @@ except ModuleNotFoundError:
 
 SUPPORTED_MODELS: dict[str, str] = {
     "deepseek-ai/DeepSeek-V3": "mla",
+    "deepseek-ai/DeepSeek-V3.1": "mla",
     "deepseek-ai/DeepSeek-V3.2": "dsa",
     "zai-org/GLM-5": "dsa",
 }
 
 MODEL_ARCHITECTURE: dict[str, str] = {
     "deepseek-ai/DeepSeek-V3": "DeepseekV3ForCausalLM",
+    "deepseek-ai/DeepSeek-V3.1": "DeepseekV3ForCausalLM",
     "deepseek-ai/DeepSeek-V3.2": "DeepseekV32ForCausalLM",
     "zai-org/GLM-5": "GlmMoeDsaForCausalLM",
 }
@@ -66,6 +74,7 @@ MODEL_ARCHITECTURE: dict[str, str] = {
 # and to always override correctly when head_num != native.
 MODEL_NATIVE_HEADS: dict[str, int] = {
     "deepseek-ai/DeepSeek-V3": 128,
+    "deepseek-ai/DeepSeek-V3.1": 128,
     "deepseek-ai/DeepSeek-V3.2": 128,
     "zai-org/GLM-5": 64,
 }
@@ -831,7 +840,6 @@ def _run_prefill(
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.chunk_cache import ChunkCache
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_params import SamplingParams
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils import BumpAllocator
@@ -874,8 +882,7 @@ def _run_prefill(
             spec_algorithm=SpeculativeAlgorithm.NONE,
         )
         batch.prepare_for_extend()
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+        forward_batch = build_forward_batch(batch, model_runner)
         model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         hidden_states = torch.randn(
@@ -893,12 +900,13 @@ def _run_prefill(
         # Warmup
         for _ in range(num_warmup):
             with torch.no_grad():
-                attention_module(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    zero_allocator=zero_allocator,
-                )
+                with maybe_forward_context(model_runner):
+                    attention_module(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        zero_allocator=zero_allocator,
+                    )
 
         # Timed runs — skip first 2 for stability
         cuda_times = []
@@ -907,12 +915,13 @@ def _run_prefill(
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
             with torch.no_grad():
-                attention_module(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    zero_allocator=zero_allocator,
-                )
+                with maybe_forward_context(model_runner):
+                    attention_module(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        zero_allocator=zero_allocator,
+                    )
             end_event.record()
             torch.cuda.synchronize()
             if i > 1:
@@ -1014,7 +1023,6 @@ def _run_decode(
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.chunk_cache import ChunkCache
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_params import SamplingParams
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils import BumpAllocator
@@ -1062,8 +1070,7 @@ def _run_decode(
         batch.prepare_for_extend()
         batch.output_ids = torch.randint(0, 10000, (batch_size,), dtype=torch.int64, device="cuda")
         batch.prepare_for_decode()
-        model_worker_batch_decode = batch.get_model_worker_batch()
-        forward_batch_decode = ForwardBatch.init_new(model_worker_batch_decode, model_runner)
+        forward_batch_decode = build_forward_batch(batch, model_runner)
         model_runner.attn_backend.init_forward_metadata(forward_batch_decode)
 
         decode_hidden = torch.randn(
@@ -1079,12 +1086,13 @@ def _run_decode(
         get_attn_tp_context().set_attn_inputs(attn_inputs_decode)
 
         def kernel_func():
-            attention_module(
-                positions=decode_positions,
-                hidden_states=decode_hidden,
-                forward_batch=forward_batch_decode,
-                zero_allocator=zero_allocator,
-            )
+            with maybe_forward_context(model_runner):
+                attention_module(
+                    positions=decode_positions,
+                    hidden_states=decode_hidden,
+                    forward_batch=forward_batch_decode,
+                    zero_allocator=zero_allocator,
+                )
 
         # Pre-warm JIT / autotuning before CUDA graph capture.
         # DSA decode on Blackwell calls DeepGEMM fp8_paged_mqa_logits and
@@ -1458,7 +1466,14 @@ def main():
     parser.add_argument("--kv-cache-dtype", choices=["bfloat16", "fp8"], default=None)
     parser.add_argument("--output-path", default=None, help="Output directory for perf files")
     parser.add_argument("--device", default="cuda:0", help="CUDA device")
+    parser.add_argument(
+        "--sglang-version-branch",
+        choices=["auto", "legacy", "current", "v0.5.10", "0.5.10", "main", "adapted"],
+        default=os.environ.get("COLLECTOR_SGLANG_VERSION_BRANCH", "auto"),
+        help="SGLang API branch. Use legacy/v0.5.10 for sglang-v0.5.10.",
+    )
     args = parser.parse_args()
+    os.environ["COLLECTOR_SGLANG_VERSION_BRANCH"] = args.sglang_version_branch
 
     # Determine which attn_types to run
     if args.attn_type:

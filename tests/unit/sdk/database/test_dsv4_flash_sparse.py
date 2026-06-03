@@ -25,7 +25,6 @@ from aiconfigurator.sdk.perf_database import (
     LoadedOpData,
     PerfDatabase,
     _deep_merge_dsv4_dicts,
-    _dsv4_flash_outer_linear_3d_lookup,
     _dsv4_flash_robust_3d_lookup,
     _dsv4_flash_tp_from_num_heads,
     load_context_dsv4_flash_kind_module_data,
