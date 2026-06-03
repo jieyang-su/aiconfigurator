@@ -311,7 +311,21 @@ def _has_sglang_sm120_paged_mqa_impl() -> bool:
 
 
 def _has_sglang_sm120_flash_mla_impl() -> bool:
-    return _has_module("sglang.srt.layers.attention.flash_mla_sm120_fallback")
+    return _has_module("sglang.srt.layers.attention.flash_mla_sm120") or _has_module(
+        "sglang.srt.layers.attention.flash_mla_sm120_fallback"
+    )
+
+
+def _import_dsv4_sm120_flash_mla_impl() -> Callable:
+    """Return the SM120 FlashMLA entrypoint across local SGLang forks."""
+    try:
+        from sglang.srt.layers.attention.flash_mla_sm120 import flash_mla_with_kvcache_sm120
+
+        return flash_mla_with_kvcache_sm120
+    except ModuleNotFoundError:
+        from sglang.srt.layers.attention.flash_mla_sm120_fallback import flash_mla_with_kvcache_entrypoint
+
+        return lambda **kwargs: flash_mla_with_kvcache_entrypoint(backend="kernel", **kwargs)
 
 
 def _import_dsv4_sm120_paged_mqa_impl() -> tuple[Callable, Callable]:
@@ -749,9 +763,7 @@ def _bench_flash_mla_sparse(
       3. FlashMLA always receives h_q=64 (kernel only supports {64, 128}).
     """
     if _sglang_is_sm120():
-        from sglang.srt.layers.attention.flash_mla_sm120_fallback import flash_mla_with_kvcache_entrypoint
-
-        flash_mla_with_kvcache = lambda **kwargs: flash_mla_with_kvcache_entrypoint(backend="kernel", **kwargs)
+        flash_mla_with_kvcache = _import_dsv4_sm120_flash_mla_impl()
         sched_meta = None
     else:
         from flash_mla import flash_mla_with_kvcache, get_mla_metadata
