@@ -24,7 +24,11 @@
   "plot_line_style": "cycle",
   "plot_marker_style": "cycle",
   "plot_alpha": 0.82,
-  "plot_title_prefix": "KIMI2.5-1024",
+  "plot_title_prefix": "minimax-m2.5-1024",
+  "gpu_hourly_cost_usd": {
+    "h20": 1.0,
+    "PRO6000": 0.75
+  },
   "compare_cases": [
     {
       "label": "h20_sxm_32",
@@ -40,13 +44,13 @@
           "moe_ep": [1, 2, 4, 8, 16, 32]
         },
         "disagg": {
-            "enable_wideep": true,
+            "enable_wideep": false,
             "moe_backend": "deepep_moe",
             "num_gpu_per_replica": [1, 2, 4, 8, 16],
             "prefill_workers": [1, 2, 4, 8, 16],
             "decode_workers": [1, 2, 4, 8, 16],
             "prefill": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1,2, 4, 8, 16],
                 "tp": [1, 2, 4, 8,16],
                 "pp": [1],
@@ -55,7 +59,7 @@
                 "moe_ep": [1, 2, 4, 8, 16]
             },
             "decode": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1, 2, 4, 8, 16],
                 "tp": [1, 2, 4, 8,16],
                 "pp": [1],
@@ -88,13 +92,13 @@
           "moe_ep": [1, 2, 4, 8, 16, 32]
         },
         "disagg": {
-            "enable_wideep": true,
+            "enable_wideep": false,
             "moe_backend": "deepep_moe",
             "num_gpu_per_replica": [1, 2, 4, 8, 16],
             "prefill_workers": [1, 2, 4, 8, 16],
             "decode_workers": [1, 2, 4, 8, 16],
             "prefill": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1,2, 4, 8, 16],
                 "tp": [1, 2, 4, 8,16],
                 "pp": [1],
@@ -103,7 +107,7 @@
                 "moe_ep": [1, 2, 4, 8, 16]
             },
             "decode": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1, 2, 4, 8, 16],
                 "tp": [1, 2, 4, 8,16],
                 "pp": [1],
@@ -136,13 +140,13 @@
           "moe_ep": [1, 2, 4, 8, 16, 32, 64, 128, 144]
         },
         "disagg": {
-            "enable_wideep": true,
+            "enable_wideep": false,
             "moe_backend": "deepep_moe",
             "num_gpu_per_replica": [1, 2, 4, 8, 16, 32, 64],
             "prefill_workers": [1, 2, 4, 8, 16, 32, 64],
             "decode_workers": [1, 2, 4, 8, 16, 32, 64],
             "prefill": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1,2, 4, 8, 16, 32, 64, 72],
                 "tp": [1, 2, 4, 8,16,32, 64, 72],
                 "pp": [1],
@@ -151,7 +155,7 @@
                 "moe_ep": [1, 2, 4, 8, 16, 32, 64, 72]
             },
             "decode": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1, 2, 4, 8, 16, 32, 64, 72],
                 "tp": [1, 2, 4, 8,16,32, 64, 72],
                 "pp": [1],
@@ -184,13 +188,13 @@
           "moe_ep": [1, 2, 4, 8, 16, 32, 64, 128, 256]
         },
         "disagg": {
-            "enable_wideep": true,
+            "enable_wideep": false,
             "moe_backend": "deepep_moe",
             "num_gpu_per_replica": [1, 2, 4, 8, 16, 32, 64, 128],
             "prefill_workers": [1, 2, 4, 8, 16, 32, 64, 128],
             "decode_workers": [1, 2, 4, 8, 16, 32, 64, 128],
             "prefill": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1,2, 4, 8, 16, 32, 64, 128],
                 "tp": [1, 2, 4, 8,16,32, 64, 128],
                 "pp": [1],
@@ -199,7 +203,7 @@
                 "moe_ep": [1, 2, 4, 8, 16, 32, 64, 128]
             },
             "decode": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1, 2, 4, 8, 16, 32, 64, 128],
                 "tp": [1, 2, 4, 8,16,32, 64, 128],
                 "pp": [1],
