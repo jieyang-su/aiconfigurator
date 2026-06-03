@@ -1,4 +1,4 @@
-# DeepSeek V4 Operator Calibration
+﻿# DeepSeek V4 Operator Calibration
 
 This note describes the DeepSeek V4 operator calibration path used to estimate
 performance for a target system from a measured source system. The common use
@@ -14,7 +14,7 @@ AIC_DSV4_ATTENTION_CALIBRATE_SYSTEM_PATTERN=PRO6000 \
 AIC_DSV4_ATTENTION_CALIBRATE_MODE=roofline \
 AIC_DISABLE_HYBRID_SHARED_LAYER=1 \
 AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE=1 \
-python3 tools/dsv4flash_topology_automation.py --config docs/perf_database/DSV4-PRO-1024.json
+python3 tools/perf_compare_automation/scripts/dsv4flash_topology_automation.py --config tools/perf_compare_automation/configs/DSV4-PRO-1024.json
 ```
 
 ## Data Flow

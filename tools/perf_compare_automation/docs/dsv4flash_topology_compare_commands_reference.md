@@ -1,8 +1,8 @@
-# DS-V4 Flash Topology Compare 命令参考
+﻿# DS-V4 Flash Topology Compare 命令参考
 
 本文档汇总以下文件的常用执行命令，方便你在服务器直接复现：
 
-- `tools/run_dsv4flash_topology_compare.sh`
+- `tools/perf_compare_automation/scripts/run_dsv4flash_topology_compare.sh`
 - `tools/extract_final_metrics.py`
 - `tools/plot_pareto_compare.py`
 - 相关 system yaml 与实验合同文档
@@ -25,21 +25,21 @@ cat docs/perf_database/dsv4flash_topology_compare_contract.md
 
 ```bash
 # 启动（默认参数已固定：model/backend/version/quant/SLA/isl/osl/total-gpus）
-bash tools/run_dsv4flash_topology_compare.sh start
+bash tools/perf_compare_automation/scripts/run_dsv4flash_topology_compare.sh start
 
 # 或用自定义输出目录
 OUT_DIR=results/dsv4flash_topology_compare_run1 \
-  bash tools/run_dsv4flash_topology_compare.sh start
+  bash tools/perf_compare_automation/scripts/run_dsv4flash_topology_compare.sh start
 ```
 
 ## 3) 查看任务状态与等待结束
 
 ```bash
 # 查看两个后台任务是否仍在运行
-bash tools/run_dsv4flash_topology_compare.sh check
+bash tools/perf_compare_automation/scripts/run_dsv4flash_topology_compare.sh check
 
 # 阻塞等待两个任务完成
-bash tools/run_dsv4flash_topology_compare.sh wait
+bash tools/perf_compare_automation/scripts/run_dsv4flash_topology_compare.sh wait
 ```
 
 ## 4) 日志与命令留痕文件
@@ -120,13 +120,13 @@ uv run --frozen python tools/plot_pareto_compare.py \
 
 ```bash
 # 1) 启动
-bash tools/run_dsv4flash_topology_compare.sh start
+bash tools/perf_compare_automation/scripts/run_dsv4flash_topology_compare.sh start
 
 # 2) 查看状态（可循环执行）
-bash tools/run_dsv4flash_topology_compare.sh check
+bash tools/perf_compare_automation/scripts/run_dsv4flash_topology_compare.sh check
 
 # 3) 等待完成
-bash tools/run_dsv4flash_topology_compare.sh wait
+bash tools/perf_compare_automation/scripts/run_dsv4flash_topology_compare.sh wait
 
 # 4) 抽取对比表
 python tools/extract_final_metrics.py \

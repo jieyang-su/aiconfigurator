@@ -14,7 +14,14 @@ from pathlib import Path
 import yaml
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+def _find_repo_root(start: Path) -> Path:
+    for path in [start, *start.parents]:
+        if (path / "src" / "aiconfigurator").exists():
+            return path
+    raise RuntimeError(f"Cannot find repository root from {start}")
+
+
+REPO_ROOT = _find_repo_root(Path(__file__).resolve())
 SRC_DIR = REPO_ROOT / "src"
 
 _QUANT_OVERRIDE_KEYS = [

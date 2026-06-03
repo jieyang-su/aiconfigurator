@@ -1,4 +1,4 @@
-# Phase 0 Experiment Contract (must-match for both topologies)
+﻿# Phase 0 Experiment Contract (must-match for both topologies)
 
 - model: `sgl-project/DeepSeek-V4-Flash-FP8`
 - backend: `sglang`

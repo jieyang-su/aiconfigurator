@@ -1,6 +1,6 @@
-# DS-V4 Flash Topology Automation 说明
+﻿# DS-V4 Flash Topology Automation 说明
 
-本文档说明 `tools/dsv4flash_topology_automation.py` 的用途、执行流程、配置项语义、环境变量覆盖规则，以及常见日志排查方法。
+本文档说明 `tools/perf_compare_automation/scripts/dsv4flash_topology_automation.py` 的用途、执行流程、配置项语义、环境变量覆盖规则，以及常见日志排查方法。
 
 ## 1. 这个脚本做什么
 
@@ -27,8 +27,8 @@
 示例：
 
 ```bash
-python3 tools/dsv4flash_topology_automation.py \
-  --config docs/perf_database/dsv4flash_topology_compare_fixed_agg_example.json
+python3 tools/perf_compare_automation/scripts/dsv4flash_topology_automation.py \
+  --config tools/perf_compare_automation/configs/dsv4flash_topology_compare_fixed_agg_example.json
 ```
 
 脚本会在配置中的 `out_dir` 下产生完整结果目录，例如：
@@ -41,7 +41,7 @@ python3 tools/dsv4flash_topology_automation.py \
 
 ## 3. 配置文件重点字段
 
-以 `docs/perf_database/dsv4flash_topology_compare_fixed_agg_example.json` 为例：
+以 `tools/perf_compare_automation/configs/dsv4flash_topology_compare_fixed_agg_example.json` 为例：
 
 - 基础实验：
   - `model`, `backend`, `backend_version`
@@ -114,7 +114,7 @@ rg "query_nccl" results/<your_out_dir>/output_*.log
 
 ## 7. 相关文件
 
-- 脚本：`tools/dsv4flash_topology_automation.py`
-- 示例配置：`docs/perf_database/dsv4flash_topology_compare_fixed_agg_example.json`
+- 脚本：`tools/perf_compare_automation/scripts/dsv4flash_topology_automation.py`
+- 示例配置：`tools/perf_compare_automation/configs/dsv4flash_topology_compare_fixed_agg_example.json`
 - 合同说明：`docs/perf_database/dsv4flash_topology_compare_contract.md`
 - 命令参考：`docs/perf_database/dsv4flash_topology_compare_commands_reference.md`
