@@ -20,7 +20,6 @@ import pytest
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.operations.dsv4 import (
     ContextDeepSeekV4AttentionModule,
-    DEFAULT_DSV4_ARCHITECTURE,
     _deep_merge_dsv4_dicts,
     _dsv4_robust_3d_lookup,
 )
@@ -128,12 +127,12 @@ def test_load_dsv4_sparse_kernel_data_basic(tmp_path):
     path = _write_csv(tmp_path / "paged.txt", _SPARSE_HEADER, rows)
     data = load_dsv4_sparse_kernel_data(path)
     assert data is not None
-    # data[architecture][native_heads][tp][past_kv][isl][bs] = {"latency": ...}
-    assert data[DEFAULT_DSV4_ARCHITECTURE][_FLASH_NATIVE_HEADS][1][0][1024][1]["latency"] == pytest.approx(0.10)
-    assert data[DEFAULT_DSV4_ARCHITECTURE][_FLASH_NATIVE_HEADS][1][8192][1024][1]["latency"] == pytest.approx(
+    # data[native_heads][tp][past_kv][isl][bs] = {"latency": ...}
+    assert data[_FLASH_NATIVE_HEADS][1][0][1024][1]["latency"] == pytest.approx(0.10)
+    assert data[_FLASH_NATIVE_HEADS][1][8192][1024][1]["latency"] == pytest.approx(
         0.30
     )
-    assert data[DEFAULT_DSV4_ARCHITECTURE][_FLASH_NATIVE_HEADS][1][0][8192][1]["latency"] == pytest.approx(0.55)
+    assert data[_FLASH_NATIVE_HEADS][1][0][8192][1]["latency"] == pytest.approx(0.55)
 
 
 def test_load_dsv4_sparse_kernel_data_skips_dup_headers(tmp_path):
@@ -147,8 +146,8 @@ def test_load_dsv4_sparse_kernel_data_skips_dup_headers(tmp_path):
     data = load_dsv4_sparse_kernel_data(path)
     assert data is not None
     # Both real rows present, header line silently dropped.
-    assert data[DEFAULT_DSV4_ARCHITECTURE][_FLASH_NATIVE_HEADS][1][0][1024][1]["latency"] == pytest.approx(0.5)
-    assert data[DEFAULT_DSV4_ARCHITECTURE][_FLASH_NATIVE_HEADS][1][0][2048][1]["latency"] == pytest.approx(0.7)
+    assert data[_FLASH_NATIVE_HEADS][1][0][1024][1]["latency"] == pytest.approx(0.5)
+    assert data[_FLASH_NATIVE_HEADS][1][0][2048][1]["latency"] == pytest.approx(0.7)
 
 
 def test_load_dsv4_sparse_kernel_data_missing_returns_none(tmp_path):
@@ -171,9 +170,9 @@ def test_load_context_dsv4_kind_module_data_keys_by_tp(tmp_path):
     path = _write_csv(tmp_path / "csa_ctx.txt", _CTX_HEADER, rows)
     data = load_context_dsv4_kind_module_data(path)
     sub = data[common.FMHAQuantMode.bfloat16][common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block][
-        DEFAULT_DSV4_ARCHITECTURE
-    ][_FLASH_NATIVE_HEADS][4]
-    # keys at the 6th level are tp_size {1, 2, 4, 8}
+        _FLASH_NATIVE_HEADS
+    ][4]
+    # keys at the tp level are {1, 2, 4, 8}
     assert set(sub.keys()) == {1, 2, 4, 8}
     # axis order continues [tp][s][b]
     assert sub[8][8192][1]["latency"] == pytest.approx(10.5)
@@ -195,7 +194,7 @@ def test_load_generation_dsv4_kind_module_data_b_before_s(tmp_path):
     ]
     path = _write_csv(tmp_path / "csa_gen.txt", _CTX_HEADER, rows)
     data = load_generation_dsv4_kind_module_data(path)
-    sub = data[common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block][DEFAULT_DSV4_ARCHITECTURE][
+    sub = data[common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block][
         _FLASH_NATIVE_HEADS
     ][4]
     # axis order [tp][b][s_total] — b comes before s_total
@@ -214,8 +213,8 @@ def test_load_context_dsv4_kind_module_data_keeps_native_heads_separate(tmp_path
     path = _write_csv(tmp_path / "csa_ctx_models.txt", _CTX_HEADER, rows)
     data = load_context_dsv4_kind_module_data(path)
     data = data[common.FMHAQuantMode.bfloat16][common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block]
-    assert data[DEFAULT_DSV4_ARCHITECTURE][_FLASH_NATIVE_HEADS][4][1][8192][1]["latency"] == pytest.approx(18.0)
-    assert data[DEFAULT_DSV4_ARCHITECTURE][_PRO_NATIVE_HEADS][4][1][8192][1]["latency"] == pytest.approx(23.0)
+    assert data[_FLASH_NATIVE_HEADS][4][1][8192][1]["latency"] == pytest.approx(18.0)
+    assert data[_PRO_NATIVE_HEADS][4][1][8192][1]["latency"] == pytest.approx(23.0)
 
 
 def test_load_generation_dsv4_kind_module_data_keeps_native_heads_separate(tmp_path):
@@ -226,8 +225,8 @@ def test_load_generation_dsv4_kind_module_data_keeps_native_heads_separate(tmp_p
     path = _write_csv(tmp_path / "hca_gen_models.txt", _CTX_HEADER, rows)
     data = load_generation_dsv4_kind_module_data(path)
     data = data[common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block]
-    assert data[DEFAULT_DSV4_ARCHITECTURE][_FLASH_NATIVE_HEADS][128][1][1][1024]["latency"] == pytest.approx(0.2)
-    assert data[DEFAULT_DSV4_ARCHITECTURE][_PRO_NATIVE_HEADS][128][1][1][1024]["latency"] == pytest.approx(0.6)
+    assert data[_FLASH_NATIVE_HEADS][128][1][1][1024]["latency"] == pytest.approx(0.2)
+    assert data[_PRO_NATIVE_HEADS][128][1][1][1024]["latency"] == pytest.approx(0.6)
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -322,7 +321,7 @@ def _make_sparse_db_from_grid(per_tp_dict: dict):
     class _DB:
         _dsv4_sparse_kernel_data: ClassVar[dict] = {
             "paged_mqa_logits": LoadedOpData(
-                {DEFAULT_DSV4_ARCHITECTURE: {_FLASH_NATIVE_HEADS: {1: per_tp_dict}}},
+                {_FLASH_NATIVE_HEADS: {1: per_tp_dict}},
                 None,
                 "mock_paged_mqa_logits",
             ),
@@ -421,12 +420,10 @@ def test_lookup_sparse_kernel_uses_cubic_3d_before_fallback(monkeypatch):
         _dsv4_sparse_kernel_data: ClassVar[dict] = {
             "paged_mqa_logits": LoadedOpData(
                 {
-                    DEFAULT_DSV4_ARCHITECTURE: {
-                        _FLASH_NATIVE_HEADS: {
-                            1: {
-                                0: {1024: {1: _sparse_value(1.0)}},
-                                4096: {2048: {2: _sparse_value(4.0)}},
-                            }
+                    _FLASH_NATIVE_HEADS: {
+                        1: {
+                            0: {1024: {1: _sparse_value(1.0)}},
+                            4096: {2048: {2: _sparse_value(4.0)}},
                         }
                     }
                 },

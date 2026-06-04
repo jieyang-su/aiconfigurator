@@ -197,7 +197,7 @@ DEFAULT_DSV4_ARCHITECTURE = "DeepseekV4ForCausalLM"
 
 
 def _dsv4_select_arch(data, architecture: str):
-    """Select architecture bucket when generic DSV4 data carries one."""
+    """Select legacy architecture bucket when old DSV4 data carries one."""
     if isinstance(data, dict) and architecture in data:
         return data[architecture]
     if isinstance(data, dict) and DEFAULT_DSV4_ARCHITECTURE in data:
@@ -1612,8 +1612,8 @@ def _dsv4_normalize_dtype(name: str) -> str:
 def load_context_dsv4_kind_module_data(file_path: str):
     """Load ONE DeepSeek-V4 context CSV (single attn_kind / compress_ratio).
 
-    Returns an 8-level nested dict:
-        data[fmha_quant][kv_quant][gemm_quant][architecture][native_heads][compress_ratio]
+    Returns a nested dict:
+        data[fmha_quant][kv_quant][gemm_quant][native_heads][compress_ratio]
             [tp_size][s][b] = {"latency": ms, "power": W, "energy": J}
 
     ``tp_size`` is the data axis. The model layer passes it through the
@@ -1627,13 +1627,13 @@ def load_context_dsv4_kind_module_data(file_path: str):
         logger.debug(f"DSV4 module data file {file_path} not found.")
         return None
 
-    # 8-level nesting: fmha → kv → gemm → native_heads → cr → tp → s → b
+    # Nesting: fmha -> kv -> gemm -> native_heads -> cr -> tp -> s -> b
     def _make_nested(depth: int):
         if depth == 0:
             return defaultdict()
         return defaultdict(lambda d=depth: _make_nested(d - 1))
 
-    data = _make_nested(8)
+    data = _make_nested(7)
     has_power = bool(rows) and "power" in rows[0]
 
     for row in rows:
@@ -1649,14 +1649,13 @@ def load_context_dsv4_kind_module_data(file_path: str):
             continue
         power = float(row.get("power", 0.0)) if has_power else 0.0
 
-        arch = row.get("architecture", DEFAULT_DSV4_ARCHITECTURE)
         native_heads = int(row["num_heads"])
         gemm_mode = common.GEMMQuantMode[row["gemm_type"]]
         fmha_mode = common.FMHAQuantMode[_dsv4_normalize_dtype(row["mla_dtype"])]
         kv_dtype = common.KVCacheQuantMode[_dsv4_normalize_dtype(row["kv_cache_dtype"])]
 
         # The row-distinguishing axis is ``tp_size`` itself.
-        data[fmha_mode][kv_dtype][gemm_mode][arch][native_heads][cr][tp_size][s][b] = {
+        data[fmha_mode][kv_dtype][gemm_mode][native_heads][cr][tp_size][s][b] = {
             "latency": latency,
             "power": power,
             "energy": power * latency,
@@ -1669,7 +1668,7 @@ def load_generation_dsv4_kind_module_data(file_path: str):
 
     Generation lookup uses absolute KV length ``s_total = isl + step`` (decode
     is q_len=1 with past_kv = step).  Dict shape:
-        data[kv_quant][gemm_quant][architecture][native_heads][compress_ratio]
+        data[kv_quant][gemm_quant][native_heads][compress_ratio]
             [tp_size][b][s_total]
 
     ``tp_size`` is passed by the attention operation for silicon lookup.
@@ -1679,13 +1678,13 @@ def load_generation_dsv4_kind_module_data(file_path: str):
         logger.debug(f"DSV4 module data file {file_path} not found.")
         return None
 
-    # 7-level nesting: kv → gemm → native_heads → cr → tp → b → s_total
+    # Nesting: kv -> gemm -> native_heads -> cr -> tp -> b -> s_total
     def _make_nested(depth: int):
         if depth == 0:
             return defaultdict()
         return defaultdict(lambda d=depth: _make_nested(d - 1))
 
-    data = _make_nested(7)
+    data = _make_nested(6)
     has_power = bool(rows) and "power" in rows[0]
 
     for row in rows:
@@ -1701,7 +1700,6 @@ def load_generation_dsv4_kind_module_data(file_path: str):
             continue
         power = float(row.get("power", 0.0)) if has_power else 0.0
 
-        arch = row.get("architecture", DEFAULT_DSV4_ARCHITECTURE)
         native_heads = int(row["num_heads"])
         gemm_mode = common.GEMMQuantMode[row["gemm_type"]]
         kv_dtype = common.KVCacheQuantMode[_dsv4_normalize_dtype(row["kv_cache_dtype"])]
@@ -1710,7 +1708,7 @@ def load_generation_dsv4_kind_module_data(file_path: str):
         # at the top of the file.  Generation convention puts ``b`` before
         # ``s_total`` (matches existing ``_interp_3d(num_heads, b, s, ...)``
         # call order in ``query_generation_*``).
-        data[kv_dtype][gemm_mode][arch][native_heads][cr][tp_size][b][s_total] = {
+        data[kv_dtype][gemm_mode][native_heads][cr][tp_size][b][s_total] = {
             "latency": latency,
             "power": power,
             "energy": power * latency,
@@ -1849,14 +1847,14 @@ def load_dsv4_sparse_kernel_data(file_path: str):
     kernel-level past_kv Δ correction on top of the chunk-0 module baseline.
 
     Dict structure:
-        data[architecture][native_heads][tp_size][past_kv][isl][bs] = {"latency": ms}
+        data[native_heads][tp_size][past_kv][isl][bs] = {"latency": ms}
     """
     rows = _read_filtered_rows(file_path)
     if rows is None:
         logger.debug(f"DSV4 sparse-kernel data file {file_path} not found.")
         return None
 
-    data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))))
+    data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict()))))
 
     for row in rows:
         # Skip duplicate header rows (file may be appended to across runs)
@@ -1870,8 +1868,7 @@ def load_dsv4_sparse_kernel_data(file_path: str):
             latency = float(row["latency"])
         except (TypeError, ValueError):
             continue
-        arch = row.get("architecture", DEFAULT_DSV4_ARCHITECTURE)
         native_heads = int(row["num_heads"])
-        data[arch][native_heads][tp_size][past_kv][isl][bs] = {"latency": latency}
+        data[native_heads][tp_size][past_kv][isl][bs] = {"latency": latency}
 
     return data
