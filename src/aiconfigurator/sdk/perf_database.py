@@ -484,6 +484,45 @@ def _iter_database_refs_for_system(systems_root: str, system: str, system_spec: 
                 continue
             yield system, backend_name, version, systems_root
 
+def resolve_perf_data_source(
+    *,
+    system: str,
+    backend: str,
+    version: str | None,
+    systems_paths: str | os.PathLike | Iterable[str] | None = None,
+) -> dict[str, str] | None:
+    """Resolve the filesystem source for a system/backend/version database.
+
+    This is a lightweight diagnostic helper for CLI logging. It mirrors the
+    path lookup used by ``get_database`` without constructing a ``PerfDatabase``.
+    Returns ``None`` when the system yaml, data directory, or backend version
+    cannot be resolved.
+    """
+    if not system or not backend or not version:
+        return None
+
+    for systems_root in _as_systems_path_list(systems_paths):
+        system_yaml_path = os.path.join(systems_root, f"{system}.yaml")
+        if not os.path.isfile(system_yaml_path):
+            continue
+
+        system_spec = _load_system_spec(system_yaml_path)
+        if system_spec is None:
+            continue
+
+        data_path = os.path.join(systems_root, system_spec["data_dir"], backend, version)
+        if not os.path.isdir(data_path):
+            continue
+        if os.path.isfile(os.path.join(data_path, "INCOMPLETE.txt")):
+            continue
+
+        return {
+            "systems_root": systems_root,
+            "system_yaml_path": system_yaml_path,
+            "data_path": data_path,
+        }
+
+    return None
 
 def _discover_database_refs(systems_paths: list[str]) -> list[DatabaseRef]:
     refs: list[DatabaseRef] = []
