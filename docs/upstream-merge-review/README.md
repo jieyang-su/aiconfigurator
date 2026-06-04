@@ -807,6 +807,51 @@ Rationale:
   SGLang 0.5.10/0.5.12 collection environments and model-specific DSV4 Pro TP
   sweeps.
 
+## Auto-applied upstream commits after `#1131`
+
+Status: applied without manual conflict resolution.
+
+Commits:
+
+- `1ce6ff60` / `#1092 feat: add non-causal encoder attention perf support`
+- `b2add2fb` / `#1153 feat: add tests&harness&execution plan for sdk core rust migration`
+- `bbeb6549` / `#1152 feat: add FPM forward pass perf model with online tuning`
+- `3bf63c7c` / `#1154 fix(ci): resolve PR number for fork PRs in accuracy regression comment`
+- `a05aacbb` / `#1160 fix: update sglang dsa module collection cases`
+- `5a4caa8e` / `#1156 fix: update b60 support matrix`
+- `69b3cff3` / `#1170 chore: add root cargo workspace`
+- `a54593e2` / `#1174 Order support matrix systems by priority`
+
+Resolution applied:
+
+- No manual conflicts occurred. These commits were accepted as upstream state.
+- For `#1160`, Git auto-merged the DSA module collection updates into the
+  already compatibility-adjusted MLA collector.
+
+## `f93be4ae` / `#1047 perf: replace perf CSV assets with parquet`
+
+Status: resolved during upstream replay.
+
+High-level conflict cause:
+
+- Upstream added `collector/collect.py --keep-csv` while converting perf data
+  assets from text/CSV staging files to parquet final outputs.
+- This fork had added `--sglang-version-branch` in the same parser location
+  for SGLang DSV4 collector compatibility.
+
+Resolution applied:
+
+- Kept both CLI flags. `--sglang-version-branch` still sets
+  `COLLECTOR_SGLANG_VERSION_BRANCH`; `--keep-csv` still controls upstream's
+  parquet finalization behavior.
+- Accepted upstream parquet conversion and finalization changes elsewhere.
+
+Rationale:
+
+- The flags control independent concerns: SGLang API compatibility versus perf
+  asset storage format. Keeping both preserves fork collector compatibility
+  while adopting upstream parquet perf assets.
+
 ## `f93be4ae` / `#1047 perf: replace perf CSV assets with parquet`
 
 Status: resolved during upstream replay.
