@@ -920,8 +920,6 @@ def cli_estimate(
             resolved_version=resolved_version,
             isl=isl,
             osl=osl,
-            nextn=nextn,
-            nextn_accept_rates=nextn_accept_rates,
             # Prefill config (fall back to shared args)
             prefill_tp_size=prefill_tp_size if prefill_tp_size is not None else tp_size,
             prefill_pp_size=prefill_pp_size if prefill_pp_size is not None else pp_size,
