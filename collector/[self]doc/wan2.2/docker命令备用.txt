@@ -1,0 +1,51 @@
+REPO=/root/ljc/sim-proj/aiconfigurator
+IMAGE=lmsysorg/sglang:v0.5.10.post1
+
+*如果是本机H100
+REPO=/home/ai_lab/ljc/scale-up-sim/aiconfigurator
+IMAGE=10.110.181.132:5000/sglang:0.5.10.post1
+
+docker run -it --gpus '"device=0,1"' --ipc=host --rm \
+  -v ${REPO}:/workspace \
+  -w /workspace \
+  ${IMAGE} bash
+
+OUT=/workspace/src/aiconfigurator/tmp/data/r6000pro/sglang/0.5.10.post1-wan2.2-r6000pro-test
+mkdir -p ${OUT}
+cd ${OUT}  # 记得一定要切换到输出目录下
+
+*本机
+OUT=/workspace/src/aiconfigurator/systems/data/h100_sxm/sglang/0.5.10.post1-wan2.2-main0520
+
+# 进入docker容器后
+## 烟测1
+'python /workspace/collector/collect.py \
+    --backend sglang \
+    --ops wan_patch_embed wan_rope wan_attention wan_elementwise \
+    --smoke \
+    --checkpoint-dir checkpoints'
+
+## 烟测其他ops: wan_t5 wan_clip wan_vae wan_vae_attention wan_vae_elementwise
+python /workspace/collector/collect.py \
+    --backend sglang \
+    --ops wan_t5 wan_clip wan_vae wan_vae_attention wan_vae_elementwise \
+    --smoke \
+    --checkpoint-dir checkpoints
+
+## 完整测
+python /workspace/collector/collect.py \
+    --backend sglang \
+    --ops wan_patch_embed wan_rope wan_attention wan_elementwise wan_t5 wan_clip wan_vae wan_vae_attention wan_vae_elementwise \
+    --checkpoint-dir checkpoints
+
+## 测某一单块
+python /workspace/collector/collect.py \
+    --backend sglang \
+    --ops wan_vae_elementwise \
+    --checkpoint-dir checkpoints
+
+## 测gemm
+COLLECTOR_GEMM_ONLY_WAN=1 python /workspace/collector/collect.py \
+    --backend sglang \
+    --ops gemm \
+    --checkpoint-dir checkpoints
