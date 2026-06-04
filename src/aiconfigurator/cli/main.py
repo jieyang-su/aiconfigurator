@@ -490,19 +490,6 @@ def _add_estimate_mode_arguments(parser):
         default=None,
         help="Context tokens budget for IFB scheduling (agg only). Default: same as ISL.",
     )
-    parser.add_argument(
-        "--nextn",
-        type=int,
-        default=0,
-        help="Number of draft tokens for MTP (Multi-Token Prediction) speculative decoding. Default: 0.",
-    )
-    parser.add_argument(
-        "--nextn-accept-rates",
-        type=str,
-        default="0.85,0.3,0,0,0",
-        help="Comma-separated acceptance rates for MTP draft tokens (5 values). "
-        "Only the first --nextn values are used.",
-    )
 
     # Shared parallelism defaults (also used as fallback for prefill/decode-specific args)
     parser.add_argument(
