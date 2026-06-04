@@ -163,6 +163,32 @@ def _gpu_hourly_cost_usd(label: str, case_cfg: dict | None, cfg: dict) -> float 
     return None
 
 
+def _cost_frontier_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    parsed: list[tuple[dict[str, str], float, float]] = []
+    for row in rows:
+        x_value = _as_float(row.get("x"))
+        y_value = _as_float(row.get("y"))
+        if x_value is None or y_value is None:
+            continue
+        parsed.append((row, x_value, y_value))
+
+    frontier: list[dict[str, str]] = []
+    for row, x_value, y_value in parsed:
+        dominated = False
+        for other_row, other_x, other_y in parsed:
+            if other_row is row:
+                continue
+            if other_x >= x_value and other_y <= y_value and (other_x > x_value or other_y < y_value):
+                dominated = True
+                break
+        if not dominated:
+            out_row = dict(row)
+            out_row["cost_frontier"] = "true"
+            frontier.append(out_row)
+
+    return sorted(frontier, key=lambda row: (_as_float(row.get("x"), 0.0), _as_float(row.get("y"), 0.0)))
+
+
 def _env_for_cfg(cfg: dict) -> dict[str, str]:
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH")
@@ -871,6 +897,8 @@ def _write_cost_plot_data(
     case_cfgs: dict[str, dict],
     cfg: dict,
     output_csv: Path,
+    *,
+    cost_frontier_only: bool = False,
 ) -> None:
     if not series:
         return
@@ -920,6 +948,14 @@ def _write_cost_plot_data(
                 rows.append(out_row)
                 point_index += 1
 
+    if cost_frontier_only:
+        grouped_rows: dict[str, list[dict[str, str]]] = {}
+        for row in rows:
+            grouped_rows.setdefault(row["series_label"], []).append(row)
+        rows = []
+        for label in grouped_rows:
+            rows.extend(_cost_frontier_rows(grouped_rows[label]))
+
     fieldnames = [
         "series_label",
         "point_index",
@@ -932,6 +968,8 @@ def _write_cost_plot_data(
         "tput_per_gpu_col",
         "tput_per_gpu",
     ]
+    if cost_frontier_only:
+        fieldnames.append("cost_frontier")
     fieldnames.extend(field for field in original_fields if field not in fieldnames)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", newline="", encoding="utf-8") as f:
@@ -941,7 +979,15 @@ def _write_cost_plot_data(
     print(output_csv)
 
 
-def _plot_cost_compare(series: list[tuple[str, Path]], case_cfgs: dict[str, dict], cfg: dict, title: str, output: Path) -> None:
+def _plot_cost_compare(
+    series: list[tuple[str, Path]],
+    case_cfgs: dict[str, dict],
+    cfg: dict,
+    title: str,
+    output: Path,
+    *,
+    cost_frontier_only: bool = False,
+) -> None:
     if not series:
         return
     import matplotlib.pyplot as plt
@@ -982,6 +1028,11 @@ def _plot_cost_compare(series: list[tuple[str, Path]], case_cfgs: dict[str, dict
                     continue
                 xs.append(x_value)
                 ys.append(gpu_cost / (tput_per_gpu * 3600.0) * 1_000_000.0)
+        if cost_frontier_only:
+            points = [{"x": f"{x:.17g}", "y": f"{y:.17g}"} for x, y in zip(xs, ys, strict=True)]
+            frontier = _cost_frontier_rows(points)
+            xs = [_as_float(row.get("x"), 0.0) or 0.0 for row in frontier]
+            ys = [_as_float(row.get("y"), 0.0) or 0.0 for row in frontier]
         if not xs:
             continue
         linestyle = line_cycle[idx % len(line_cycle)] if line_style == "cycle" else line_style
@@ -1130,6 +1181,21 @@ def _run_compare_cases(cfg: dict, out_dir: Path) -> None:
             cfg,
             f"{title_prefix} {mode} Cost per Million Output Tokens",
             plot_dir / f"pareto_cost_compare_{mode}.png",
+        )
+        _write_cost_plot_data(
+            pareto_series,
+            case_cfgs,
+            cfg,
+            plot_dir / f"pareto_cost_frontier_compare_{mode}.csv",
+            cost_frontier_only=True,
+        )
+        _plot_cost_compare(
+            pareto_series,
+            case_cfgs,
+            cfg,
+            f"{title_prefix} {mode} Cost Frontier per Million Output Tokens",
+            plot_dir / f"pareto_cost_frontier_compare_{mode}.png",
+            cost_frontier_only=True,
         )
         full_series = [(label, paths[mode]) for label, paths in case_all_results.items() if mode in paths]
         _plot_multi_compare(full_series, cfg, f"{title_prefix} {mode} All Candidates", plot_dir / f"full_compare_{mode}.png")
