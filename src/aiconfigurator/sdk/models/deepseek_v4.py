@@ -136,7 +136,6 @@ class DeepSeekV4Model(BaseModel):
                     kvcache_quant_mode,
                     fmha_quant_mode,
                     gemm_quant_mode,
-                    architecture=self.architecture,
                 )
                 for ratio, count in ratio_counts.items()
                 if count > 0

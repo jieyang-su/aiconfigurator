@@ -852,6 +852,39 @@ Rationale:
   asset storage format. Keeping both preserves fork collector compatibility
   while adopting upstream parquet perf assets.
 
+## Final `upstream/main` merge
+
+Status: resolved as a graph-alignment merge after replaying upstream commits.
+
+High-level conflict cause:
+
+- Several upstream commits had already been cherry-picked and manually adapted
+  for fork compatibility. A final `merge upstream/main` therefore re-surfaced
+  those same files as content/add-add conflicts even though the functional
+  changes were already present in the branch.
+- Upstream `#1047` deleted text perf assets after converting database files to
+  parquet, while this fork had renamed some RTX PRO 6000 text assets under a
+  `PRO6000` system directory.
+
+Resolution applied:
+
+- For code and test conflicts, kept the current branch versions. These files
+  already include the upstream behavior plus the fork compatibility decisions
+  recorded above: generic-only DSV4 APIs, model/architecture metadata support,
+  SGLang v0.5.10/v0.5.12 backend selection, and compatibility wrappers.
+- For PRO6000 perf database rename/delete conflicts, accepted the upstream
+  parquet direction and removed the old `.txt` staging files.
+- The merge is intended to make the branch topology include `upstream/main`
+  while preserving the manually reviewed compatibility tree built during the
+  PR-by-PR replay.
+
+Rationale:
+
+- Re-applying upstream content over the already-resolved files would have
+  removed fork-specific compatibility that was intentionally migrated during
+  earlier conflicts. Keeping the current tree for code conflicts avoids undoing
+  that work, while deleting text perf files aligns storage format with upstream.
+
 ## `f93be4ae` / `#1047 perf: replace perf CSV assets with parquet`
 
 Status: resolved during upstream replay.
