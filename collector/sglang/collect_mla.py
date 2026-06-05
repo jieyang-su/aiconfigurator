@@ -131,6 +131,9 @@ class MockServerArgs:
     def __init__(self, kv_cache_dtype: torch.dtype, page_size: int):
         self.enable_lora = False
         self.enable_deterministic_inference = False
+        self.enable_dp_attention = False
+        self.is_embedding = False
+        self.disable_radix_cache = True
         self.kv_cache_dtype = "fp8" if kv_cache_dtype == torch.float8_e4m3fn else "bfloat16"
         self.speculative_eagle_topk = 0
         self.speculative_num_draft_tokens = 0

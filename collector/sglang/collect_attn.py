@@ -88,6 +88,9 @@ class MockServerArgs:
     def __init__(self, page_size: int):
         self.enable_lora = False
         self.enable_deterministic_inference = False
+        self.enable_dp_attention = False
+        self.is_embedding = False
+        self.disable_radix_cache = True
         self.kv_cache_dtype = "auto"
         self.speculative_eagle_topk = 0
         self.speculative_num_draft_tokens = 0
