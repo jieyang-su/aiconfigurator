@@ -172,7 +172,9 @@ def _is_glm5_dsa_model(model_id: str) -> bool:
 def _enable_glm5_dsa_piecewise_graph(attn_type: str, model_id: str) -> bool:
     if _env_flag("AIC_DISABLE_PIECEWISE_CUDA_GRAPH"):
         return False
-    return _env_flag("AIC_ENABLE_PIECEWISE_CUDA_GRAPH") or (attn_type == "dsa" and _is_glm5_dsa_model(model_id))
+    # SGLang 0.5.10 full-model piecewise capture rejects the GLM-5 DSA
+    # attention path; module-level piecewise replay remains enabled below.
+    return _env_flag("AIC_ENABLE_PIECEWISE_CUDA_GRAPH") and attn_type == "dsa" and _is_glm5_dsa_model(model_id)
 
 
 def _piecewise_cuda_graph_tokens_for_cases(test_cases, is_prefill: bool) -> list[int] | None:
@@ -382,8 +384,8 @@ def get_context_test_cases(attn_type: str):
     cases = []
     for compute_dtype, kv_dtype, gemm_type in _get_precision_combos("context"):
         for num_heads in sweep.inner_sweep_head_counts:
-            for batch_size in sweep.batch_sizes:
-                for seq_len in sweep.sequence_lengths:
+            for batch_size in sweep.context_batch_sizes:
+                for seq_len in sweep.context_sequence_lengths:
                     if batch_size * seq_len > sweep.context_max_tokens:
                         continue
                     if (
@@ -765,6 +767,23 @@ def _validate_dsa_tp_module_shapes(model_runner, local_num_heads: int, target_tp
         _expect_module_attr(o_proj, "output_size", int(attn.hidden_size), "o_proj")
 
 
+def _import_sglang_forward_context():
+    """Return SGLang's forward-context wrapper across runtime API versions."""
+    try:
+        from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+    except ModuleNotFoundError:
+        from contextlib import nullcontext
+
+        class ForwardContext:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        def forward_context(_context):
+            return nullcontext()
+
+    return ForwardContext, forward_context
+
+
 def load_model_runner(
     model_path: str,
     head_num: int,
@@ -1083,10 +1102,11 @@ def _run_prefill(
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.chunk_cache import ChunkCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
     from sglang.srt.sampling.sampling_params import SamplingParams
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils import BumpAllocator
+
+    forward_context_type, forward_context = _import_sglang_forward_context()
 
     print(f"\nPrefill: batch_size={batch_size}, seq_length={seq_length}, prefix_len={prefix_len}")
 
@@ -1581,10 +1601,11 @@ def _run_decode(
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.chunk_cache import ChunkCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
     from sglang.srt.sampling.sampling_params import SamplingParams
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils import BumpAllocator
+
+    forward_context_type, forward_context = _import_sglang_forward_context()
 
     print(f"\nDecode: batch_size={batch_size}, kv_cache_length={seq_length}")
 
@@ -1690,7 +1711,7 @@ def _run_decode(
         power_stats = results["power_stats"]
 
         # Log perf — wideep MLA uses isl=seq_len, step=0 (old convention).
-        # DSA uses isl=1, step=seq_len (matches vllm convention).
+        # DSA uses isl=1, step=seq_len, where seq_len is past-KV length.
         # The wideep generation loader computes s = isl + step, so both
         # conventions yield the same effective key when step=0 → s=seq_len.
         try:

@@ -910,3 +910,38 @@ Rationale:
 - The two CLI flags are independent. Accepting upstream parquet data keeps the
   fork aligned with current upstream perf-database storage while preserving the
   fork's SGLang collector compatibility switch.
+
+## 2026-06-05 `upstream/main` merge
+
+Status: resolved while merging the four new upstream commits:
+
+- `29fae326` / `#1158 fix: heal L40S support matrix for latest backends`
+- `81bde10f` / `#1199 ci: cache accuracy regression predictions`
+- `c3ef575c` / `#1197 chore: update Nemotron Ultra HF IDs`
+- `f027123f` / `#1114 fix: improve B200 support matrix coverage and replay tooling`
+
+High-level conflict cause:
+
+- Upstream refreshed SGLang dense attention/MLA mocks for newer backend fields,
+  while this fork already carried SGLang v0.5.10/v0.5.12 compatibility shims.
+- Upstream changed MLA module forward-context usage to the direct current API,
+  while this fork wraps the same section through `maybe_forward_context` so the
+  collector can run across both supported SGLang branches.
+
+Resolution applied:
+
+- In `collector/sglang/collect_attn.py`, kept upstream's structured
+  `MockHFConfig` construction and removed duplicate mock server-arg assignments
+  that would overwrite fork compatibility defaults.
+- In `collector/sglang/collect_mla.py`, kept both the fork's `head_dim` update
+  and upstream's new `swa_v_head_dim` update.
+- In `collector/sglang/collect_mla_module.py`, kept the fork's
+  `maybe_forward_context(...)` wrapper at the conflicted call sites, preserving
+  v0.5.10/v0.5.12 behavior while accepting upstream's surrounding changes.
+
+Validation:
+
+- Conflict-marker scan over the resolved SGLang files passed.
+- `git diff --check` passed.
+- Local Python is unavailable in this workspace, so unit tests could not be
+  executed here.

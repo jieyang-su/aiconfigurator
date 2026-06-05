@@ -108,6 +108,7 @@ class MockModelConfig:
         self.is_hybrid_swa = None
         self.swa_attention_layer_ids = None
         self.full_attention_layer_ids = None
+        self.swa_v_head_dim = v_head_dim
         self.num_attention_heads = num_attention_heads
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -177,6 +178,7 @@ class MockModelRunner:
         self.tp_size = 1
         self.hybrid_gdn_config = None
         self.kimi_linear_config = None
+        self.linear_attn_model_spec = None
         self.model_config = MockModelConfig(num_attention_heads=num_attention_heads, scaling=scaling)
         # Keep attributes for compatibility across sglang versions (older code ignores them)
         self.is_hybrid_swa = self.model_config.is_hybrid_swa
@@ -408,6 +410,7 @@ def run_mla(
     model_runner.model_config.kv_lora_rank = kv_lora_rank
     model_runner.model_config.v_head_dim = v_head_dim
     model_runner.model_config.head_dim = head_dim_total
+    model_runner.model_config.swa_v_head_dim = v_head_dim
     model_runner.model_config.qk_nope_head_dim = qk_nope_head_dim
     model_runner.model_config.qk_rope_head_dim = qk_rope_head_dim
     model_runner.model_config.scaling = MLA_SCALING
