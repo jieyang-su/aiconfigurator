@@ -434,9 +434,10 @@ def _resolve_model_path(
         #   - Setting ``n_shared_experts=0`` makes ``DeepseekV2MoE`` build a
         #     shared expert with intermediate=0, which divides-by-zero in
         #     ``validate_block_quant_shapes``.
-        # 8 routed experts x 2048 inter x 7168 hidden x 1 byte fp8 ≈ 230 MB
-        # per layer, comfortable on one H20.
-        config["n_routed_experts"] = min(int(config.get("n_routed_experts", 8)), 8)
+        # Keep at least tp_size experts because SGLang's DeepseekV2MoE requires
+        # tensor parallel size <= routed expert count.
+        min_routed_experts = max(8, tp_size)
+        config["n_routed_experts"] = min(int(config.get("n_routed_experts", min_routed_experts)), min_routed_experts)
         config["num_experts_per_tok"] = min(int(config.get("num_experts_per_tok", 2)), 2)
 
     tmp_dir = os.path.join(
