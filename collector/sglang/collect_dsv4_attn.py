@@ -357,6 +357,7 @@ def _resolve_model_path(
     disable_weight_quant: bool,
     strip_auto_map: bool = True,
     gemm_type: str = "bfloat16",
+    tp_size: int = 1,
 ) -> str:
     """Create a local config dir patched for a single DSV4 attention kind.
 
@@ -556,6 +557,7 @@ def _load_model_runner(
         shrink_unused_moe=shrink_unused_moe,
         disable_weight_quant=disable_weight_quant,
         gemm_type=gemm_type,
+        tp_size=tp_size,
     )
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
     # CUDA_VISIBLE_DEVICES remaps every child to cuda:0; keep the physical GPU
