@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from pathlib import Path
 
 import pytest
+import yaml
 
 from aiconfigurator.sdk import common, config
 from aiconfigurator.sdk import operations as ops
@@ -18,9 +20,11 @@ from aiconfigurator.sdk.operations.dsv4 import (
 from aiconfigurator.sdk.perf_database import (
     DEFAULT_DSV4_ARCHITECTURE,
     LoadedOpData,
+    PerfDatabase,
     PerfDataNotAvailableError,
     load_mhc_module_data,
 )
+from aiconfigurator.sdk.performance_result import PerformanceResult
 
 pytestmark = pytest.mark.unit
 
@@ -698,6 +702,84 @@ def test_sglang_deepseek_v4_pro_moe_workspace_uses_residual_hidden_size(mutable_
         * attention_width
         * model.config.attention_dp_size
         * model._num_experts
+
+
+def test_deepseek_v4_rejects_unsupported_tp_without_env():
+    model_config = config.ModelConfig(
+        tp_size=3,
+        attention_dp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=3,
+        nextn=0,
+    )
+
+    with pytest.raises(ValueError, match="DeepSeek-V4 attention TP size"):
+        get_model("deepseek-ai/DeepSeek-V4-Pro", model_config, backend_name="sglang")
+
+
+def test_deepseek_v4_allows_unsupported_tp_with_env(monkeypatch):
+    model_config = config.ModelConfig(
+        tp_size=3,
+        attention_dp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=3,
+        nextn=0,
+    )
+    monkeypatch.setenv("AIC_ALLOW_UNSUPPORTED_DSV4_TP", "1")
+
+    model = get_model("deepseek-ai/DeepSeek-V4-Pro", model_config, backend_name="sglang")
+
+    assert model is not None
+
+
+def test_dsv4_calibration_env_enables_operator_calibration(tmp_path: Path, monkeypatch):
+    systems_root = tmp_path / "systems"
+    systems_root.mkdir()
+    system_spec = {
+        "data_dir": "data_target",
+        "misc": {"nccl_version": "v1"},
+        "gpu": {"bfloat16_tc_flops": 1000.0, "mem_bw": 100.0},
+        "node": {"inter_node_bw": 100.0, "intra_node_bw": 100.0, "num_gpus_per_node": 8, "p2p_latency": 1e-6},
+    }
+    source_spec = {
+        "data_dir": "data_source",
+        "misc": {"nccl_version": "v1"},
+        "gpu": {"bfloat16_tc_flops": 2000.0, "mem_bw": 200.0},
+        "node": {"inter_node_bw": 100.0, "intra_node_bw": 100.0, "num_gpus_per_node": 8, "p2p_latency": 1e-6},
+    }
+    (systems_root / "PRO6000_test.yaml").write_text(yaml.safe_dump(system_spec), encoding="utf-8")
+    (systems_root / "h20_sxm.yaml").write_text(yaml.safe_dump(source_spec), encoding="utf-8")
+
+    monkeypatch.setenv("AIC_DSV4_ATTENTION_CALIBRATE_FROM", "h20_sxm")
+    monkeypatch.setenv("AIC_DSV4_ATTENTION_CALIBRATE_SYSTEM_PATTERN", "PRO6000")
+
+    db = PerfDatabase("PRO6000_test", "trtllm", "v1", str(systems_root))
+
+    assert db._dsv4_operator_calibration_enabled is True
+    assert db._dsv4_operator_calibration_source == "h20_sxm"
+
+
+def test_dsv4_calibration_mode_scales_silicon_result(mutable_comprehensive_perf_db, monkeypatch):
+    db = mutable_comprehensive_perf_db
+    db._dsv4_operator_calibration_enabled = True
+    db._dsv4_operator_calibration_source = "h20_sxm"
+    db._dsv4_operator_calibration_system_spec = {
+        "gpu": {"bfloat16_tc_flops": 2000.0, "mem_bw": 200.0},
+    }
+    db.system_spec["gpu"]["bfloat16_tc_flops"] = 1000.0
+    db.system_spec["gpu"]["mem_bw"] = 100.0
+    monkeypatch.setenv("AIC_DSV4_ATTENTION_CALIBRATE_MODE", "2.0")
+
+    result = db._query_silicon_or_hybrid(
+        get_silicon=lambda: PerformanceResult(5.0, energy=3.0, source="silicon"),
+        get_empirical=lambda: 1.0,
+        database_mode=common.DatabaseMode.SILICON,
+        error_msg="calibration test",
+    )
+
+    assert float(result) == pytest.approx(10.0)
+    assert result.energy == pytest.approx(6.0)
+    assert result.source.endswith("dsv4_calibrated_from_h20_sxm")
         * model._topk
         / model.config.moe_ep_size
         / 128

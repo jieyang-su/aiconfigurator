@@ -207,3 +207,18 @@ class TestCustomAllreduceEmptyBucket:
             "PerfDataNotAvailableError is a structured signal — it must not be logged "
             f"via logger.exception. Got: {[r.getMessage() for r in records_with_traceback]}"
         )
+
+    def test_debug_comm_queries_emits_comm_debug_log(self, _db_factory, monkeypatch, caplog):
+        data = _make_defaultdict_custom_allreduce(tp_sizes=[2, 4])
+        db = _db_factory(data)
+        monkeypatch.setenv("AIC_DEBUG_COMM_QUERIES", "1")
+
+        caplog.set_level(logging.INFO, logger="aiconfigurator.sdk.operations.communication")
+        db.query_custom_allreduce(
+            common.CommQuantMode.half,
+            tp_size=4,
+            size=2048,
+            database_mode=common.DatabaseMode.SILICON,
+        )
+
+        assert any("[comm-debug] query_custom_allreduce" in record.getMessage() for record in caplog.records)

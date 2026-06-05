@@ -38,9 +38,11 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 import numpy as np
+import yaml
 
 from aiconfigurator.sdk import common, interpolation
 from aiconfigurator.sdk.operations.base import Operation, _read_filtered_rows
+from aiconfigurator.sdk.system_spec import SystemSpec
 
 logger = logging.getLogger(__name__)
 from aiconfigurator.sdk.performance_result import PerformanceResult
@@ -656,6 +658,8 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
     _data_cache: ClassVar[dict] = {}
     _raw_data_cache: ClassVar[dict] = {}
     _sparse_kernel_cache: ClassVar[dict] = {}
+    _calibration_cache: ClassVar[dict] = {}
+    _raw_calibration_cache: ClassVar[dict] = {}
 
     # ------------------------------------------------------------------
     # Data ownership
@@ -712,6 +716,62 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                 "hca_attn": _load_sparse(PerfDataFilename.dsv4_hca_attn_module),
             }
 
+            cls._calibration_cache[key] = None
+            cls._raw_calibration_cache[key] = None
+            if not getattr(database, "_dsv4_operator_calibration_enabled", False):
+                from aiconfigurator.sdk.perf_database import (
+                    _dsv4_attention_calibration_source,
+                    _dsv4_attention_calibration_target_pattern,
+                )
+
+                source_system = _dsv4_attention_calibration_source()
+                target_pattern = _dsv4_attention_calibration_target_pattern()
+                if source_system and target_pattern and target_pattern in database.system:
+                    source_yaml_path = os.path.join(database.systems_root, source_system + ".yaml")
+                    if os.path.isfile(source_yaml_path):
+                        with open(source_yaml_path, encoding="utf-8") as f:
+                            database._dsv4_attention_calibration_system_spec = SystemSpec(
+                                yaml.load(f, Loader=yaml.SafeLoader)
+                            )
+                        source_system_data_root = os.path.join(
+                            database.systems_root,
+                            database._dsv4_attention_calibration_system_spec["data_dir"],
+                        )
+                        source_data_dir = os.path.join(source_system_data_root, database.backend, database.version)
+
+                        def _load_calibration(filename_enum):
+                            primary_path = os.path.join(source_data_dir, filename_enum.value)
+                            sources = database._build_op_sources(filename_enum, primary_path, source_system_data_root)
+                            return LoadedOpData(
+                                load_context_dsv4_kind_module_data(sources),
+                                filename_enum,
+                                primary_path,
+                            )
+
+                        cal_split = [
+                            _load_calibration(PerfDataFilename.dsv4_csa_context_module),
+                            _load_calibration(PerfDataFilename.dsv4_hca_context_module),
+                        ]
+                        cls._calibration_cache[key] = _load_dsv4_split(cal_split)
+                        cal_merged = cls._calibration_cache[key]
+                        cls._raw_calibration_cache[key] = (
+                            LoadedOpData(copy.deepcopy(cal_merged.data), cal_merged.op_name_enum, cal_merged.filepath)
+                            if cal_merged is not None
+                            else None
+                        )
+                        if cal_merged is not None:
+                            logger.info(
+                                "Using DSV4 attention calibration source system='%s' version='%s' for target system='%s'",
+                                source_system,
+                                database.version,
+                                database.system,
+                            )
+                    else:
+                        logger.warning(
+                            "DSV4 attention calibration source system yaml not found: %s",
+                            source_yaml_path,
+                        )
+
             cls._record_load()
 
         if "_context_deepseek_v4_attention_module_data" not in database.__dict__:
@@ -720,12 +780,18 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             database._raw_context_deepseek_v4_attention_module_data = cls._raw_data_cache[key]
         if "_dsv4_sparse_kernel_data" not in database.__dict__:
             database._dsv4_sparse_kernel_data = cls._sparse_kernel_cache[key]
+        if "_context_deepseek_v4_attention_module_calibration_data" not in database.__dict__:
+            database._context_deepseek_v4_attention_module_calibration_data = cls._calibration_cache[key]
+        if "_raw_context_deepseek_v4_attention_module_calibration_data" not in database.__dict__:
+            database._raw_context_deepseek_v4_attention_module_calibration_data = cls._raw_calibration_cache[key]
 
     @classmethod
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
         cls._raw_data_cache.clear()
         cls._sparse_kernel_cache.clear()
+        cls._calibration_cache.clear()
+        cls._raw_calibration_cache.clear()
 
     # ------------------------------------------------------------------
     # Sparse-kernel lookup helper (formerly PerfDatabase._lookup_dsv4_sparse_kernel)
@@ -1025,6 +1091,62 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                 # Exact → cubic → linear to avoid qhull crashes on the
                 # caps-driven flat b axis.
                 result = _dsv4_robust_3d_lookup(database, deepseek_v4_dict, tp_size, lookup_s, b)
+            calibration_data = getattr(database, "_context_deepseek_v4_attention_module_calibration_data", None)
+            if calibration_data is not None and getattr(calibration_data, "loaded", False):
+                try:
+                    calibration_arch_dict = _dsv4_select_arch(
+                        calibration_data[fmha_quant_mode][kvcache_quant_mode][gemm_quant_mode],
+                        architecture,
+                    )
+                    calibration_native_dict = (
+                        calibration_arch_dict.get(native_heads) if isinstance(calibration_arch_dict, dict) else None
+                    )
+                    if calibration_native_dict is None:
+                        raise KeyError(native_heads)
+                    calibration_dict = calibration_native_dict[compress_ratio]
+                    calibration_result = None
+                    if compress_ratio == 4:
+                        calibration_raw_data = getattr(
+                            database,
+                            "_raw_context_deepseek_v4_attention_module_calibration_data",
+                            None,
+                        )
+                        calibration_raw_dict = None
+                        if calibration_raw_data is not None and getattr(calibration_raw_data, "loaded", True):
+                            try:
+                                calibration_raw_arch_dict = _dsv4_select_arch(
+                                    calibration_raw_data[fmha_quant_mode][kvcache_quant_mode][gemm_quant_mode],
+                                    architecture,
+                                )
+                                calibration_raw_native_dict = (
+                                    calibration_raw_arch_dict.get(native_heads)
+                                    if isinstance(calibration_raw_arch_dict, dict)
+                                    else None
+                                )
+                                calibration_raw_dict = (
+                                    None if calibration_raw_native_dict is None else calibration_raw_native_dict[compress_ratio]
+                                )
+                            except KeyError:
+                                calibration_raw_dict = None
+                        calibration_result = interpolation.interp_context_topk_piecewise_from_raw(
+                            tp_size,
+                            lookup_s,
+                            b,
+                            calibration_raw_dict,
+                            index_topk * compress_ratio,
+                        )
+                    if calibration_result is None:
+                        calibration_result = _dsv4_robust_3d_lookup(database, calibration_dict, tp_size, lookup_s, b)
+                    scale = database._dsv4_attention_calibration_scale(
+                        fmha_quant_mode=fmha_quant_mode,
+                        gemm_quant_mode=gemm_quant_mode,
+                    )
+                    result = {"latency": calibration_result["latency"] * scale, "energy": 0.0}
+                except Exception as exc:
+                    logger.debug(
+                        "DSV4 context attention calibration lookup failed; using target silicon data: %s",
+                        exc,
+                    )
             latency = result["latency"]
             energy = result.get("energy", 0.0)
 
@@ -1079,6 +1201,7 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                 f"Failed to query DeepSeek-V4 context attention module for {b=}, {s=}, {prefix=}, "
                 f"{num_heads=}, {native_heads=}, {tp_size=}, {compress_ratio=}"
             ),
+            dsv4_operator_roofline_scale=lambda: database._dsv4_operator_roofline_scale(get_sol),
         )
 
     # ------------------------------------------------------------------
@@ -1129,6 +1252,7 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
     """
 
     _data_cache: ClassVar[dict] = {}
+    _calibration_cache: ClassVar[dict] = {}
 
     # ------------------------------------------------------------------
     # Data ownership
@@ -1163,14 +1287,66 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             ]
             cls._data_cache[key] = _load_dsv4_split(gen_split)
 
+            cls._calibration_cache[key] = None
+            if not getattr(database, "_dsv4_operator_calibration_enabled", False):
+                from aiconfigurator.sdk.perf_database import (
+                    _dsv4_attention_calibration_source,
+                    _dsv4_attention_calibration_target_pattern,
+                )
+
+                source_system = _dsv4_attention_calibration_source()
+                target_pattern = _dsv4_attention_calibration_target_pattern()
+                if source_system and target_pattern and target_pattern in database.system:
+                    source_yaml_path = os.path.join(database.systems_root, source_system + ".yaml")
+                    if os.path.isfile(source_yaml_path):
+                        with open(source_yaml_path, encoding="utf-8") as f:
+                            database._dsv4_attention_calibration_system_spec = SystemSpec(
+                                yaml.load(f, Loader=yaml.SafeLoader)
+                            )
+                        source_system_data_root = os.path.join(
+                            database.systems_root,
+                            database._dsv4_attention_calibration_system_spec["data_dir"],
+                        )
+                        source_data_dir = os.path.join(source_system_data_root, database.backend, database.version)
+
+                        def _load_calibration(filename_enum):
+                            primary_path = os.path.join(source_data_dir, filename_enum.value)
+                            sources = database._build_op_sources(filename_enum, primary_path, source_system_data_root)
+                            return LoadedOpData(
+                                load_generation_dsv4_kind_module_data(sources),
+                                filename_enum,
+                                primary_path,
+                            )
+
+                        cal_split = [
+                            _load_calibration(PerfDataFilename.dsv4_csa_generation_module),
+                            _load_calibration(PerfDataFilename.dsv4_hca_generation_module),
+                        ]
+                        cls._calibration_cache[key] = _load_dsv4_split(cal_split)
+                        if cls._calibration_cache[key] is not None:
+                            logger.info(
+                                "Using DSV4 attention calibration source system='%s' version='%s' for target system='%s'",
+                                source_system,
+                                database.version,
+                                database.system,
+                            )
+                    else:
+                        logger.warning(
+                            "DSV4 attention calibration source system yaml not found: %s",
+                            source_yaml_path,
+                        )
+
             cls._record_load()
 
         if "_generation_deepseek_v4_attention_module_data" not in database.__dict__:
             database._generation_deepseek_v4_attention_module_data = cls._data_cache[key]
+        if "_generation_deepseek_v4_attention_module_calibration_data" not in database.__dict__:
+            database._generation_deepseek_v4_attention_module_calibration_data = cls._calibration_cache[key]
 
     @classmethod
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
+        cls._calibration_cache.clear()
 
     # ------------------------------------------------------------------
     # Query table (formerly PerfDatabase.query_generation_deepseek_v4_attention_module)
@@ -1261,6 +1437,37 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                 )
             deepseek_v4_dict = native_dict[compress_ratio]
             result = _dsv4_robust_3d_lookup(database, deepseek_v4_dict, tp_size, b, s, batch_axis="y")
+            calibration_data = getattr(database, "_generation_deepseek_v4_attention_module_calibration_data", None)
+            if calibration_data is not None and getattr(calibration_data, "loaded", False):
+                try:
+                    calibration_arch_dict = _dsv4_select_arch(
+                        calibration_data[kvcache_quant_mode][gemm_quant_mode],
+                        architecture,
+                    )
+                    calibration_native_dict = (
+                        calibration_arch_dict.get(native_heads) if isinstance(calibration_arch_dict, dict) else None
+                    )
+                    if calibration_native_dict is None:
+                        raise KeyError(native_heads)
+                    calibration_dict = calibration_native_dict[compress_ratio]
+                    calibration_result = _dsv4_robust_3d_lookup(
+                        database,
+                        calibration_dict,
+                        tp_size,
+                        b,
+                        s,
+                        batch_axis="y",
+                    )
+                    scale = database._dsv4_attention_calibration_scale(
+                        fmha_quant_mode=fmha_quant_mode,
+                        gemm_quant_mode=gemm_quant_mode,
+                    )
+                    result = {"latency": calibration_result["latency"] * scale, "energy": 0.0}
+                except Exception as exc:
+                    logger.debug(
+                        "DSV4 generation attention calibration lookup failed; using target silicon data: %s",
+                        exc,
+                    )
             latency = result["latency"]
             energy = result.get("energy", 0.0)
             return database._interp_pr(latency, energy=energy)
@@ -1273,6 +1480,7 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                 f"Failed to query DeepSeek-V4 generation attention module for {b=}, {s=}, "
                 f"{num_heads=}, {native_heads=}, {tp_size=}, {compress_ratio=}"
             ),
+            dsv4_operator_roofline_scale=lambda: database._dsv4_operator_roofline_scale(get_sol),
         )
 
     # ------------------------------------------------------------------

@@ -27,6 +27,56 @@ _SYSTEMS_PATHS: list[str] = [os.fspath(pkg_resources.files("aiconfigurator") / "
 _MISSING_SILICON_DATA_EXCEPTIONS = (KeyError, IndexError)
 
 
+def _comm_debug_enabled() -> bool:
+    return os.environ.get("AIC_DEBUG_COMM_QUERIES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dsv4_attention_calibration_source() -> str | None:
+    value = os.environ.get("AIC_DSV4_ATTENTION_CALIBRATE_FROM", "").strip()
+    return value or None
+
+
+def _dsv4_attention_calibration_target_pattern() -> str:
+    return os.environ.get("AIC_DSV4_ATTENTION_CALIBRATE_SYSTEM_PATTERN", "PRO6000").strip()
+
+
+def _dsv4_calibration_mode() -> str:
+    return os.environ.get("AIC_DSV4_ATTENTION_CALIBRATE_MODE", "roofline").strip().lower()
+
+
+def _nccl_perf_filename_override(system_spec: dict) -> str | None:
+    filename = os.environ.get("AIC_NCCL_PERF_FILE") or system_spec.get("misc", {}).get("nccl_perf_file")
+    if filename is None:
+        return None
+    filename = filename.strip()
+    if not filename:
+        return None
+    if filename != os.path.basename(filename):
+        raise ValueError(
+            "NCCL perf filename override must be a file name under the selected nccl_version directory, "
+            f"got: {filename}"
+        )
+    return filename
+
+
+def _hybrid_shared_layer_enabled(database_mode: str | None) -> bool:
+    if (database_mode or "").upper() != "HYBRID":
+        return False
+    return os.environ.get("AIC_DISABLE_HYBRID_SHARED_LAYER", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _log_comm_debug(event: str, **fields) -> None:
+    if not _comm_debug_enabled():
+        return
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.info("[comm-debug] %s %s", event, payload)
+
+
 def _normalize_systems_paths(raw_paths: str | Iterable[str] | None) -> list[str]:
     default_path = os.fspath(pkg_resources.files("aiconfigurator") / "systems")
     if raw_paths is None:
@@ -359,20 +409,22 @@ def get_database(
         logger.error(f"No database version available for {system=}, {backend=}")
         return None
 
-    shared_flag = (database_mode or "").upper() == "HYBRID"
+    shared_flag = _hybrid_shared_layer_enabled(database_mode)
     missing_data_candidate = None
     for systems_root in systems_paths:
         system_yaml_path = os.path.join(systems_root, f"{system}.yaml")
         if not os.path.isfile(system_yaml_path):
             continue
-        cache_key = (systems_root, system, shared_flag)
         try:
             with open(system_yaml_path) as f:
                 system_spec = yaml.load(f, Loader=yaml.SafeLoader)
             data_dir = system_spec["data_dir"]
+            nccl_perf_filename = _nccl_perf_filename_override(system_spec)
         except Exception:
             logger.warning(f"failed to read system spec at {system_yaml_path}, continuing searching")
             continue
+
+        cache_key = (systems_root, system, shared_flag, nccl_perf_filename)
 
         data_path = os.path.join(systems_root, data_dir, backend, version)
         is_incomplete = os.path.isfile(os.path.join(data_path, "INCOMPLETE.txt"))
@@ -1223,9 +1275,13 @@ class PerfDatabase:
         self.backend = backend
         self.version = version
         self.systems_root = systems_root
-        self.enable_shared_layer = (database_mode or "").upper() == "HYBRID"
+        self.enable_shared_layer = _hybrid_shared_layer_enabled(database_mode)
         with open(os.path.join(systems_root, system + ".yaml")) as f:
             self.system_spec = SystemSpec(yaml.load(f, Loader=yaml.SafeLoader))
+        self._dsv4_operator_calibration_enabled = False
+        self._dsv4_operator_calibration_source = None
+        self._dsv4_operator_calibration_system_spec = None
+        self._dsv4_attention_calibration_system_spec = None
         self._default_database_mode = common.DatabaseMode.SILICON  # default mode is SILICON
 
         # Cache for extracted metric data to avoid repeated extraction in _interp_3d
@@ -1235,6 +1291,24 @@ class PerfDatabase:
         # (lazy-load path inside each op class) to discover which sibling
         # backend/version dirs hold rows the active backend can inherit.
         self._op_kernel_source_manifest_entries = _load_op_kernel_source_manifest_entries(systems_root)
+
+        calibration_source = _dsv4_attention_calibration_source()
+        calibration_target_pattern = _dsv4_attention_calibration_target_pattern()
+        if calibration_source and calibration_target_pattern and calibration_target_pattern in self.system:
+            source_yaml_path = os.path.join(systems_root, calibration_source + ".yaml")
+            if os.path.isfile(source_yaml_path):
+                with open(source_yaml_path, encoding="utf-8") as f:
+                    self._dsv4_operator_calibration_system_spec = SystemSpec(yaml.load(f, Loader=yaml.SafeLoader))
+                self._dsv4_operator_calibration_enabled = True
+                self._dsv4_operator_calibration_source = calibration_source
+                logger.info(
+                    "Using DSV4 operator calibration source system='%s' version='%s' for target system='%s'",
+                    calibration_source,
+                    version,
+                    self.system,
+                )
+            else:
+                logger.warning("DSV4 operator calibration source system yaml not found: %s", source_yaml_path)
 
         # lazy per-op data ownership: every op class owns its CSV data and loads it on first query
         # via ``OpClass.load_data(database)``. No eager warm-up here — each op
@@ -1550,6 +1624,11 @@ class PerfDatabase:
         get_empirical: Callable[[], float],
         database_mode: common.DatabaseMode,
         error_msg: str,
+        fallback_source: str = "empirical",
+        fallback_debug_event: str | None = None,
+        fallback_debug_fields: dict | None = None,
+        apply_dsv4_operator_calibration: bool = True,
+        dsv4_operator_roofline_scale: Callable[[], float] | None = None,
     ) -> PerformanceResult:
         """
         Helper method to query database (SILICON mode) with optional fallback to empirical mode.
@@ -1568,13 +1647,27 @@ class PerfDatabase:
             error_msg += "."
 
         try:
-            return get_silicon()
+            result = get_silicon()
+            if apply_dsv4_operator_calibration:
+                result = self._apply_dsv4_operator_calibration(
+                    result,
+                    roofline_scale=dsv4_operator_roofline_scale,
+                )
+            return result
 
         except Exception as e:
             if database_mode == common.DatabaseMode.HYBRID:
                 debug_msg = error_msg + " Will try empirical mode."
                 logger.debug(debug_msg)
-                return PerformanceResult(get_empirical(), energy=0.0, source="empirical")
+                emp_latency = get_empirical()
+                if fallback_debug_event is not None:
+                    fields = dict(fallback_debug_fields or {})
+                    fields.setdefault("source", fallback_source)
+                    fields["fallback_reason"] = type(e).__name__
+                    fields["fallback_detail"] = str(e)
+                    fields["latency_ms"] = f"{emp_latency:.6f}"
+                    _log_comm_debug(fallback_debug_event, **fields)
+                return PerformanceResult(emp_latency, energy=0.0, source=fallback_source)
 
             exception_msg = error_msg + " Consider using HYBRID mode."
             # PerfDataNotAvailableError is a structured signal that callers (e.g.
@@ -1598,6 +1691,115 @@ class PerfDatabase:
             else:
                 e.args = (exception_msg,)
             raise
+
+    def _dsv4_operator_calibration_scale(self, roofline_scale: Callable[[], float] | None = None) -> float:
+        mode = _dsv4_calibration_mode()
+        try:
+            return float(mode)
+        except ValueError:
+            pass
+
+        source_spec = getattr(self, "_dsv4_operator_calibration_system_spec", None)
+        if source_spec is None:
+            return 1.0
+
+        source_gpu = source_spec["gpu"]
+        target_gpu = self.system_spec["gpu"]
+        mem_scale = source_gpu["mem_bw"] / target_gpu["mem_bw"]
+
+        def _gpu_flops(gpu: dict, key: str) -> float | None:
+            value = gpu.get(key)
+            return float(value) if value else None
+
+        source_compute = _gpu_flops(source_gpu, "fp8_tc_flops") or _gpu_flops(source_gpu, "bfloat16_tc_flops")
+        target_compute = _gpu_flops(target_gpu, "fp8_tc_flops") or _gpu_flops(target_gpu, "bfloat16_tc_flops")
+        compute_scale = source_compute / target_compute if source_compute and target_compute else 1.0
+
+        if mode == "roofline" and roofline_scale is not None:
+            try:
+                return roofline_scale()
+            except Exception:
+                logger.debug("DSV4 per-op roofline calibration failed; using global roofline scale", exc_info=True)
+        if mode == "memory":
+            return mem_scale
+        if mode == "compute":
+            return compute_scale
+        if mode == "min":
+            return min(mem_scale, compute_scale)
+        return max(mem_scale, compute_scale)
+
+    def _dsv4_operator_roofline_scale(self, get_sol: Callable[[], tuple[float, float, float]]) -> float:
+        source_spec = getattr(self, "_dsv4_operator_calibration_system_spec", None)
+        if source_spec is None:
+            return 1.0
+
+        target_spec = self.system_spec
+
+        def _sol_time(spec: SystemSpec) -> float:
+            original_spec = self.system_spec
+            self.system_spec = spec
+            try:
+                result = get_sol()
+            finally:
+                self.system_spec = original_spec
+            return float(result[0] if isinstance(result, tuple) else result)
+
+        source_sol = _sol_time(source_spec)
+        target_sol = _sol_time(target_spec)
+        if source_sol <= 0 or target_sol <= 0:
+            return 1.0
+        return target_sol / source_sol
+
+    def _apply_dsv4_operator_calibration(
+        self,
+        result: PerformanceResult,
+        roofline_scale: Callable[[], float] | None = None,
+    ) -> PerformanceResult:
+        if not self._dsv4_operator_calibration_enabled:
+            return result
+        scale = self._dsv4_operator_calibration_scale(roofline_scale=roofline_scale)
+        source = f"{result.source}:dsv4_calibrated_from_{self._dsv4_operator_calibration_source}"
+        return PerformanceResult(float(result) * scale, energy=result.energy * scale, source=source)
+
+    def _dsv4_attention_calibration_scale(
+        self,
+        *,
+        fmha_quant_mode: common.FMHAQuantMode,
+        gemm_quant_mode: common.GEMMQuantMode,
+    ) -> float:
+        mode = _dsv4_calibration_mode()
+        try:
+            return float(mode)
+        except ValueError:
+            pass
+
+        source_spec = getattr(self, "_dsv4_attention_calibration_system_spec", None)
+        if source_spec is None:
+            return 1.0
+
+        source_gpu = source_spec["gpu"]
+        target_gpu = self.system_spec["gpu"]
+        mem_scale = source_gpu["mem_bw"] / target_gpu["mem_bw"]
+
+        def _flops(spec: dict, quant_mode) -> float:
+            compute_to_flops_key = {1: "bfloat16_tc_flops", 2: "fp8_tc_flops", 4: "fp4_tc_flops"}
+            key = compute_to_flops_key.get(quant_mode.value.compute)
+            if key is not None and key in spec:
+                return spec[key]
+            return spec["bfloat16_tc_flops"] * quant_mode.value.compute
+
+        compute_scale = max(
+            _flops(source_gpu, common.GEMMQuantMode.bfloat16) / _flops(target_gpu, common.GEMMQuantMode.bfloat16),
+            _flops(source_gpu, gemm_quant_mode) / _flops(target_gpu, gemm_quant_mode),
+            _flops(source_gpu, fmha_quant_mode) / _flops(target_gpu, fmha_quant_mode),
+        )
+        if mode == "memory":
+            return mem_scale
+        if mode == "compute":
+            return compute_scale
+        if mode == "min":
+            return min(mem_scale, compute_scale)
+        return max(mem_scale, compute_scale)
 
     @functools.lru_cache(maxsize=32768)
     def query_gemm(

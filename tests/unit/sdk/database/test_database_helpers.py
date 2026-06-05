@@ -332,6 +332,35 @@ def test_get_database_skips_incomplete_version_directory(tmp_path: Path, perf_da
         perf_database.databases_cache.update(cache_snapshot)
 
 
+def test_get_database_respects_disable_hybrid_shared_layer_env(tmp_path: Path, perf_database, monkeypatch):
+    systems_root = tmp_path / "systems"
+    systems_root.mkdir()
+    (systems_root / "sys.yaml").write_text(yaml.safe_dump({"data_dir": "data_sys"}), encoding="utf-8")
+    (systems_root / "data_sys" / "trtllm" / "1.0.0").mkdir(parents=True)
+
+    class FakePerfDatabase:
+        def __init__(self, system, backend, version, systems_root, database_mode=None):
+            self.enable_shared_layer = perf_database._hybrid_shared_layer_enabled(database_mode)
+
+    monkeypatch.setattr(perf_database, "PerfDatabase", FakePerfDatabase)
+    monkeypatch.setenv("AIC_DISABLE_HYBRID_SHARED_LAYER", "1")
+    cache_snapshot = dict(perf_database.databases_cache)
+    try:
+        perf_database.databases_cache.clear()
+        db = perf_database.get_database(
+            "sys",
+            "trtllm",
+            "1.0.0",
+            systems_paths=[str(systems_root)],
+            database_mode="HYBRID",
+        )
+
+        assert db.enable_shared_layer is False
+    finally:
+        perf_database.databases_cache.clear()
+        perf_database.databases_cache.update(cache_snapshot)
+
+
 def test_perf_database_clear_runtime_caches_clears_interpolation_and_lru_state(perf_database):
     db = object.__new__(perf_database.PerfDatabase)
     db._extracted_metrics_cache = {"table": object()}

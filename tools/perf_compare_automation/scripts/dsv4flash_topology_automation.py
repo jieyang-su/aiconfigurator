@@ -416,7 +416,19 @@ def _fixed_worker_config(cfg: dict, fixed: dict) -> dict:
     if "attention_backend" in fixed:
         worker_cfg["attention_backend"] = fixed["attention_backend"]
     _copy_worker_tuning(worker_cfg, cfg, fixed)
+    _normalize_sglang_moe_flags(cfg, worker_cfg)
     return worker_cfg
+
+
+def _normalize_sglang_moe_flags(cfg: dict, target: dict) -> None:
+    # Legacy non-wideep SGLang automation cases omit the DeepEP override. If a
+    # config explicitly disables WideEP, carrying deepep_moe into the generated
+    # YAML forces runtime onto wideep_deepep_* perf tables and regresses those
+    # cases.
+    if str(cfg.get("backend", "")).lower() != "sglang":
+        return
+    if target.get("enable_wideep") is False and target.get("moe_backend") == "deepep_moe":
+        target.pop("moe_backend", None)
 
 
 def _base_exp_config(cfg: dict, system_name: str) -> dict:
@@ -436,6 +448,7 @@ def _base_exp_config(cfg: dict, system_name: str) -> dict:
     for key in ["prefix", "request_latency", "enable_wideep", "enable_eplb", "moe_backend", "attention_backend"]:
         if key in cfg:
             exp_cfg[key] = cfg[key]
+    _normalize_sglang_moe_flags(cfg, exp_cfg)
     return exp_cfg
 
 
@@ -445,6 +458,7 @@ def _apply_exp_overrides(exp_cfg: dict, overrides: dict | None) -> None:
     for key in ["prefix", "request_latency", "enable_wideep", "enable_eplb", "moe_backend", "attention_backend"]:
         if key in overrides:
             exp_cfg[key] = overrides[key]
+    _normalize_sglang_moe_flags(exp_cfg, exp_cfg)
 
 
 def _build_custom_experiment_yaml(cfg: dict, system_name: str) -> dict:

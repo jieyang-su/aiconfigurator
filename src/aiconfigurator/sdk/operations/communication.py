@@ -41,6 +41,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _comm_debug_enabled() -> bool:
+    return os.environ.get("AIC_DEBUG_COMM_QUERIES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _log_comm_debug(event: str, **fields) -> None:
+    if not _comm_debug_enabled():
+        return
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.info("[comm-debug] %s %s", event, payload)
+
+
 def _prefer_nccl_for_custom_allreduce_enabled() -> bool:
     return os.environ.get("AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE", "").strip().lower() in {
         "1",
@@ -165,11 +176,29 @@ class CustomAllReduce(Operation):
             database_mode = database._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(quant_mode, tp_size, size)[0]
+            _log_comm_debug(
+                "query_custom_allreduce",
+                mode=database_mode.name,
+                quant_mode=quant_mode.name,
+                requested_tp=tp_size,
+                message_size=size,
+                source="sol",
+                latency_ms=f"{sol_latency:.6f}",
+            )
             return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(quant_mode, tp_size, size)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(quant_mode, tp_size, size)
+            _log_comm_debug(
+                "query_custom_allreduce",
+                mode=database_mode.name,
+                quant_mode=quant_mode.name,
+                requested_tp=tp_size,
+                message_size=size,
+                source="empirical",
+                latency_ms=f"{emp_latency:.6f}",
+            )
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
 
         cls.load_data(database)
@@ -177,8 +206,26 @@ class CustomAllReduce(Operation):
 
         def get_silicon():
             if tp_size == 1:
+                _log_comm_debug(
+                    "query_custom_allreduce",
+                    mode=database_mode.name,
+                    quant_mode=quant_mode.name,
+                    requested_tp=tp_size,
+                    message_size=size,
+                    source="custom_allreduce",
+                    effective_tp=1,
+                    latency_ms="0.000000",
+                )
                 return PerformanceResult(0.0, energy=0.0, source="empirical")
             if _prefer_nccl_for_custom_allreduce_enabled():
+                _log_comm_debug(
+                    "query_custom_allreduce",
+                    mode=database_mode.name,
+                    quant_mode=quant_mode.name,
+                    requested_tp=tp_size,
+                    message_size=size,
+                    source="prefer_nccl_substitute",
+                )
                 return database.query_nccl(
                     quant_mode,
                     tp_size,
@@ -188,6 +235,14 @@ class CustomAllReduce(Operation):
                 )
             if database.system_spec["node"]["num_gpus_per_node"] == 72 and tp_size > 4:
                 # on GB200, we only have custom all reduce for up to tp4.
+                _log_comm_debug(
+                    "query_custom_allreduce",
+                    mode=database_mode.name,
+                    quant_mode=quant_mode.name,
+                    requested_tp=tp_size,
+                    message_size=size,
+                    source="fallback_to_nccl",
+                )
                 return database.query_nccl(quant_mode, tp_size, "all_reduce", size)
 
             data_wrapper.raise_if_not_loaded()
@@ -237,6 +292,20 @@ class CustomAllReduce(Operation):
                 lat = lat * scale_factor
                 energy = energy * scale_factor
 
+            _log_comm_debug(
+                "query_custom_allreduce",
+                mode=database_mode.name,
+                quant_mode=quant_mode.name,
+                requested_tp=tp_size,
+                effective_tp=effective_tp,
+                message_size=size,
+                bucket_left=size_left,
+                bucket_right=size_right,
+                scaled=int(tp_size > database.system_spec["node"]["num_gpus_per_node"]),
+                source="custom_allreduce",
+                data_file=data_wrapper.filepath,
+                latency_ms=f"{lat:.6f}",
+            )
             return database._interp_pr(lat, energy=energy)
 
         return database._query_silicon_or_hybrid(
@@ -244,6 +313,13 @@ class CustomAllReduce(Operation):
             get_empirical=lambda: get_empirical(quant_mode, tp_size, size),
             database_mode=database_mode,
             error_msg=f"Failed to query custom allreduce data for {quant_mode=}, {tp_size=}, {size=}",
+            fallback_debug_event="query_custom_allreduce",
+            fallback_debug_fields={
+                "mode": database_mode.name,
+                "quant_mode": quant_mode.name,
+                "requested_tp": tp_size,
+                "message_size": size,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -392,24 +468,56 @@ class NCCL(Operation):
         if database_mode is None:
             database_mode = database._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol(dtype, num_gpus, operation, message_size)[0], energy=0.0, source="sol")
+            sol_latency = get_sol(dtype, num_gpus, operation, message_size)[0]
+            _log_comm_debug(
+                "query_nccl",
+                mode=database_mode.name,
+                dtype=dtype.name,
+                num_gpus=num_gpus,
+                operation=operation,
+                message_size=message_size,
+                source="sol",
+                latency_ms=f"{sol_latency:.6f}",
+            )
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(dtype, num_gpus, operation, message_size)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
-            return PerformanceResult(
-                get_empirical(dtype, num_gpus, operation, message_size), energy=0.0, source="empirical"
+            emp_latency = get_empirical(dtype, num_gpus, operation, message_size)
+            _log_comm_debug(
+                "query_nccl",
+                mode=database_mode.name,
+                dtype=dtype.name,
+                num_gpus=num_gpus,
+                operation=operation,
+                message_size=message_size,
+                source="empirical",
+                latency_ms=f"{emp_latency:.6f}",
             )
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
 
         cls.load_data(database)
 
         def get_silicon():
             if num_gpus == 1:
+                _log_comm_debug(
+                    "query_nccl",
+                    mode=database_mode.name,
+                    dtype=dtype.name,
+                    num_gpus=num_gpus,
+                    operation=operation,
+                    message_size=message_size,
+                    source="nccl",
+                    latency_ms="0.000000",
+                )
                 return PerformanceResult(0.0, energy=0.0, source="empirical")
 
             # Use oneCCL data as fallback when NCCL data is not available (e.g. XPU systems)
             nccl_source = database._nccl_data
+            source_name = "nccl"
             if not nccl_source.loaded and database._oneccl_data is not None and database._oneccl_data.loaded:
                 nccl_source = database._oneccl_data
+                source_name = "oneccl"
             nccl_source.raise_if_not_loaded()
 
             max_num_gpus = max(nccl_source[dtype][operation].keys())
@@ -441,6 +549,20 @@ class NCCL(Operation):
                 lat = lat * scaling_formula
                 energy = energy * scaling_formula
 
+            _log_comm_debug(
+                "query_nccl",
+                mode=database_mode.name,
+                dtype=dtype.name,
+                num_gpus=num_gpus,
+                operation=operation,
+                message_size=message_size,
+                bucket_left=size_left,
+                bucket_right=size_right,
+                source=source_name,
+                data_file=nccl_source.filepath,
+                scaled=int(num_gpus > max_num_gpus),
+                latency_ms=f"{lat:.6f}",
+            )
             return database._interp_pr(lat, energy=energy)
 
         return database._query_silicon_or_hybrid(
@@ -448,6 +570,14 @@ class NCCL(Operation):
             get_empirical=lambda: get_empirical(dtype, num_gpus, operation, message_size),
             database_mode=database_mode,
             error_msg=f"Failed to query nccl data for {dtype=}, {num_gpus=}, {operation=}, {message_size=}",
+            fallback_debug_event="query_nccl",
+            fallback_debug_fields={
+                "mode": database_mode.name,
+                "dtype": dtype.name,
+                "num_gpus": num_gpus,
+                "operation": operation,
+                "message_size": message_size,
+            },
         )
 
     # ------------------------------------------------------------------
