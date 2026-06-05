@@ -76,6 +76,8 @@ class MockModelConfig:
                 self.architectures = ["LlamaForCausalLM"]
 
         self.hf_config = MockHFConfig()
+        self.hf_text_config = MockHFConfig()
+        self.hf_text_config.num_attention_heads = num_attention_heads
         self.dtype = torch.bfloat16
 
     def get_num_kv_heads(self, tp_size):

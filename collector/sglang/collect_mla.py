@@ -113,8 +113,15 @@ class MockModelConfig:
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
+        self.head_dim = kv_lora_rank + qk_rope_head_dim
         self.scaling = scaling
         self.is_local_attention_model = False
+
+        class MockHFTextConfig:
+            def __init__(self, num_heads):
+                self.num_attention_heads = num_heads
+
+        self.hf_text_config = MockHFTextConfig(num_attention_heads)
 
     def get_num_kv_heads(self, tp_size: int):
         return 1
@@ -396,6 +403,7 @@ def run_mla(
     # Must update config BEFORE creating attn_backend so it picks up the right v_head_dim
     model_runner.model_config.kv_lora_rank = kv_lora_rank
     model_runner.model_config.v_head_dim = v_head_dim
+    model_runner.model_config.head_dim = head_dim_total
     model_runner.model_config.qk_nope_head_dim = qk_nope_head_dim
     model_runner.model_config.qk_rope_head_dim = qk_rope_head_dim
     model_runner.model_config.scaling = MLA_SCALING

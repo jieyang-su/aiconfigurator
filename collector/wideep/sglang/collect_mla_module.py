@@ -13,10 +13,12 @@ from collector.sglang.collect_mla_module import run_mla_module_worker as _run_ml
 
 
 def get_wideep_mla_context_test_cases(*args, **kwargs):
+    kwargs.pop("model_path", None)
     return _get_wideep_mla_context_test_cases(*args, **kwargs)
 
 
 def get_wideep_mla_generation_test_cases(*args, **kwargs):
+    kwargs.pop("model_path", None)
     return _get_wideep_mla_generation_test_cases(*args, **kwargs)
 
 
