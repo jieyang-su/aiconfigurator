@@ -171,6 +171,7 @@ class MockModelRunner:
         self.attn_backend = None
         self.sliding_window_size = None
         self.is_hybrid = False
+        self.tp_size = 1
         self.hybrid_gdn_config = None
         self.kimi_linear_config = None
         self.model_config = MockModelConfig(num_attention_heads=num_attention_heads, scaling=scaling)
