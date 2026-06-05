@@ -76,6 +76,7 @@ def _db_factory(tmp_path, monkeypatch):
     }
 
     def _factory(*, nccl_data=None, oneccl_data=None, has_oneccl_version=True):
+    def _factory(*, nccl_data=None, oneccl_data=None, has_oneccl_version=True, path_log=None):
         spec = dict(dummy_spec_base)
         spec["misc"] = dict(spec["misc"])
         if has_oneccl_version:
@@ -98,6 +99,8 @@ def _db_factory(tmp_path, monkeypatch):
         def _nccl_load_dispatch(path):
             # First call is for NCCL, second for OneCCL (per __init__ ordering)
             call_count["n"] += 1
+            if path_log is not None:
+                path_log.append(path)
             if call_count["n"] == 1:
                 return nccl_data
             return oneccl_data
@@ -130,6 +133,26 @@ def _db_factory(tmp_path, monkeypatch):
 
 class TestNcclOnecclFallback:
     """Verify the NCCL → OneCCL fallback logic in query_nccl (SILICON mode)."""
+
+    def test_nccl_filename_override_env_is_used_for_load_path(self, _db_factory, monkeypatch):
+        """AIC_NCCL_PERF_FILE must override the default nccl perf file name."""
+        nccl = _make_comm_data(_DTYPES, _OPS, _NCCL_GPUS, _MSG_SIZES, scale=0.001, power=5.0)
+        path_log = []
+        monkeypatch.setenv("AIC_NCCL_PERF_FILE", "custom_override_nccl.txt")
+
+        db = _db_factory(nccl_data=nccl, oneccl_data=None, has_oneccl_version=False, path_log=path_log)
+        result = db.query_nccl(
+            common.CommQuantMode.half,
+            4,
+            "all_reduce",
+            1024,
+            database_mode=common.DatabaseMode.SILICON,
+        )
+
+        assert float(result) > 0
+        assert path_log, "expected NCCL loader to be invoked"
+        assert str(path_log[0]).endswith("custom_override_nccl.txt")
+        assert str(db._nccl_data.filepath).endswith("custom_override_nccl.txt")
 
     def test_nccl_loaded_uses_nccl(self, _db_factory):
         """When NCCL data is loaded, query_nccl should use it directly."""

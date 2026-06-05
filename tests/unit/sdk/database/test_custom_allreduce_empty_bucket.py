@@ -18,12 +18,14 @@ successful Pareto searches was the user-facing symptom of the bug.
 import logging
 import math
 from collections import defaultdict
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
 
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.perf_database import PerfDatabase, PerfDataNotAvailableError
+from aiconfigurator.sdk.performance_result import PerformanceResult
 
 
 def _make_defaultdict_custom_allreduce(tp_sizes):
@@ -139,6 +141,29 @@ class TestCustomAllreduceEmptyBucket:
             database_mode=common.DatabaseMode.HYBRID,
         )
         assert float(result) > 0, "HYBRID empirical fallback should yield positive latency"
+
+    def test_prefer_nccl_substitutes_before_missing_bucket_error(self, _db_factory, monkeypatch):
+        """The legacy env var must route custom_allreduce through NCCL before table lookup."""
+        data = _make_defaultdict_custom_allreduce(tp_sizes=[2, 4])
+        db = _db_factory(data)
+        monkeypatch.setenv("AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE", "1")
+        db.query_nccl = MagicMock(return_value=PerformanceResult(12.34, energy=0.0, source="nccl"))
+
+        result = db.query_custom_allreduce(
+            common.CommQuantMode.half,
+            tp_size=8,
+            size=6291456,
+            database_mode=common.DatabaseMode.SILICON,
+        )
+
+        db.query_nccl.assert_called_once_with(
+            common.CommQuantMode.half,
+            8,
+            "all_reduce",
+            6291456,
+            database_mode=common.DatabaseMode.SILICON,
+        )
+        assert math.isclose(float(result), 12.34, rel_tol=1e-6)
 
     def test_silicon_available_bucket_still_works(self, _db_factory):
         """Sanity check: a tp_size that IS present still returns the interpolated value."""

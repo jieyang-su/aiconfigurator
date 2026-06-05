@@ -27,6 +27,7 @@ inheritance), so HYBRID mode doesn't union sibling rows for those.
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from typing import TYPE_CHECKING, ClassVar
 
@@ -38,6 +39,30 @@ if TYPE_CHECKING:
     from aiconfigurator.sdk.perf_database import PerfDatabase
 
 logger = logging.getLogger(__name__)
+
+
+def _prefer_nccl_for_custom_allreduce_enabled() -> bool:
+    return os.environ.get("AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _nccl_perf_filename_override(system_spec: dict) -> str | None:
+    filename = os.environ.get("AIC_NCCL_PERF_FILE") or system_spec.get("misc", {}).get("nccl_perf_file")
+    if filename is None:
+        return None
+    filename = filename.strip()
+    if not filename:
+        return None
+    if filename != os.path.basename(filename):
+        raise ValueError(
+            "NCCL perf filename override must be a file name under the selected nccl_version directory, "
+            f"got: {filename}"
+        )
+    return filename
 
 
 def _cache_key(database: PerfDatabase) -> tuple:
@@ -153,6 +178,14 @@ class CustomAllReduce(Operation):
         def get_silicon():
             if tp_size == 1:
                 return PerformanceResult(0.0, energy=0.0, source="empirical")
+            if _prefer_nccl_for_custom_allreduce_enabled():
+                return database.query_nccl(
+                    quant_mode,
+                    tp_size,
+                    "all_reduce",
+                    size,
+                    database_mode=database_mode,
+                )
             if database.system_spec["node"]["num_gpus_per_node"] == 72 and tp_size > 4:
                 # on GB200, we only have custom all reduce for up to tp4.
                 return database.query_nccl(quant_mode, tp_size, "all_reduce", size)
@@ -274,7 +307,7 @@ class NCCL(Operation):
 
     @classmethod
     def _cache_key(cls, database: PerfDatabase) -> tuple:
-        return _cache_key(database)
+        return _cache_key(database) + (_nccl_perf_filename_override(database.system_spec),)
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -287,12 +320,14 @@ class NCCL(Operation):
         key = cls._cache_key(database)
         if key not in cls._data_cache:
             system_data_root = os.path.join(database.systems_root, database.system_spec["data_dir"])
+            nccl_perf_filename = _nccl_perf_filename_override(database.system_spec)
 
             # NCCL data lives under ``systems_data_root/nccl/<nccl_version>/``,
             # NOT under ``backend/version/``. Per ``_build_op_sources`` early-
             # exit, NCCL ops never inherit shared-layer sibling rows.
             nccl_data_dir = os.path.join(system_data_root, "nccl", database.system_spec["misc"]["nccl_version"])
-            nccl_primary = os.path.join(nccl_data_dir, PerfDataFilename.nccl.value)
+            nccl_filename = nccl_perf_filename or PerfDataFilename.nccl.value
+            nccl_primary = os.path.join(nccl_data_dir, nccl_filename)
             nccl_sources = database._build_op_sources(PerfDataFilename.nccl, nccl_primary, system_data_root)
             cls._data_cache[key] = LoadedOpData(load_nccl_data(nccl_sources), PerfDataFilename.nccl, nccl_primary)
 
