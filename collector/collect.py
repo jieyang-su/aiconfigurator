@@ -111,6 +111,36 @@ def _xpu_available() -> bool:
     return torch is not None and hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+def _resolve_perf_filename(perf_filename: str) -> str:
+    """Resolve bare perf filenames into the active collector run directory."""
+    if os.path.isabs(perf_filename) or os.path.dirname(perf_filename):
+        return perf_filename
+
+    log_dir = os.environ.get("COLLECTOR_LOG_DIR", "").strip()
+    if not log_dir:
+        return perf_filename
+
+    if not os.path.isabs(log_dir):
+        log_dir = os.path.abspath(log_dir)
+    return os.path.join(log_dir, perf_filename)
+
+
+def _perf_output_roots() -> list[Path]:
+    """Return directories that may receive collector perf staging files."""
+    roots = [Path.cwd()]
+    if os.environ.get("COLLECTOR_LOG_DIR", "").strip():
+        roots.append(Path(_resolve_perf_filename("__collector_probe_perf.txt")).parent)
+
+    seen = set()
+    unique_roots = []
+    for root in roots:
+        resolved = root.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_roots.append(root)
+    return unique_roots
+
+
 def _wideep_registry_for_backend(backend: str) -> list:
     module_name = f"collector.wideep.{backend}.registry"
     try:
@@ -1055,7 +1085,10 @@ def collect_ops(
 
             get_func = getattr(get_module, collection["get_func"])
             run_func = getattr(run_module, collection["run_func"])
-            run_func = functools.partial(run_func, perf_filename=collection["perf_filename"])
+            run_func = functools.partial(
+                run_func,
+                perf_filename=_resolve_perf_filename(collection["perf_filename"]),
+            )
 
             def get_func_with_limit(get_func=get_func):
                 cases = _get_test_cases(get_func, model_path)
@@ -1611,8 +1644,12 @@ def main():
     if not args.profile:
         mp.set_start_method("spawn")
 
-    output_root = Path.cwd()
-    existing_perf_outputs = {path.resolve(): path.stat().st_mtime_ns for path in find_perf_csv_outputs(output_root)}
+    output_roots = _perf_output_roots()
+    existing_perf_outputs = {
+        path.resolve(): path.stat().st_mtime_ns
+        for output_root in output_roots
+        for path in find_perf_csv_outputs(output_root)
+    }
 
     def was_touched_by_run(path: Path) -> bool:
         resolved = path.resolve()
@@ -1654,7 +1691,12 @@ def main():
     if args.keep_csv:
         logger.info("Keeping collector CSV staging files because --keep-csv was passed")
     else:
-        touched_perf_outputs = [path for path in find_perf_csv_outputs(output_root) if was_touched_by_run(path)]
+        touched_perf_outputs = [
+            path
+            for output_root in output_roots
+            for path in find_perf_csv_outputs(output_root)
+            if was_touched_by_run(path)
+        ]
         if touched_perf_outputs:
             logger.info(
                 "Finalizing collector CSV staging files as parquet:\n  "

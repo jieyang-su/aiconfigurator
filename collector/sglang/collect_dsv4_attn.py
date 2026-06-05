@@ -59,10 +59,10 @@ os.environ["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
 os.environ.setdefault("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK", "1")
 
 try:
-    from helper import benchmark_with_power, log_perf, resolve_subprocess_visible_device
+    from helper import _resolve_local_model_path, benchmark_with_power, log_perf, resolve_subprocess_visible_device
 except ModuleNotFoundError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from helper import benchmark_with_power, log_perf, resolve_subprocess_visible_device
+    from helper import _resolve_local_model_path, benchmark_with_power, log_perf, resolve_subprocess_visible_device
 
 try:
     from collector.sglang.version_compat import sglang_version_branch
@@ -283,6 +283,15 @@ def _resolve_perf_path(output_path: str | None, default_name: str) -> str:
     return os.path.join(output_path, default_name)
 
 
+def _resolve_subprocess_log_dir() -> str:
+    log_root = os.environ.get("COLLECTOR_LOG_DIR", "").strip()
+    if log_root:
+        if not os.path.isabs(log_root):
+            log_root = os.path.abspath(log_root)
+        return os.path.join(log_root, "dsv4_subproc_logs")
+    return os.path.join(tempfile.gettempdir(), "dsv4_subproc_logs")
+
+
 def _copy_non_weight_files(src_dir: str, dst_dir: str) -> None:
     """Mirror model assets into the patched-config temp dir.
 
@@ -375,7 +384,9 @@ def _resolve_model_path(
         with open(os.path.join(src_dir, "config.json")) as f:
             config = json.load(f)
     else:
-        src_dir, config = _download_non_weight_model_files(model_path)
+        src_dir = _resolve_local_model_path(model_path)
+        with open(os.path.join(src_dir, "config.json")) as f:
+            config = json.load(f)
 
     config = copy.deepcopy(config)
     if strip_auto_map:
@@ -1158,7 +1169,7 @@ def _run_subprocess(
 
     # Persist subprocess output to a per-task log so we can inspect failures
     # even when the child dies before stdout is streamed (e.g. OOM kill).
-    log_dir = os.path.join(tempfile.gettempdir(), "dsv4_subproc_logs")
+    log_dir = _resolve_subprocess_log_dir()
     os.makedirs(log_dir, exist_ok=True)
     prefix_label = "sweep" if prefix_lens_arg is not None else str(prefix_len)
     log_path = os.path.join(
