@@ -623,7 +623,8 @@ def run_mla_module(
 
     use_fp8_kv_cache = kv_cache_dtype == "fp8"
 
-    is_context = "context" in perf_filename
+    perf_basename = os.path.basename(str(perf_filename))
+    is_context = "context" in perf_basename
     prefix_len = int(prefix_len) if is_context else 0
     phase = "context" if is_context else "generation"
     variant = attn_type.upper()

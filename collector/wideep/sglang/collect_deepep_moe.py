@@ -340,6 +340,7 @@ def benchmark_moe_layer_prefill(
         model_total_experts: Total number of experts in the model (256 for DeepSeek-V3, 128 for Qwen3)
     """
 
+    logged_count = 0
     for case in prefill_test_cases:
         try:
             # Backward compatible: old format was just an int
@@ -536,6 +537,7 @@ def benchmark_moe_layer_prefill(
                         kernel_source="deepepmoe",
                         perf_filename=perf_filename,
                     )
+                    logged_count += 1
                 except Exception as e:
                     rank_print(f"  Warning: failed to log prefill MoE metrics: {e}")
             del (
@@ -566,6 +568,7 @@ def benchmark_moe_layer_prefill(
                 rank_print("CUDA context corrupted, exiting prefill benchmark early")
                 break
             continue
+    return logged_count
 
 
 def benchmark_moe_layer_decode(
@@ -600,6 +603,7 @@ def benchmark_moe_layer_decode(
     model_runner.token_to_kv_pool_allocator.clear()
     top_k = moe_layer.topk.topk_config.top_k
 
+    logged_count = 0
     for case in decode_test_cases:
         try:
             num_token = case["num_tokens"]
@@ -820,6 +824,7 @@ def benchmark_moe_layer_decode(
                         perf_filename=perf_filename,
                         power_stats=power_stats,
                     )
+                    logged_count += 1
                 except Exception as e:
                     rank_print(f"  Warning: failed to log decode MoE metrics: {e}")
             del hidden_states, hidden_states_fp8_tensor, scale_tensor, dispatch_output_list
@@ -842,6 +847,7 @@ def benchmark_moe_layer_decode(
                 rank_print("CUDA context corrupted, exiting decode benchmark early")
                 break
             continue
+    return logged_count
 
 
 def run_moe(
@@ -1006,7 +1012,7 @@ def run_moe(
 
         # Use deepep_mode="normal" for prefill
         server_args.deepep_mode = "normal"
-        benchmark_moe_layer_prefill(
+        prefill_logged_count = benchmark_moe_layer_prefill(
             model_runner,
             server_args,
             port_args,
@@ -1030,7 +1036,7 @@ def run_moe(
         rank_print(f"Testing {len(decode_test_cases)} decode configurations...")
         # Use deepep_mode="low_latency" for decode
         server_args.deepep_mode = "low_latency"
-        benchmark_moe_layer_decode(
+        decode_logged_count = benchmark_moe_layer_decode(
             model_runner,
             server_args,
             port_args,
@@ -1049,6 +1055,16 @@ def run_moe(
             model_inter_size=model_inter_size,
             model_total_experts=model_total_experts,
         )
+        if prefill_test_cases and prefill_logged_count == 0:
+            raise RuntimeError(
+                "WideEP MoE prefill produced no perf rows; "
+                "all prefill cases failed or were skipped"
+            )
+        if decode_test_cases and decode_logged_count == 0:
+            raise RuntimeError(
+                "WideEP MoE decode produced no perf rows; "
+                "all decode cases failed or were skipped"
+            )
 
         del model_runner, moe_layer
         torch.cuda.empty_cache()
@@ -1058,7 +1074,7 @@ def run_moe(
         import traceback
 
         rank_print(f"Traceback: {traceback.format_exc()}")
-        return
+        raise
 
     torch.cuda.empty_cache()
 

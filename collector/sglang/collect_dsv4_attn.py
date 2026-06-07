@@ -1327,7 +1327,8 @@ def run_dsv4_attn_worker(
     if tp_size not in expected_tp_sizes:
         raise ValueError(f"unsupported tp_size={tp_size}; expected one of {expected_tp_sizes}")
 
-    is_prefill = "context" in perf_filename
+    perf_basename = os.path.basename(str(perf_filename))
+    is_prefill = "context" in perf_basename
     mode = "context" if is_prefill else "generation"
     prefix_lens = list(_PREFIX_LENGTHS) if is_prefill else None
 

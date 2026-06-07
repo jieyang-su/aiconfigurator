@@ -2127,7 +2127,8 @@ def run_mla_module_worker(
     """
     device_str = str(device) if not isinstance(device, str) else device
     gpu_id = int(device_str.split(":")[-1]) if ":" in device_str else 0
-    is_prefill = "context" in perf_filename
+    perf_basename = os.path.basename(str(perf_filename))
+    is_prefill = "context" in perf_basename
     batch_size_filter = batch_size if is_prefill and attn_type == "dsa" and batch_size > 0 else None
 
     print(f"\n{'=' * 60}")
