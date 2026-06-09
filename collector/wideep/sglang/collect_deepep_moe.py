@@ -63,6 +63,30 @@ from math import ceil as _ceil
 
 MOE_SUBPROCESS_TIMEOUT_SEC = 1800
 MOE_PROGRESS_LOG_INTERVAL_SEC = 60
+DEFAULT_MOE_MEM_FRACTION_STATIC = 0.3
+
+
+def _get_moe_mem_fraction_static() -> float:
+    """Return the WideEP MoE mem_fraction_static override from env."""
+    raw_value = os.environ.get("COLLECTOR_WIDEEP_MOE_MEM_FRACTION_STATIC")
+    if raw_value is None:
+        return DEFAULT_MOE_MEM_FRACTION_STATIC
+
+    try:
+        mem_fraction_static = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            "COLLECTOR_WIDEEP_MOE_MEM_FRACTION_STATIC must be a float, "
+            f"got {raw_value!r}"
+        ) from exc
+
+    if not 0 < mem_fraction_static < 1:
+        raise ValueError(
+            "COLLECTOR_WIDEEP_MOE_MEM_FRACTION_STATIC must be between 0 and 1, "
+            f"got {mem_fraction_static}"
+        )
+
+    return mem_fraction_static
 
 
 def _is_scale_ue8m0() -> bool:
@@ -1145,6 +1169,7 @@ def run_moe_benchmark(num_experts, gpu_id, output_path=None):
 
     original_model_path = _get_moe_model_path()
     model_path = _resolve_sglang_model_path(original_model_path)
+    mem_fraction_static = _get_moe_mem_fraction_static()
 
     server_port = 30000 + gpu_id * 100
     server_args = ServerArgs(
@@ -1154,7 +1179,7 @@ def run_moe_benchmark(num_experts, gpu_id, output_path=None):
         load_format="dummy",
         tp_size=1,
         trust_remote_code=True,
-        mem_fraction_static=0.3,
+        mem_fraction_static=mem_fraction_static,
         moe_a2a_backend="deepep",
         moe_runner_backend="deep_gemm",
         deepep_mode="auto",
@@ -1185,6 +1210,7 @@ def run_moe_benchmark(num_experts, gpu_id, output_path=None):
         f"MOE Benchmark: num_experts={num_experts}, EP_size={simulated_ep_size}, "
         f"total_experts={total_experts}, GPU={gpu_id}"
     )
+    print(f"Using mem_fraction_static={server_args.mem_fraction_static}")
     print(f"{'=' * 60}")
 
     # Run the actual benchmark

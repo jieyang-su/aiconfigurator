@@ -232,11 +232,7 @@ def benchmark_layer(layer, forward_batch, q, k, v, q_rope, k_rope, **kwargs):
 
 
 def get_context_mla_test_cases():
-    # This collector covers the CUDA MLA backends used by SGLang defaults on SM90+.
-    sm_version = get_sm_version()
-    if sm_version < 90:
-        return []
-
+    # Follow SGLang's default MLA backend selection: SM89 and below fall back to Triton.
     backend = _select_default_mla_backend()
     dtype_list = [torch.bfloat16] if backend == "triton" else [torch.bfloat16, torch.float8_e4m3fn]
     test_cases = []
@@ -269,11 +265,8 @@ def get_context_mla_test_cases():
 
 
 def get_generation_mla_test_cases():
-    # This collector covers the CUDA MLA backends used by SGLang defaults on SM90+.
+    # Follow SGLang's default MLA backend selection: SM89 and below fall back to Triton.
     sm_version = get_sm_version()
-    if sm_version < 90:
-        return []
-
     backend = _select_default_mla_backend()
     if backend == "triton":
         # SGLang's Triton MLA path stores BF16 MLA KV cache.

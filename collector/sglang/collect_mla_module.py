@@ -350,7 +350,7 @@ def _get_mla_backend_list() -> list[str]:
     elif sm >= 90:
         return ["flashinfer", "fa3"]
     else:
-        return []
+        return ["triton"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
