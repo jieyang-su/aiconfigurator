@@ -78,6 +78,7 @@ def _plot_worker_setup_table(
     is_moe: bool,
     request_latency_target: float | None,
     show_power: bool = True,
+    inclusive_tpot: bool = False,
 ) -> str:
     """Plot worker setup table for a single experiment."""
     buf = []
@@ -110,6 +111,9 @@ def _plot_worker_setup_table(
     if top_configs.empty:
         return f"\nNo configurations for {exp_name} met the {constraint_label} constraint."
 
+    if inclusive_tpot:
+        top_configs = _apply_inclusive_tpot(top_configs)
+
     top_configs["replicas"] = total_gpus // top_configs["num_total_gpus"]
     top_configs["total_gpus_used"] = top_configs["num_total_gpus"] * top_configs["replicas"]
 
@@ -129,6 +133,7 @@ def _plot_worker_setup_table(
             "tokens/s/user",
             "req/s",
             "TTFT",
+            "TPOT",
             "request_latency",
             "concurrency",
             "total_gpus (used)",
@@ -200,6 +205,7 @@ def _plot_worker_setup_table(
                     f"{row['tokens/s/user']:.2f}",
                     f"{row['cluster_request_rate']:.2f}",
                     f"{row['ttft']:.2f}",
+                    f"{row['tpot']:.2f}",
                     f"{row['request_latency']:.2f}",
                     f"{row['concurrency'] * row['replicas']} (={row['concurrency']}x{row['replicas']})",
                     f"{total_gpus} ({row['total_gpus_used']}={row['replicas']}x{row['num_total_gpus']})",
@@ -226,6 +232,7 @@ def _plot_worker_setup_table(
             "tokens/s/user",
             "req/s",
             "TTFT",
+            "TPOT",
             "request_latency",
             "concurrency",
             "total_gpus (used)",
@@ -267,6 +274,7 @@ def _plot_worker_setup_table(
                     f"{row['tokens/s/user']:.2f}",
                     f"{row['cluster_request_rate']:.2f}",
                     f"{row['ttft']:.2f}",
+                    f"{row['tpot']:.2f}",
                     f"{row['request_latency']:.2f}",
                     f"{row['concurrency'] * row['replicas']} (={row['concurrency']}x{row['replicas']})",
                     f"{total_gpus} ({row['total_gpus_used']}={row['replicas']}x{row['num_total_gpus']})",
@@ -479,6 +487,7 @@ def log_final_summary(
             exp_task_config.is_moe,
             exp_task_config.runtime_config.request_latency,
             show_power,
+            inclusive_tpot,
         )
         summary_box.append(table_buf)
 
