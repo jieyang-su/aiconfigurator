@@ -122,19 +122,19 @@ def _as_float(value: object, default: float | None = None) -> float | None:
         return default
 
 
-def _gpu_hourly_cost_usd(label: str, case_cfg: dict | None, cfg: dict) -> float | None:
-    """Resolve $/GPU/h for a plotted series.
+def _gpu_hourly_cost_RMB(label: str, case_cfg: dict | None, cfg: dict) -> float | None:
+    """Resolve RMB/GPU/h for a plotted series.
 
-    ``gpu_hourly_cost_usd`` may be:
+    ``gpu_hourly_cost_rmb`` may be:
       - a number at case level or top level
       - a dict at top level, matched by case label/system/backend/model substring
     """
     case_cfg = case_cfg or {}
-    case_cost = _as_float(case_cfg.get("gpu_hourly_cost_usd"))
+    case_cost = _as_float(case_cfg.get("gpu_hourly_cost_rmb"))
     if case_cost is not None:
         return case_cost
 
-    raw_costs = cfg.get("gpu_hourly_cost_usd", cfg.get("gpu_hourly_costs_usd"))
+    raw_costs = cfg.get("gpu_hourly_cost_rmb", cfg.get("gpu_hourly_costs_rmb"))
     scalar_cost = _as_float(raw_costs)
     if scalar_cost is not None:
         return scalar_cost
@@ -157,9 +157,11 @@ def _gpu_hourly_cost_usd(label: str, case_cfg: dict | None, cfg: dict) -> float 
     # as a fallback so old JSON files can produce the cost plot.
     match_text = f"{label} {case_cfg.get('system', '')}".lower()
     if "h20" in match_text:
-        return 1.0
+        return 4.514
     if "pro6000" in match_text or "r6000" in match_text:
-        return 0.75
+        return 5.5
+    if "rtx4090D" in match_text:
+        return 1.389
     return None
 
 
@@ -926,9 +928,9 @@ def _write_cost_plot_data(
 
     for label, csv_path in series:
         case_cfg = case_cfgs.get(label, {})
-        gpu_cost = _gpu_hourly_cost_usd(label, case_cfg, cfg)
+        gpu_cost = _gpu_hourly_cost_RMB(label, case_cfg, cfg)
         if gpu_cost is None:
-            print(f"skip cost plot series={label}: cannot resolve gpu_hourly_cost_usd")
+            print(f"skip cost plot series={label}: cannot resolve gpu_hourly_cost_rmb")
             continue
         with csv_path.open(encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -952,9 +954,9 @@ def _write_cost_plot_data(
                     "x": f"{x_value:.6g}",
                     "y": f"{cost_per_million:.6g}",
                     "x_col": x_col,
-                    "y_col": "cost_per_million_output_tokens_usd",
+                    "y_col": "cost_per_million_output_tokens_rmb",
                     "source_csv": str(csv_path),
-                    "gpu_hourly_cost_usd": f"{gpu_cost:.6g}",
+                    "gpu_hourly_cost_rmb": f"{gpu_cost:.6g}",
                     "tput_per_gpu_col": tput_col,
                     "tput_per_gpu": f"{tput_per_gpu:.6g}",
                 }
@@ -978,7 +980,7 @@ def _write_cost_plot_data(
         "x_col",
         "y_col",
         "source_csv",
-        "gpu_hourly_cost_usd",
+        "gpu_hourly_cost_rmb",
         "tput_per_gpu_col",
         "tput_per_gpu",
     ]
@@ -1022,9 +1024,9 @@ def _plot_cost_compare(
     plt.figure(figsize=(8, 5))
     for idx, (label, csv_path) in enumerate(series):
         case_cfg = case_cfgs.get(label, {})
-        gpu_cost = _gpu_hourly_cost_usd(label, case_cfg, cfg)
+        gpu_cost = _gpu_hourly_cost_RMB(label, case_cfg, cfg)
         if gpu_cost is None:
-            print(f"skip cost plot series={label}: cannot resolve gpu_hourly_cost_usd")
+            print(f"skip cost plot series={label}: cannot resolve gpu_hourly_cost_rmb")
             continue
         xs: list[float] = []
         ys: list[float] = []
@@ -1058,7 +1060,7 @@ def _plot_cost_compare(
         plt.close()
         return
     plt.xlabel(axis_label(requested_x, resolved_x))
-    plt.ylabel("Cost per Million Output Tokens ($)")
+    plt.ylabel("Cost per Million Output Tokens (RMB)")
     plt.title(title)
     plt.legend()
     plt.tight_layout()

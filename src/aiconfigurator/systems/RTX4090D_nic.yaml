@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+data_dir: data/RTX4090D_nic # relative to systems_dir
+
+gpu:
+  mem_bw: 1008000000000 # 1.008TB/s, same as RTX 4090D 24GB GDDR6X 384-bit 21Gbps
+  mem_bw_empirical_scaling_factor: 0.8
+  mem_empirical_constant_latency: 0.000003 # 3us
+
+  mem_capacity: 25769803776 # 24GiB
+
+  # RTX 4090D: 114 SMs vs RTX 4090 128 SMs
+  # Scale RTX 4090 tensor flops by 114/128 = 0.890625
+  bfloat16_tc_flops: 294229687500000 # ~294.2 TFLOPS
+  int8_tc_flops: 588459375000000    # ~588.5 TFLOPS
+  fp8_tc_flops: 588459375000000     # ~588.5 TFLOPS
+
+  power: 425  # Watt
+  sm_version: 89
+
+node:
+  num_gpus_per_node: 2
+  inter_node_bw: 25000000000  # Byte/s per GPU, single direction, 2:1 CX7 NDR 400Gb/s per node
+  intra_node_bw: 32000000000  # Byte/s per gpu, single direction, PCIe 4.0
+  pcie_bw: 32000000000        # Byte/s, single direction, PCIe 4.0
+  p2p_latency: 0.00001        # 10us
+
+misc:
+  nccl_mem:
+    1: 0
+    2: 358612992 # 342MB
+    4: 411041792 # 392MB
+    8: 411041792 # 392MB
+  other_mem: 3758096384 # 3.5GB
+  nccl_version: '2.28.9'

@@ -41,7 +41,7 @@ import numpy as np
 import yaml
 
 from aiconfigurator.sdk import common, interpolation
-from aiconfigurator.sdk.operations.base import Operation, _read_filtered_rows
+from aiconfigurator.sdk.operations.base import Operation, _read_filtered_rows, _resolve_perf_data_path
 from aiconfigurator.sdk.system_spec import SystemSpec
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,32 @@ def _cache_key(database: PerfDatabase) -> tuple:
         database.enable_shared_layer,
     )
 
+def _dsv4_perf_primary_path(data_dir: str, filename_enum, version: str) -> str:
+    primary_path = os.path.join(data_dir, filename_enum.value)
+    if os.path.exists(_resolve_perf_data_path(primary_path)):
+        return primary_path
+
+    stem, suffix = os.path.splitext(filename_enum.value)
+    if not stem.startswith("dsv4_"):
+        return primary_path
+
+    suffix = suffix or ".parquet"
+    tail = stem[len("dsv4_") :]
+    version_lower = version.lower()
+    prefixes = ("dsv4_flash", "dsv4_pro") if "flash" in version_lower else ("dsv4_pro", "dsv4_flash")
+    for prefix in prefixes:
+        alias_path = os.path.join(data_dir, f"{prefix}_{tail}{suffix}")
+        if os.path.exists(_resolve_perf_data_path(alias_path)):
+            return alias_path
+    return primary_path
+
+
+def _dsv4_perf_data_dirs(database: PerfDatabase) -> tuple[str, str]:
+    system_spec = database.system_spec
+    if getattr(database, "_dsv4_operator_calibration_enabled", False):
+        system_spec = getattr(database, "_dsv4_operator_calibration_system_spec", None) or system_spec
+    system_data_root = os.path.join(database.systems_root, system_spec["data_dir"])
+    return system_data_root, os.path.join(system_data_root, database.backend, database.version)
 
 # ───────────────────────────────────────────────────────────────────────
 # Module-level helpers (moved from perf_database.py).
@@ -390,8 +416,7 @@ class DeepSeekV4MHCModule(Operation):
 
         key = cls._cache_key(database)
         if key not in cls._data_cache:
-            system_data_root = os.path.join(database.systems_root, database.system_spec["data_dir"])
-            data_dir = os.path.join(system_data_root, database.backend, database.version)
+            system_data_root, data_dir = _dsv4_perf_data_dirs(database)
             primary_path = os.path.join(data_dir, PerfDataFilename.mhc_module.value)
             sources = database._build_op_sources(PerfDataFilename.mhc_module, primary_path, system_data_root)
             cls._data_cache[key] = LoadedOpData(
@@ -686,11 +711,10 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
 
         key = cls._cache_key(database)
         if key not in cls._data_cache:
-            system_data_root = os.path.join(database.systems_root, database.system_spec["data_dir"])
-            data_dir = os.path.join(system_data_root, database.backend, database.version)
+            system_data_root, data_dir = _dsv4_perf_data_dirs(database)
 
             def _load(filename_enum):
-                primary_path = os.path.join(data_dir, filename_enum.value)
+                primary_path = _dsv4_perf_primary_path(data_dir, filename_enum, database.version)
                 sources = database._build_op_sources(filename_enum, primary_path, system_data_root)
                 return LoadedOpData(load_context_dsv4_kind_module_data(sources), filename_enum, primary_path)
 
@@ -707,7 +731,7 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             )
 
             def _load_sparse(filename_enum):
-                primary_path = os.path.join(data_dir, filename_enum.value)
+                primary_path = _dsv4_perf_primary_path(data_dir, filename_enum, database.version)
                 sources = database._build_op_sources(filename_enum, primary_path, system_data_root)
                 return LoadedOpData(load_dsv4_sparse_kernel_data(sources), filename_enum, primary_path)
 
@@ -740,7 +764,7 @@ class ContextDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                         source_data_dir = os.path.join(source_system_data_root, database.backend, database.version)
 
                         def _load_calibration(filename_enum):
-                            primary_path = os.path.join(source_data_dir, filename_enum.value)
+                            primary_path = _dsv4_perf_primary_path(source_data_dir, filename_enum, database.version)
                             sources = database._build_op_sources(filename_enum, primary_path, source_system_data_root)
                             return LoadedOpData(
                                 load_context_dsv4_kind_module_data(sources),
@@ -1273,11 +1297,10 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
 
         key = cls._cache_key(database)
         if key not in cls._data_cache:
-            system_data_root = os.path.join(database.systems_root, database.system_spec["data_dir"])
-            data_dir = os.path.join(system_data_root, database.backend, database.version)
+            system_data_root, data_dir = _dsv4_perf_data_dirs(database)
 
             def _load(filename_enum):
-                primary_path = os.path.join(data_dir, filename_enum.value)
+                primary_path = _dsv4_perf_primary_path(data_dir, filename_enum, database.version)
                 sources = database._build_op_sources(filename_enum, primary_path, system_data_root)
                 return LoadedOpData(load_generation_dsv4_kind_module_data(sources), filename_enum, primary_path)
 
@@ -1310,7 +1333,7 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
                         source_data_dir = os.path.join(source_system_data_root, database.backend, database.version)
 
                         def _load_calibration(filename_enum):
-                            primary_path = os.path.join(source_data_dir, filename_enum.value)
+                            primary_path = _dsv4_perf_primary_path(source_data_dir, filename_enum, database.version)
                             sources = database._build_op_sources(filename_enum, primary_path, source_system_data_root)
                             return LoadedOpData(
                                 load_generation_dsv4_kind_module_data(sources),
@@ -1594,8 +1617,7 @@ class DeepSeekV4MegaMoEModule(Operation):
 
         key = cls._cache_key(database)
         if key not in cls._data_cache:
-            system_data_root = os.path.join(database.systems_root, database.system_spec["data_dir"])
-            data_dir = os.path.join(system_data_root, database.backend, database.version)
+            system_data_root, data_dir = _dsv4_perf_data_dirs(database)
             primary_path = os.path.join(data_dir, PerfDataFilename.dsv4_megamoe_module.value)
             cls._data_cache[key] = LoadedOpData(
                 load_dsv4_megamoe_module_data(primary_path), PerfDataFilename.dsv4_megamoe_module, primary_path

@@ -214,13 +214,23 @@ class GEMM(Operation):
     @staticmethod
     def _normalize_gemm_quant_mode_for_table(
         quant_mode: common.GEMMQuantMode,
+        perf_data=None,
     ) -> common.GEMMQuantMode:
         """Normalize modeled GEMM quant modes for perf table lookup.
 
         ``fp8_static`` is modeled from the dynamic ``fp8`` GEMM row plus
         separately collected activation-quantization overhead tables.
+        ``fp8_block`` is a behavioral SGLang mode: prefer explicit rows when
+        present, otherwise reuse ``fp8`` rows.
         """
         if quant_mode == common.GEMMQuantMode.fp8_static:
+            return common.GEMMQuantMode.fp8
+        if quant_mode == common.GEMMQuantMode.fp8_block:
+            try:
+                if perf_data is not None and quant_mode in perf_data:
+                    return quant_mode
+            except Exception:
+                pass
             return common.GEMMQuantMode.fp8
         return quant_mode
 
@@ -397,8 +407,6 @@ class GEMM(Operation):
         if database_mode is None:
             database_mode = database._default_database_mode
 
-        table_quant_mode = cls._normalize_gemm_quant_mode_for_table(quant_mode)
-
         if database_mode == common.DatabaseMode.SOL:
             return PerformanceResult(get_sol(m, n, k, quant_mode)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
@@ -411,6 +419,7 @@ class GEMM(Operation):
         # the test hasn't already pre-set them.
         cls.load_data(database)
         gemm_data_wrapper = database._gemm_data
+        table_quant_mode = cls._normalize_gemm_quant_mode_for_table(quant_mode, gemm_data_wrapper)
 
         def get_silicon():
             def _to_performance_result(result, *, source: str = "silicon"):
@@ -500,8 +509,6 @@ class GEMM(Operation):
         if database_mode is None:
             database_mode = database._default_database_mode
 
-        table_quant_mode = cls._normalize_gemm_quant_mode_for_table(quant_mode)
-
         if database_mode == common.DatabaseMode.SOL:
             return PerformanceResult(get_sol(m, k)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
@@ -511,6 +518,7 @@ class GEMM(Operation):
 
         cls.load_data(database)
         compute_scale_wrapper = database._compute_scale_data
+        table_quant_mode = cls._normalize_gemm_quant_mode_for_table(quant_mode, compute_scale_wrapper)
 
         def get_silicon():
             compute_scale_wrapper.raise_if_not_loaded()
@@ -578,8 +586,6 @@ class GEMM(Operation):
         if database_mode is None:
             database_mode = database._default_database_mode
 
-        table_quant_mode = cls._normalize_gemm_quant_mode_for_table(quant_mode)
-
         if database_mode == common.DatabaseMode.SOL:
             return PerformanceResult(get_sol(m, k)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
@@ -589,6 +595,7 @@ class GEMM(Operation):
 
         cls.load_data(database)
         scale_matrix_wrapper = database._scale_matrix_data
+        table_quant_mode = cls._normalize_gemm_quant_mode_for_table(quant_mode, scale_matrix_wrapper)
 
         def get_silicon():
             scale_matrix_wrapper.raise_if_not_loaded()

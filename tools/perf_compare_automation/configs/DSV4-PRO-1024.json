@@ -6,7 +6,7 @@
   "gemm_quant_mode": "fp8_block",
   "database_mode": "HYBRID",
   "ttft": 10000,
-  "tpot": 1000,
+  "tpot": 100,
   "max_batch_size": 1024,
   "isl": 2048,
   "osl": 500,
@@ -25,6 +25,11 @@
     {
       "label": "h20_sxm_32",
       "system": "h20_sxm",
+      "gemm_quant_mode": "fp8_block",
+      "kvcache_quant_mode": "fp8",
+      "fmha_quant_mode": "bfloat16",
+      "moe_quant_mode": "fp8_block",
+      "comm_quant_mode": "half",
       "nccl_perf_file": "nccl_perf.txt",
       "search_parallel": {
         "agg": {
@@ -36,13 +41,12 @@
           "moe_ep": [1, 2, 4, 8, 16, 32]
         },
         "disagg": {
-            "enable_wideep": true,
-            "moe_backend": "deepep_moe",
+            "enable_wideep": false,
             "num_gpu_per_replica": [1, 2, 4, 8, 16, 32],
             "prefill_workers": [1, 2, 4, 8, 16],
             "decode_workers": [1, 2, 4, 8, 16],
             "prefill": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1,2, 4, 8, 16],
                 "tp": [1, 2, 4, 8, 16],
                 "pp": [1],
@@ -51,7 +55,7 @@
                 "moe_ep": [1, 2, 4, 8, 16]
             },
             "decode": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1, 2, 4, 8, 16],
                 "tp": [1, 2, 4, 8, 16],
                 "pp": [1],
@@ -65,6 +69,11 @@
     {
       "label": "PRO6000_clos32",
       "system": "PRO6000_clos32",
+      "gemm_quant_mode": "nvfp4",
+      "kvcache_quant_mode": "fp8",
+      "fmha_quant_mode": "bfloat16",
+      "moe_quant_mode": "fp8_block",
+      "comm_quant_mode": "half",
       "nccl_perf_file": "PRO6000_clos32_deg_0.85_nccl_perf.txt",
       "search_parallel": {
         "agg": {
@@ -76,13 +85,12 @@
           "moe_ep": [1, 2, 4, 8, 16, 32]
         },
         "disagg": {
-            "enable_wideep": true,
-            "moe_backend": "deepep_moe",
+            "enable_wideep": false,
             "num_gpu_per_replica": [1, 2, 4, 8, 16, 32],
             "prefill_workers": [1, 2, 4, 8, 16],
             "decode_workers": [1, 2, 4, 8, 16],
             "prefill": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1,2, 4, 8, 16],
                 "tp": [1, 2, 4, 8, 16],
                 "pp": [1],
@@ -91,93 +99,13 @@
                 "moe_ep": [1, 2, 4, 8, 16]
             },
             "decode": {
-                "enable_wideep": true,
+                "enable_wideep": false,
                 "num_gpu_per_worker": [1, 2, 4, 8, 16],
                 "tp": [1, 2, 4, 8, 16],
                 "pp": [1],
                 "dp": [1, 2, 4, 8, 16],
                 "moe_tp": [1],
                 "moe_ep": [1, 2, 4, 8, 16]
-            }
-        }
-      }
-    },
-    {
-      "label": "PRO6000_clos144",
-      "system": "PRO6000_clos144",
-      "nccl_perf_file": "PRO6000_clos144_deg_0.85_nccl_perf.txt",
-      "search_parallel": {
-        "agg": {
-          "num_gpu_per_worker": [1, 2, 4, 8, 16, 32, 64, 128, 144],
-          "tp": [1, 2, 4, 8, 16],
-          "pp": [1],
-          "dp": [1, 2, 4, 8, 16, 32, 64, 128, 144],
-          "moe_tp": [1],
-          "moe_ep": [1, 2, 4, 8, 16, 32, 64, 128, 144]
-        },
-        "disagg": {
-            "enable_wideep": true,
-            "moe_backend": "deepep_moe",
-            "num_gpu_per_replica": [1, 2, 4, 8, 16, 32, 64],
-            "prefill_workers": [1, 2, 4, 8, 16, 32, 64],
-            "decode_workers": [1, 2, 4, 8, 16, 32, 64],
-            "prefill": {
-                "enable_wideep": true,
-                "num_gpu_per_worker": [1,2, 4, 8, 16, 32, 64],
-                "tp": [1, 2, 4, 8, 16],
-                "pp": [1],
-                "dp": [1, 2, 4, 8, 16, 32, 64],
-                "moe_tp": [1],
-                "moe_ep": [1, 2, 4, 8, 16, 32, 64]
-            },
-            "decode": {
-                "enable_wideep": true,
-                "num_gpu_per_worker": [1, 2, 4, 8, 16, 32, 64],
-                "tp": [1, 2, 4, 8, 16],
-                "pp": [1],
-                "dp": [1, 2, 4, 8, 16, 32, 64],
-                "moe_tp": [1],
-                "moe_ep": [1, 2, 4, 8, 16, 32, 64]
-            }
-        }
-      }
-    },
-    {
-      "label": "PRO6000_nic",
-      "system": "PRO6000_nic",
-      "nccl_perf_file": "PRO6000_nic_nccl_perf.txt",
-      "search_parallel": {
-        "agg": {
-          "num_gpu_per_worker": [1, 2, 4, 8, 16, 32, 64, 128, 256],
-          "tp": [1, 2, 4, 8, 16],
-          "pp": [1],
-          "dp": [1, 2, 4, 8, 16, 32, 64, 128, 256],
-          "moe_tp": [1],
-          "moe_ep": [1, 2, 4, 8, 16, 32, 64, 128, 256]
-        },
-        "disagg": {
-            "enable_wideep": true,
-            "moe_backend": "deepep_moe",
-            "num_gpu_per_replica": [1, 2, 4, 8, 16, 32, 64, 128],
-            "prefill_workers": [1, 2, 4, 8, 16, 32, 64, 128],
-            "decode_workers": [1, 2, 4, 8, 16, 32, 64, 128],
-            "prefill": {
-                "enable_wideep": true,
-                "num_gpu_per_worker": [1,2, 4, 8, 16, 32, 64, 128],
-                "tp": [1, 2, 4, 8, 16],
-                "pp": [1],
-                "dp": [1, 2, 4, 8, 16, 32, 64, 128],
-                "moe_tp": [1],
-                "moe_ep": [1, 2, 4, 8, 16, 32, 64, 128]
-            },
-            "decode": {
-                "enable_wideep": true,
-                "num_gpu_per_worker": [1, 2, 4, 8, 16, 32, 64, 128],
-                "tp": [1, 2, 4, 8, 16],
-                "pp": [1],
-                "dp": [1, 2, 4, 8, 16, 32, 64, 128],
-                "moe_tp": [1],
-                "moe_ep": [1, 2, 4, 8, 16, 32, 64, 128]
             }
         }
       }
