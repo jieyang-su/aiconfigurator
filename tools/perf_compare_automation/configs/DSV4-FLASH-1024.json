@@ -21,6 +21,11 @@
   "plot_marker_style": "cycle",
   "plot_alpha": 0.82,
   "plot_title_prefix": "DeepSeek-V4-Flash-FP8",
+  "gpu_hourly_cost_rmb": {
+    "h20": 5.294,
+    "PRO6000": 5.141,
+    "rtx4090": 2.149
+  },
   "compare_cases": [
     {
       "label": "h20_sxm_32",

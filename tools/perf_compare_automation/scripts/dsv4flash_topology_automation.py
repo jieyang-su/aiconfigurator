@@ -157,11 +157,11 @@ def _gpu_hourly_cost_RMB(label: str, case_cfg: dict | None, cfg: dict) -> float 
     # as a fallback so old JSON files can produce the cost plot.
     match_text = f"{label} {case_cfg.get('system', '')}".lower()
     if "h20" in match_text:
-        return 4.514
+        return 5.294
     if "pro6000" in match_text or "r6000" in match_text:
-        return 5.5
+        return 5.141
     if "rtx4090D" in match_text:
-        return 1.389
+        return 2.149
     return None
 
 
