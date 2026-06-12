@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+from contextlib import contextmanager
 from typing import Any
 
 import pandas as pd
@@ -14,6 +15,7 @@ import yaml
 
 from aiconfigurator import __version__
 from aiconfigurator.cli.estimate_detail_report import detail_requests_time, format_estimate_detail_report
+from aiconfigurator.cli.hisim_refinement import merge_refinement_config, refine_task_result, should_refine_task
 from aiconfigurator.cli.report_and_save import log_final_summary, save_results
 from aiconfigurator.cli.utils import merge_experiment_results_by_mode, process_experiment_result
 from aiconfigurator.generator.api import (
@@ -30,6 +32,43 @@ from aiconfigurator.sdk.task import TaskConfig, TaskRunner, UnsupportedWideepCon
 from aiconfigurator.sdk.utils import ListFlowDumper, get_model_config_from_model_path
 
 logger = logging.getLogger(__name__)
+
+
+_AIC_RUNTIME_ENV_KEYS = {
+    "prefer_nccl_for_custom_allreduce": "AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE",
+    "disable_hybrid_shared_layer": "AIC_DISABLE_HYBRID_SHARED_LAYER",
+}
+
+
+def _env_bool(value: Any) -> str:
+    if isinstance(value, str):
+        return "1" if value.strip().lower() in {"1", "true", "yes", "on"} else "0"
+    return "1" if bool(value) else "0"
+
+
+@contextmanager
+def _aic_runtime_env(overrides: dict[str, Any]):
+    previous: dict[str, str | None] = {}
+    try:
+        for config_key, env_key in _AIC_RUNTIME_ENV_KEYS.items():
+            if config_key not in overrides or overrides[config_key] is None:
+                continue
+            previous[env_key] = os.environ.get(env_key)
+            os.environ[env_key] = _env_bool(overrides[config_key])
+        yield
+    finally:
+        for env_key, old_value in previous.items():
+            if old_value is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = old_value
+
+
+def _task_runtime_env_overrides(task_config: TaskConfig) -> dict[str, Any]:
+    return {
+        "prefer_nccl_for_custom_allreduce": getattr(task_config, "prefer_nccl_for_custom_allreduce", None),
+        "disable_hybrid_shared_layer": getattr(task_config, "disable_hybrid_shared_layer", None),
+    }
 
 
 def _latest_support_matrix_version(
@@ -1300,9 +1339,13 @@ _EXPERIMENT_RESERVED_KEYS = {
     "enable_wideep",
     "moe_backend",
     "enable_eplb",
+    "enable_chunked_prefill",
     "total_gpus",
     "database_mode",
     "engine_step_backend",
+    "prefer_nccl_for_custom_allreduce",
+    "disable_hybrid_shared_layer",
+    "refinement",
 }
 
 
@@ -1361,11 +1404,12 @@ def build_experiment_task_configs(
     if not isinstance(experiment_data, dict):
         raise TypeError("Experiment data must be a mapping (dict).")
 
+    root_refinement_config = experiment_data.get("refinement")
     order = experiment_data.get("exps")
     if isinstance(order, list):
         experiment_names = [name for name in order if name in experiment_data]
     else:
-        experiment_names = [name for name in experiment_data if name != "exps"]
+        experiment_names = [name for name in experiment_data if name not in {"exps", "refinement"}]
 
     task_configs: dict[str, TaskConfig] = {}
 
@@ -1445,16 +1489,25 @@ def build_experiment_task_configs(
             task_kwargs["enable_chunked_prefill"] = exp_config["enable_chunked_prefill"]
         if "database_mode" in exp_config:
             task_kwargs["database_mode"] = exp_config["database_mode"]
+        for env_key in _AIC_RUNTIME_ENV_KEYS:
+            if env_key in exp_config:
+                task_kwargs[env_key] = exp_config[env_key]
         effective_engine_step_backend = exp_config.get("engine_step_backend", engine_step_backend)
         if effective_engine_step_backend is not None:
             task_kwargs["engine_step_backend"] = effective_engine_step_backend
+        if root_refinement_config is not None or "refinement" in exp_config:
+            task_kwargs["refinement"] = merge_refinement_config(
+                root_refinement_config,
+                exp_config.get("refinement"),
+            )
 
         yaml_config = _build_yaml_config(exp_config, config_section)
         if yaml_config:
             task_kwargs["yaml_config"] = yaml_config
 
         try:
-            task_configs[exp_name] = TaskConfig(**task_kwargs)
+            with _aic_runtime_env(task_kwargs):
+                task_configs[exp_name] = TaskConfig(**task_kwargs)
         except Exception:
             logger.exception("Failed to build TaskConfig for experiment '%s'", exp_name)
 
@@ -1509,9 +1562,16 @@ def _execute_task_configs(
         try:
             logger.info("Starting experiment: %s", exp_name)
             logger.debug("Task config: \n%s", task_config.to_yaml())
-            task_result = runner.run(task_config)
-            if task_result is None:
-                raise RuntimeError(f"Task runner returned no result for {exp_name}")
+            with _aic_runtime_env(_task_runtime_env_overrides(task_config)):
+                task_result = runner.run(task_config)
+                if task_result is None:
+                    raise RuntimeError(f"Task runner returned no result for {exp_name}")
+                if should_refine_task(task_config):
+                    task_result = refine_task_result(
+                        exp_name=exp_name,
+                        task_config=task_config,
+                        task_result=task_result,
+                    )
             pareto_df = task_result["pareto_df"]
             if pareto_df is not None and not pareto_df.empty:
                 results[exp_name] = task_result
@@ -1543,6 +1603,7 @@ def _execute_task_configs(
             failure_messages.append(f"Experiment {exp_name} failed: {exc}")
 
     if len(results) < 1:
+        _execute_task_configs.last_results = results
         first_config = next(iter(task_configs.values()), None)
         db_mode = getattr(first_config, "database_mode", None) if first_config else None
         if db_mode == common.DatabaseMode.SILICON.name:
@@ -1556,6 +1617,8 @@ def _execute_task_configs(
         for msg in failure_messages:
             logger.error("  -> %s", msg)
         raise SystemExit(1)
+
+    _execute_task_configs.last_results = results
 
     best_configs: dict[str, pd.DataFrame] = {}
     best_throughputs: dict[str, float] = {}
@@ -2150,9 +2213,32 @@ def main(args):
         **execute_kwargs,
     )
 
-    all_results = {exp_name: df for exp_name, df in pareto_fronts.items()}
+    raw_task_results = getattr(_execute_task_configs, "last_results", {})
+    if not isinstance(raw_task_results, dict):
+        raw_task_results = {}
+    if raw_task_results:
+        all_results = {exp_name: result.get("pareto_df") for exp_name, result in raw_task_results.items()}
+        analytical_results = {
+            exp_name: result.get("analytical_pareto_df")
+            for exp_name, result in raw_task_results.items()
+            if result.get("analytical_pareto_df") is not None
+        }
+        hisim_refined_results = {
+            exp_name: result.get("hisim_refined_df")
+            for exp_name, result in raw_task_results.items()
+            if result.get("hisim_refined_df") is not None
+        }
+    else:
+        all_results = {exp_name: df for exp_name, df in pareto_fronts.items()}
+        analytical_results = {}
+        hisim_refined_results = {}
 
     if args.save_dir:
+        extra_results = {}
+        if analytical_results:
+            extra_results["analytical_all_results"] = analytical_results
+        if hisim_refined_results:
+            extra_results["hisim_refined_results"] = hisim_refined_results
         save_results(
             args=args,
             best_configs=best_configs,
@@ -2162,6 +2248,7 @@ def main(args):
             save_dir=args.save_dir,
             generated_backend_version=args.generated_config_version,
             backend=args.backend if args.mode == "default" else None,
+            extra_results=extra_results or None,
         )
 
 

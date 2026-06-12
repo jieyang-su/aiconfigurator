@@ -907,6 +907,9 @@ class TaskConfig:
         free_gpu_memory_fraction: float | None = None,
         max_seq_len: int | None = None,
         engine_step_backend: str | None = None,
+        prefer_nccl_for_custom_allreduce: bool | None = None,
+        disable_hybrid_shared_layer: bool | None = None,
+        refinement: dict | None = None,
     ) -> None:
         """
         Initialize a TaskConfig object.
@@ -936,6 +939,7 @@ class TaskConfig:
             total_gpus: The total number of GPUs.
             profiles: The profiles to use.
             yaml_config: The YAML configuration.
+            refinement: Optional post-analytical refinement configuration.
         """
         self.serving_mode = serving_mode
         self.model_path = model_path
@@ -1023,15 +1027,19 @@ class TaskConfig:
         self.decode_system_name = decode_system_name
         self.backend_name = backend_name
         self.enable_wideep = enable_wideep
+        self.enable_chunked_prefill = enable_chunked_prefill
         self.enable_eplb = enable_eplb
         self.moe_backend = moe_backend
         self.total_gpus = total_gpus
         self.free_gpu_memory_fraction = free_gpu_memory_fraction
         self.max_seq_len = max_seq_len
         self.engine_step_backend = engine_step_backend
+        self.prefer_nccl_for_custom_allreduce = prefer_nccl_for_custom_allreduce
+        self.disable_hybrid_shared_layer = disable_hybrid_shared_layer
         self.yaml_mode = yaml_mode
         self.yaml_patch = yaml_patch
         self.profiles = list(effective_profiles)
+        self.refinement = copy.deepcopy(refinement) if refinement else {}
 
         if engine_step_backend not in {None, "python", "rust"}:
             raise ValueError(f"Invalid engine_step_backend: {engine_step_backend!r}. Use 'python' or 'rust'.")
@@ -1314,6 +1322,12 @@ class TaskConfig:
         printable["enable_wideep"] = self.enable_wideep
         printable["moe_backend"] = self.config.moe_backend
         printable["attention_backend"] = self.config.attention_backend
+        if self.prefer_nccl_for_custom_allreduce is not None:
+            printable["prefer_nccl_for_custom_allreduce"] = self.prefer_nccl_for_custom_allreduce
+        if self.disable_hybrid_shared_layer is not None:
+            printable["disable_hybrid_shared_layer"] = self.disable_hybrid_shared_layer
+        if self.refinement:
+            printable["refinement"] = _convert(self.refinement)
 
         base_config = _convert(getattr(self.config, "yaml_patch", getattr(self, "yaml_patch", {})))
         printable["profiles"] = self.profiles

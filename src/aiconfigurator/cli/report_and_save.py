@@ -40,6 +40,88 @@ def _apply_inclusive_tpot(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _plot_refinement_overlay(
+    *,
+    exp_name: str,
+    exp_dir: str,
+    analytical_df: pd.DataFrame | None,
+    hisim_df: pd.DataFrame | None,
+    merged_pareto_df: pd.DataFrame | None,
+    x_axis_col: str,
+    maximize_x: bool,
+) -> None:
+    if (
+        analytical_df is None
+        or analytical_df.empty
+        or hisim_df is None
+        or hisim_df.empty
+        or merged_pareto_df is None
+        or merged_pareto_df.empty
+    ):
+        return
+    if x_axis_col not in analytical_df.columns or x_axis_col not in hisim_df.columns:
+        return
+    if "tokens/s/gpu" not in analytical_df.columns or "tokens/s/gpu" not in hisim_df.columns:
+        return
+    if x_axis_col not in merged_pareto_df.columns or "tokens/s/gpu" not in merged_pareto_df.columns:
+        return
+
+    def front(df: pd.DataFrame) -> pd.DataFrame:
+        data = df.copy()
+        data[x_axis_col] = pd.to_numeric(data[x_axis_col], errors="coerce")
+        data["tokens/s/gpu"] = pd.to_numeric(data["tokens/s/gpu"], errors="coerce")
+        data = data.dropna(subset=[x_axis_col, "tokens/s/gpu"])
+        if data.empty:
+            return data
+        return pareto_analysis.get_pareto_front(
+            data,
+            x_axis_col,
+            "tokens/s/gpu",
+            maximize_x=maximize_x,
+            maximize_y=True,
+        ).sort_values(x_axis_col, ascending=not maximize_x)
+
+    aic_front = front(analytical_df)
+    hisim_front = front(hisim_df)
+    merged_front = front(merged_pareto_df)
+    if aic_front.empty or hisim_front.empty or merged_front.empty:
+        return
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+    ax.plot(
+        aic_front[x_axis_col],
+        aic_front["tokens/s/gpu"],
+        marker="o",
+        linestyle="--",
+        color="#4C78A8",
+        label="AIC analytical",
+    )
+    ax.plot(
+        hisim_front[x_axis_col],
+        hisim_front["tokens/s/gpu"],
+        marker="s",
+        linestyle="-.",
+        color="#F58518",
+        label="hisim refined",
+    )
+    ax.plot(
+        merged_front[x_axis_col],
+        merged_front["tokens/s/gpu"],
+        marker="^",
+        linestyle="-",
+        linewidth=2.2,
+        color="#222222",
+        label="merged outer frontier",
+    )
+    ax.set_title(f"{exp_name} refinement overlay")
+    ax.set_xlabel(x_axis_col)
+    ax.set_ylabel("tokens/s/gpu")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.savefig(os.path.join(exp_dir, "refinement_overlay.png"), bbox_inches="tight")
+    plt.close(fig)
+
+
 def _check_power_data_available(best_configs: dict[str, pd.DataFrame], threshold: float = 0.9) -> bool:
     """
     Check if power data is available and meaningful across configurations.
@@ -498,14 +580,19 @@ def log_final_summary(
 def save_results(
     args,
     best_configs: dict[str, pd.DataFrame],
-    all_results: dict[str, pd.DataFrame | None],
     pareto_fronts: dict[str, pd.DataFrame | None],
     task_configs: dict[str, TaskConfig],
     save_dir: str,
+    all_results: dict[str, pd.DataFrame | None] | None = None,
     generated_backend_version: str | None = None,
     backend: str | None = None,
+    extra_results: dict[str, dict[str, pd.DataFrame | None]] | None = None,
 ):
     """Save the results to a directory."""
+    if all_results is None:
+        all_results = pareto_fronts
+    extra_results = extra_results or {}
+
     # display_* copies carry inclusive TPOT for CSV/plot output only.
     # Originals are kept for artifact generation (task_config_to_generator_config).
     if getattr(args, "inclusive_tpot", False):
@@ -647,6 +734,23 @@ def save_results(
             if all_results_df is not None:
                 all_results_csv_df = all_results_df.drop(columns=["_per_ops_source"], errors="ignore")
                 all_results_csv_df.to_csv(os.path.join(exp_dir, "all_results.csv"), index=False)
+
+            for artifact_name, artifact_results in extra_results.items():
+                artifact_df = artifact_results.get(exp_name)
+                if artifact_df is None:
+                    continue
+                artifact_csv_df = artifact_df.drop(columns=["_per_ops_source"], errors="ignore")
+                artifact_csv_df.to_csv(os.path.join(exp_dir, f"{artifact_name}.csv"), index=False)
+
+            _plot_refinement_overlay(
+                exp_name=exp_name,
+                exp_dir=exp_dir,
+                analytical_df=extra_results.get("analytical_all_results", {}).get(exp_name),
+                hisim_df=extra_results.get("hisim_refined_results", {}).get(exp_name),
+                merged_pareto_df=pareto_df,
+                x_axis_col=pareto_axis.get(exp_name, global_x_axis),
+                maximize_x=pareto_axis.get(exp_name, global_x_axis) != "request_latency",
+            )
 
             # 1. Save best config dataframe (display copy carries inclusive TPOT if flag set)
             #    Strip the object-typed _per_ops_source column before CSV write; it is

@@ -119,6 +119,9 @@ def _execute_and_wrap_result(
     chosen_exp, best_configs, pareto_fronts, best_throughputs, best_latencies = _execute_task_configs_internal(
         task_configs, mode, top_n=top_n, strict_sla=strict_sla
     )
+    raw_results = getattr(_execute_task_configs_internal, "last_results", {})
+    if not isinstance(raw_results, dict):
+        raw_results = {}
 
     return CLIResult(
         chosen_exp=chosen_exp,
@@ -127,7 +130,7 @@ def _execute_and_wrap_result(
         best_throughputs=best_throughputs,
         best_latencies=best_latencies,
         task_configs=task_configs,
-        raw_results={},
+        raw_results=raw_results,
     )
 
 
@@ -284,6 +287,9 @@ def cli_default(
             pareto_fronts=result.pareto_fronts,
             task_configs=result.task_configs,
             save_dir=save_dir,
+            all_results={name: data.get("pareto_df") for name, data in result.raw_results.items()}
+            if result.raw_results
+            else None,
             generated_backend_version=None,
         )
 
@@ -395,6 +401,9 @@ def cli_exp(
             pareto_fronts=result.pareto_fronts,
             task_configs=result.task_configs,
             save_dir=save_dir,
+            all_results={name: data.get("pareto_df") for name, data in result.raw_results.items()}
+            if result.raw_results
+            else None,
             generated_backend_version=None,
         )
 
@@ -806,6 +815,8 @@ def cli_estimate(
         return resolved_version
 
     def _load_database(sys_name: str):
+        import inspect
+
         resolved_version = _resolve_version_for(sys_name)
         database_kwargs = {"allow_missing_data": database_mode != "SILICON"}
         if active_systems_paths is not None:
@@ -813,7 +824,15 @@ def cli_estimate(
         # Keep loader behavior consistent with TaskRunner:
         # HYBRID must be passed at construction time so shared-layer sources
         # are loaded into PerfDatabase.
-        database_kwargs["database_mode"] = database_mode
+        try:
+            signature = inspect.signature(get_database)
+            accepts_database_mode = "database_mode" in signature.parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
+            )
+        except (TypeError, ValueError):
+            accepts_database_mode = True
+        if accepts_database_mode:
+            database_kwargs["database_mode"] = database_mode
         db = get_database(
             sys_name,
             backend_name,
