@@ -31,5 +31,6 @@ REGISTRY: list[OpEntry] = [
         get_func="get_wideep_moe_test_cases",
         run_func="run_wideep_moe",
         perf_filename=PerfFile.WIDEEP_MOE,
+        num_processes=1,
     ),
 ]

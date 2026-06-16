@@ -32,6 +32,7 @@ if str(SRC_ROOT) not in sys.path:
 
 
 TRACE_STAGE_RE = re.compile(r"^aic_moe/layer_(?P<layer_id>\d+)/(?P<stage>.+)$")
+AIC_OP_STAGE_RE = re.compile(r"^aic_moe/shared/(?P<stage>.+)$")
 NTOK_RE = re.compile(r"(?:^|[_-])(?:ntok|numtok|num_tokens)[_-]?(?P<ntok>\d+)(?:$|[_-])")
 ISL_RE = re.compile(r"(?:^|[_-])isl[_-]?(?P<isl>\d+)(?:$|[_-])")
 INPUT_RE = re.compile(r"(?:^|[_-])input(?P<input>\d+)(?:$|[_-])")
@@ -76,26 +77,75 @@ def parse_trace(args: argparse.Namespace) -> None:
         with _open_trace(trace_path) as f:
             payload = json.load(f)
 
+        events = payload.get("traceEvents", [])
+        kernels: list[tuple[float, float, str]] = []
+        kernel_duration_by_external_id: dict[object, float] = {}
+        for event in events:
+            if event.get("ph") != "X" or event.get("cat") != "kernel":
+                continue
+            kernel_name = str(event.get("name", ""))
+            kernel_start = float(event.get("ts", 0.0))
+            kernel_end = kernel_start + float(event.get("dur", 0.0))
+            kernels.append((kernel_start, kernel_end, kernel_name))
+            external_id = (event.get("args") or {}).get("External id")
+            if external_id is None:
+                continue
+            kernel_duration_by_external_id[external_id] = kernel_duration_by_external_id.get(external_id, 0.0) + float(
+                event.get("dur", 0.0)
+            )
+
+        cpu_ops: list[tuple[float, object]] = []
+        for event in events:
+            if event.get("ph") != "X" or event.get("cat") != "cpu_op":
+                continue
+            external_id = (event.get("args") or {}).get("External id")
+            if external_id is None:
+                continue
+            cpu_ops.append((float(event.get("ts", 0.0)), external_id))
+
         trace_rows: list[dict[str, str | int | float]] = []
-        for event in payload.get("traceEvents", []):
+        for event in events:
             if event.get("ph") != "X":
+                continue
+            # PyTorch emits the same record_function range both as the CPU
+            # annotation and as GPU stream annotations.  Keep the CPU range as
+            # the source of truth to avoid double-counting stages.
+            if event.get("cat") != "user_annotation":
                 continue
             name = event.get("name", "")
             match = TRACE_STAGE_RE.match(name)
-            if not match:
+            op_match = AIC_OP_STAGE_RE.match(name)
+            if not match and not op_match:
                 continue
+            start_ts = float(event.get("ts", 0.0))
+            end_ts = start_ts + float(event.get("dur", 0.0))
+            external_ids = {external_id for ts, external_id in cpu_ops if start_ts <= ts <= end_ts}
+            overlapping_kernels = [
+                (kernel_start, kernel_end, kernel_name)
+                for kernel_start, kernel_end, kernel_name in kernels
+                if kernel_start < end_ts and kernel_end > start_ts
+            ]
             trace_rows.append(
                 {
                     "run": run_name,
                     "trace": str(trace_path),
                     "phase": phase,
                     "num_tokens": num_tokens,
-                    "layer_id": int(match.group("layer_id")),
-                    "stage": match.group("stage"),
+                    "layer_id": int(match.group("layer_id")) if match else -1,
+                    "stage": match.group("stage") if match else op_match.group("stage"),
                     "duration_us": float(event.get("dur", 0.0)),
+                    "cuda_duration_us": sum(kernel_duration_by_external_id.get(external_id, 0.0) for external_id in external_ids),
+                    "cuda_window_duration_us": sum(kernel_end - kernel_start for kernel_start, kernel_end, _ in overlapping_kernels),
+                    "deepep_window_duration_us": sum(
+                        kernel_end - kernel_start
+                        for kernel_start, kernel_end, kernel_name in overlapping_kernels
+                        if "deep_ep::" in kernel_name
+                    ),
+                    "cpu_op_count": len(external_ids),
                     "ts": float(event.get("ts", 0.0)),
                     "pid": event.get("pid", ""),
                     "tid": event.get("tid", ""),
+                    "event_category": event.get("cat", ""),
                 }
             )
         if trace_rows and num_tokens == "":
@@ -122,9 +172,14 @@ def parse_trace(args: argparse.Namespace) -> None:
         "layer_id",
         "stage",
         "duration_us",
+        "cuda_duration_us",
+        "cuda_window_duration_us",
+        "deepep_window_duration_us",
+        "cpu_op_count",
         "ts",
         "pid",
         "tid",
+        "event_category",
     ]
     with output.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -277,7 +332,20 @@ def _row_phase(row: dict[str, str]) -> str:
     return row.get("phase") or "context"
 
 
-def _stage_values(rows: list[dict[str, str]], stage_expr: str) -> dict[str, list[float]]:
+def _row_duration(row: dict[str, str], duration_column: str) -> float:
+    if duration_column not in row:
+        raise SystemExit(
+            f"Trace CSV does not contain duration column {duration_column!r}. "
+            "Use duration_us for CPU record_function ranges or a CSV with cuda_duration_us."
+        )
+    return float(row[duration_column])
+
+
+def _stage_values(
+    rows: list[dict[str, str]],
+    stage_expr: str,
+    duration_column: str = "duration_us",
+) -> dict[str, list[float]]:
     stages = [stage.strip() for stage in stage_expr.split("+") if stage.strip()]
     if not stages:
         raise SystemExit(f"Invalid stage expression: {stage_expr!r}")
@@ -291,7 +359,7 @@ def _stage_values(rows: list[dict[str, str]], stage_expr: str) -> dict[str, list
             num_tokens = row.get("num_tokens") or ""
             if not num_tokens:
                 continue
-            groups.setdefault(num_tokens, []).append(float(row["duration_us"]))
+            groups.setdefault(num_tokens, []).append(_row_duration(row, duration_column))
         return groups
 
     partial: dict[
@@ -315,7 +383,7 @@ def _stage_values(rows: list[dict[str, str]], stage_expr: str) -> dict[str, list
         )
         bucket = partial.setdefault(key, {})
         bucket.setdefault(stage, []).append(
-            (float(row.get("ts") or 0.0), float(row["duration_us"]))
+            (float(row.get("ts") or 0.0), _row_duration(row, duration_column))
         )
 
     groups: dict[str, list[float]] = {}
@@ -382,7 +450,7 @@ def summarize_trace(args: argparse.Namespace) -> None:
     for phase in phases:
         phase_rows = [row for row in rows if _row_phase(row) == phase]
         for stage_expr in stage_exprs:
-            for num_tokens, vals in _stage_values(phase_rows, stage_expr).items():
+            for num_tokens, vals in _stage_values(phase_rows, stage_expr, args.duration_column).items():
                 groups[(phase, num_tokens, stage_expr)] = vals
 
     output_rows = []
@@ -897,7 +965,7 @@ def compare(args: argparse.Namespace) -> None:
 
     groups = {
         (num_tokens, args.distribution): vals
-        for num_tokens, vals in _stage_values(trace_rows, args.real_stage).items()
+        for num_tokens, vals in _stage_values(trace_rows, args.real_stage, args.duration_column).items()
     }
 
     aic_by_key = {
@@ -918,6 +986,7 @@ def compare(args: argparse.Namespace) -> None:
                 "num_tokens": key[0],
                 "distribution": key[1],
                 "real_stage": args.real_stage,
+                "duration_column": args.duration_column,
                 "real_samples": len(vals),
                 "real_mean_us": real_mean_us,
                 "real_p50_us": real_p50_us,
@@ -1025,6 +1094,11 @@ def main() -> None:
     p.add_argument("--trace-csv", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--stage", nargs="*", default=None)
+    p.add_argument(
+        "--duration-column",
+        default="duration_us",
+        help="Trace CSV duration column to aggregate, e.g. duration_us or cuda_duration_us.",
+    )
     p.set_defaults(func=summarize_trace)
 
     p = subparsers.add_parser("validate-trace", help="Validate required aic_moe stages exist.")
@@ -1120,6 +1194,11 @@ def main() -> None:
     p.add_argument("--real-stage", default="topk+routed/compute")
     p.add_argument("--distribution", default="balanced")
     p.add_argument("--phase", choices=["context", "generation"], default="context")
+    p.add_argument(
+        "--duration-column",
+        default="duration_us",
+        help="Trace CSV duration column to compare, e.g. duration_us or cuda_duration_us.",
+    )
     p.set_defaults(func=compare)
 
     args = parser.parse_args()

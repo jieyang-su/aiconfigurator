@@ -10,6 +10,7 @@ and perf-row aggregation for WideEP MoE cases.
 """
 
 import functools
+import csv
 import json
 import logging
 import os
@@ -64,6 +65,310 @@ from math import ceil as _ceil
 MOE_SUBPROCESS_TIMEOUT_SEC = 1800
 MOE_PROGRESS_LOG_INTERVAL_SEC = 60
 DEFAULT_MOE_MEM_FRACTION_STATIC = 0.3
+DEFAULT_MOE_TEST_LAYER = 3
+DEFAULT_MOE_COLLECTION_LAYERS = DEFAULT_MOE_TEST_LAYER + 1
+
+
+def _env_int_list(name: str) -> list[int] | None:
+    raw_value = os.environ.get(name)
+    if not raw_value:
+        return None
+    values = []
+    for item in raw_value.replace(",", " ").split():
+        values.append(int(item))
+    return values
+
+
+def _env_float_list(name: str) -> list[float] | None:
+    raw_value = os.environ.get(name)
+    if not raw_value:
+        return None
+    values = []
+    for item in raw_value.replace(",", " ").split():
+        values.append(float(item))
+    return values
+
+
+def _env_str_set(name: str) -> set[str] | None:
+    raw_value = os.environ.get(name)
+    if not raw_value:
+        return None
+    return {item.strip() for item in raw_value.replace(",", " ").split() if item.strip()}
+
+
+def _get_recorded_distribution_name() -> str:
+    return os.environ.get("COLLECTOR_WIDEEP_MOE_RECORDED_DISTRIBUTION", "recorded")
+
+
+def _resolve_recorded_distribution_file(output_path: str | None = None) -> str:
+    for env_name in (
+        "COLLECTOR_WIDEEP_MOE_RECORDED_DISTRIBUTION_FILE",
+        "COLLECTOR_MOE_TOKEN_DISTRIBUTION_FILE",
+    ):
+        raw_value = os.environ.get(env_name)
+        if raw_value:
+            if not os.path.exists(raw_value):
+                raise FileNotFoundError(f"{env_name} points to missing file: {raw_value}")
+            return raw_value
+
+    candidates = []
+    if output_path:
+        candidates.append(os.path.join(output_path, "moe_token_distribution_perf.txt"))
+    collector_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates.append(os.path.join(collector_dir, "moe_token_distribution_perf.txt"))
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        "recorded MoE distribution requested, but no moe_token_distribution_perf.txt was found. "
+        "Set COLLECTOR_WIDEEP_MOE_RECORDED_DISTRIBUTION_FILE or run moe_token_distribution first "
+        "in the same collector output directory."
+    )
+
+
+def _has_recorded_distribution_file(output_path: str | None = None) -> bool:
+    try:
+        _resolve_recorded_distribution_file(output_path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+@functools.cache
+def _load_recorded_distribution_rows(path: str, distribution: str) -> tuple[dict, ...]:
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = []
+        for row in csv.DictReader(f):
+            if row.get("distribution") != distribution:
+                continue
+            if row.get("phase", "context") != "context":
+                continue
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"No distribution={distribution!r} context rows found in {path}")
+    return tuple(rows)
+
+
+def _parse_recorded_expert_counts(row: dict, total_experts: int) -> list[int]:
+    raw_counts = row.get("expert_assignments_json") or ""
+    if not raw_counts:
+        raise ValueError(
+            "recorded MoE distribution row has empty expert_assignments_json. "
+            "Re-run moe_token_distribution with the updated collector so the exact expert counts are saved."
+        )
+    counts = json.loads(raw_counts)
+    if len(counts) != total_experts:
+        raise ValueError(
+            f"recorded expert count length mismatch: got {len(counts)}, expected {total_experts}"
+        )
+    return [max(0, int(round(float(value)))) for value in counts]
+
+
+def _select_recorded_expert_counts(
+    *,
+    output_path: str | None,
+    distribution: str,
+    num_tokens: int,
+    topk: int,
+    total_experts: int,
+    preferred_layer_id: int | None,
+    preferred_recorder_ep_size: int | None,
+) -> list[int]:
+    path = _resolve_recorded_distribution_file(output_path)
+    rows = _load_recorded_distribution_rows(path, distribution)
+    candidates = []
+    for row in rows:
+        try:
+            if int(float(row.get("num_tokens", 0))) != int(num_tokens):
+                continue
+            if int(float(row.get("topk", topk))) != int(topk):
+                continue
+            if int(float(row.get("num_experts", total_experts))) != int(total_experts):
+                continue
+        except ValueError:
+            continue
+        candidates.append(row)
+
+    if not candidates:
+        raise ValueError(
+            f"No recorded MoE distribution row for num_tokens={num_tokens}, topk={topk}, "
+            f"num_experts={total_experts} in {path}"
+        )
+
+    def score(row: dict) -> tuple[int, int, int, float, int]:
+        try:
+            layer_id = int(float(row.get("layer_id", -1)))
+        except ValueError:
+            layer_id = -1
+        try:
+            recorder_ep_size = int(float(row.get("recorder_ep_size", -1)))
+        except ValueError:
+            recorder_ep_size = -1
+        try:
+            total_assignments = float(row.get("total_assignments", 0.0) or 0.0)
+        except ValueError:
+            total_assignments = 0.0
+        layer_match = int(preferred_layer_id is not None and layer_id == preferred_layer_id)
+        ep_match = int(
+            preferred_recorder_ep_size is not None
+            and recorder_ep_size == int(preferred_recorder_ep_size)
+        )
+        nonzero = int(total_assignments > 0)
+        return (ep_match, nonzero, layer_match, total_assignments, layer_id)
+
+    selected = max(candidates, key=score)
+    counts = _parse_recorded_expert_counts(selected, total_experts)
+    actual_total = sum(counts)
+    if actual_total <= 0:
+        raise ValueError(
+            f"Recorded MoE distribution row for num_tokens={num_tokens} has zero assignments; "
+            "check that the selected layer is a routed MoE layer."
+        )
+    return counts
+
+
+def _recorded_distribution_has_case(
+    *,
+    output_path: str | None,
+    num_tokens: int,
+    topk: int,
+    total_experts: int,
+    preferred_recorder_ep_size: int | None,
+) -> bool:
+    try:
+        _select_recorded_expert_counts(
+            output_path=output_path,
+            distribution=_get_recorded_distribution_name(),
+            num_tokens=num_tokens,
+            topk=topk,
+            total_experts=total_experts,
+            preferred_layer_id=None,
+            preferred_recorder_ep_size=preferred_recorder_ep_size,
+        )
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _rescale_counts_to_total(counts: list[int], target_total: int) -> list[int]:
+    actual_total = sum(counts)
+    if actual_total <= 0:
+        raise ValueError("Cannot rescale recorded MoE distribution with zero total assignments")
+    if actual_total == target_total:
+        return counts
+
+    scaled = [count * target_total / actual_total for count in counts]
+    floors = [int(value) for value in scaled]
+    remainder = target_total - sum(floors)
+    if remainder > 0:
+        fractional_order = sorted(
+            range(len(scaled)),
+            key=lambda idx: (scaled[idx] - floors[idx], counts[idx]),
+            reverse=True,
+        )
+        for idx in fractional_order[:remainder]:
+            floors[idx] += 1
+    elif remainder < 0:
+        removable_order = sorted(range(len(floors)), key=lambda idx: floors[idx], reverse=True)
+        for idx in removable_order[: -remainder]:
+            if floors[idx] > 0:
+                floors[idx] -= 1
+
+    final_total = sum(floors)
+    if final_total != target_total:
+        raise ValueError(
+            f"Failed to rescale recorded MoE distribution: got total={final_total}, expected={target_total}"
+        )
+    return floors
+
+
+def _build_recorded_prefill_sample(
+    *,
+    num_tokens: int,
+    topk: int,
+    num_local_experts: int,
+    total_experts: int,
+    output_path: str | None,
+    preferred_layer_id: int | None,
+    preferred_recorder_ep_size: int | None,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    distribution = _get_recorded_distribution_name()
+    counts = _select_recorded_expert_counts(
+        output_path=output_path,
+        distribution=distribution,
+        num_tokens=num_tokens,
+        topk=topk,
+        total_experts=total_experts,
+        preferred_layer_id=preferred_layer_id,
+        preferred_recorder_ep_size=preferred_recorder_ep_size,
+    )
+    counts = _rescale_counts_to_total(counts, num_tokens * topk)
+    local_counts = [0] * num_local_experts
+    for expert_id, count in enumerate(counts):
+        local_counts[expert_id % num_local_experts] += count
+
+    probabilities = torch.tensor(local_counts, device=device, dtype=torch.float32)
+    if torch.count_nonzero(probabilities).item() < topk:
+        raise ValueError(
+            f"Recorded local distribution has fewer active experts than topk: "
+            f"active={torch.count_nonzero(probabilities).item()}, topk={topk}"
+        )
+    probabilities = probabilities / probabilities.sum()
+
+    seed = int(os.environ.get("COLLECTOR_WIDEEP_MOE_RECORDED_ROUTING_SEED", "20260615"))
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed + num_tokens + topk + num_local_experts)
+    topk_rows = [
+        torch.multinomial(probabilities, num_samples=topk, replacement=False, generator=generator)
+        for _ in range(num_tokens)
+    ]
+    topk_idx = torch.stack(topk_rows).to(torch.int32)
+    topk_weights = torch.full((num_tokens, topk), 1.0 / topk, device=device, dtype=torch.float32)
+    sampled_counts = torch.bincount(topk_idx.reshape(-1), minlength=num_local_experts).to(torch.int32).tolist()
+    return topk_idx.contiguous(), topk_weights.contiguous(), sampled_counts
+
+
+def _build_recorded_decode_masked_m(
+    *,
+    num_tokens: int,
+    topk: int,
+    num_local_experts: int,
+    total_experts: int,
+    output_path: str | None,
+    preferred_layer_id: int | None,
+    preferred_recorder_ep_size: int | None,
+    device,
+) -> torch.Tensor:
+    counts = _select_recorded_expert_counts(
+        output_path=output_path,
+        distribution=_get_recorded_distribution_name(),
+        num_tokens=num_tokens,
+        topk=topk,
+        total_experts=total_experts,
+        preferred_layer_id=preferred_layer_id,
+        preferred_recorder_ep_size=preferred_recorder_ep_size,
+    )
+    counts = _rescale_counts_to_total(counts, num_tokens * topk)
+    local_counts = [0] * num_local_experts
+    for expert_id, count in enumerate(counts):
+        local_counts[expert_id % num_local_experts] += count
+    return torch.tensor(local_counts, device=device, dtype=torch.int32)
+
+
+def _get_wideep_moe_max_local_assignments() -> int:
+    raw_value = os.environ.get("COLLECTOR_WIDEEP_MOE_MAX_LOCAL_ASSIGNMENTS")
+    if raw_value is None:
+        return 512
+    value = int(raw_value)
+    if value < 0:
+        raise ValueError(
+            "COLLECTOR_WIDEEP_MOE_MAX_LOCAL_ASSIGNMENTS must be >= 0 "
+            f"or unset, got {raw_value!r}"
+        )
+    return value
 
 
 def _get_moe_mem_fraction_static() -> float:
@@ -87,6 +392,40 @@ def _get_moe_mem_fraction_static() -> float:
         )
 
     return mem_fraction_static
+
+
+def _get_requested_moe_num_layers() -> int:
+    raw_value = os.environ.get("SGLANG_TEST_NUM_LAYERS")
+    if raw_value is None:
+        return DEFAULT_MOE_COLLECTION_LAYERS
+    try:
+        num_layers = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"SGLANG_TEST_NUM_LAYERS must be an integer, got {raw_value!r}") from exc
+    if num_layers < 1:
+        raise ValueError(f"SGLANG_TEST_NUM_LAYERS must be >= 1, got {num_layers}")
+    return num_layers
+
+
+def _get_moe_test_layer(num_layers: int | None = None) -> int:
+    raw_value = os.environ.get("COLLECTOR_WIDEEP_MOE_TEST_LAYER")
+    if raw_value is not None:
+        test_layer = int(raw_value)
+    else:
+        test_layer = DEFAULT_MOE_TEST_LAYER
+    num_layers = _get_requested_moe_num_layers() if num_layers is None else num_layers
+    return min(test_layer, num_layers - 1)
+
+
+def _force_first_layer_moe_for_short_dummy_config(config: dict, num_layers: int) -> None:
+    """Keep 1-layer dummy collection on a real MoE layer for DeepSeek-style models."""
+    if num_layers > DEFAULT_MOE_TEST_LAYER:
+        return
+    if "first_k_dense_replace" in config:
+        config["first_k_dense_replace"] = 0
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict) and "first_k_dense_replace" in text_config:
+        text_config["first_k_dense_replace"] = 0
 
 
 def _is_scale_ue8m0() -> bool:
@@ -161,7 +500,14 @@ def _get_config_value(config, *names: str):
 
 
 def _strip_moe_collection_quantization(config: dict) -> None:
-    """Remove checkpoint quant metadata so dummy MoE collection uses DeepGEMM/DeepEP."""
+    """Optionally remove checkpoint quant metadata for older SGLang runners.
+
+    Current SGLang DeepEP fp8 MoE keeps the DeepGEMM path behind Fp8Config.
+    Stripping quantization metadata makes DeepEPMoE fall through to deprecated
+    forward_deepgemm_* assertions, so preserve it unless explicitly requested.
+    """
+    if not get_bool_env_var("COLLECTOR_WIDEEP_MOE_STRIP_QUANTIZATION"):
+        return
     config.pop("quantization_config", None)
     text_config = config.get("text_config")
     if isinstance(text_config, dict):
@@ -169,8 +515,9 @@ def _strip_moe_collection_quantization(config: dict) -> None:
 
 
 def _set_moe_collection_override(config: dict, num_experts: int) -> None:
+    num_layers = _get_requested_moe_num_layers()
     override = {
-        "num_hidden_layers": 4,
+        "num_hidden_layers": num_layers,
         "n_routed_experts": num_experts,
         "num_experts": num_experts,
         "num_local_experts": num_experts,
@@ -179,6 +526,7 @@ def _set_moe_collection_override(config: dict, num_experts: int) -> None:
     text_config = config.get("text_config")
     if isinstance(text_config, dict):
         text_config.update(override)
+    _force_first_layer_moe_for_short_dummy_config(config, num_layers)
 
 
 def _resolve_sglang_model_path(model_ref: str) -> str:
@@ -235,15 +583,28 @@ def _get_total_experts_for_selected_model(default: int = 256) -> int:
     return int(_get_config_value(config, "n_routed_experts", "num_experts", "num_local_experts") or default)
 
 
-def get_moe_prefill_test_cases(rank):
+def get_moe_prefill_test_cases(rank, output_path: str | None = None):
     """Get test cases for MoE prefill phase including distribution and alpha.
 
     Returns a list of dicts with keys: 'num_tokens', 'distributed', 'power_law_alpha'.
     For uniform distribution, 'power_law_alpha' is None.
     """
     test_cases = []
-    num_tokens = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-    power_law_alphas = [0.6, 0.8, 1.01, 1.02, 1.2]
+    requested_logged_tokens = _env_int_list("COLLECTOR_WIDEEP_MOE_PREFILL_TOKENS")
+    if requested_logged_tokens:
+        num_tokens = sorted({max(1, token // rank) for token in requested_logged_tokens})
+    elif os.environ.get("COLLECTOR_SMOKE") == "1":
+        num_tokens = sorted({max(1, 128 // rank)})
+    else:
+        # Default to production calibration points expressed as global/logged
+        # token counts, then convert to this simulated EP rank's local count.
+        num_tokens = sorted({max(1, token // rank) for token in (128, 512, 2048, 4096)})
+    requested_distributions = _env_str_set("COLLECTOR_WIDEEP_MOE_DISTRIBUTIONS")
+    if requested_distributions is None:
+        requested_distributions = (
+            {"uniform", "recorded"} if _has_recorded_distribution_file(output_path) else {"uniform"}
+        )
+    power_law_alphas = _env_float_list("COLLECTOR_WIDEEP_MOE_POWER_LAW_ALPHAS") or [0.6, 0.8, 1.01, 1.02, 1.2]
 
     for num_token in sorted(num_tokens):
         if num_token * 8 < 128:
@@ -251,48 +612,91 @@ def get_moe_prefill_test_cases(rank):
         if num_token * rank > 256 * 2048:
             continue
         # Uniform
-        test_cases.append({"num_tokens": num_token, "distributed": "uniform", "power_law_alpha": None})
+        if "uniform" in requested_distributions:
+            test_cases.append({"num_tokens": num_token, "distributed": "uniform", "power_law_alpha": None})
         # Power-law variants
-        for alpha in power_law_alphas:
-            test_cases.append(
-                {
-                    "num_tokens": num_token,
-                    "distributed": "power_law",
-                    "power_law_alpha": alpha,
-                }
-            )
+        if "power_law" in requested_distributions:
+            for alpha in power_law_alphas:
+                test_cases.append(
+                    {
+                        "num_tokens": num_token,
+                        "distributed": "power_law",
+                        "power_law_alpha": alpha,
+                    }
+                )
+        include_recorded = (
+            "recorded" in requested_distributions
+            and _has_recorded_distribution_file(output_path)
+        )
+        if include_recorded:
+            test_cases.append({"num_tokens": num_token, "distributed": "recorded", "power_law_alpha": None})
 
     return test_cases
 
 
-def get_moe_decode_test_cases():
+def get_moe_decode_test_cases(
+    output_path: str | None = None,
+    simulated_ep_size: int | None = None,
+    topk: int | None = None,
+    total_experts: int | None = None,
+):
     """Get test cases for MoE decode phase including distribution and alpha.
 
     Returns a list of dicts with keys: 'num_tokens', 'distributed', 'power_law_alpha'.
     For uniform distribution, 'power_law_alpha' is None.
     """
     batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
-    power_law_alphas = [0.6, 0.8, 1.01, 1.02, 1.2]
+    requested_logged_tokens = _env_int_list("COLLECTOR_WIDEEP_MOE_DECODE_TOKENS")
+    if requested_logged_tokens:
+        batch_sizes = sorted(set(requested_logged_tokens))
+    requested_distributions = _env_str_set("COLLECTOR_WIDEEP_MOE_DISTRIBUTIONS")
+    if requested_distributions is None:
+        requested_distributions = (
+            {"uniform", "recorded"} if _has_recorded_distribution_file(output_path) else {"uniform"}
+        )
+    power_law_alphas = _env_float_list("COLLECTOR_WIDEEP_MOE_POWER_LAW_ALPHAS") or [0.6, 0.8, 1.01, 1.02, 1.2]
     test_cases = []
     # Uniform cases
-    for bs in batch_sizes:
-        test_cases.append(
-            {
-                "num_tokens": bs,
-                "distributed": "uniform",
-                "power_law_alpha": None,
-            }
-        )
-    # Power-law cases
-    for bs in batch_sizes:
-        for alpha in power_law_alphas:
+    if "uniform" in requested_distributions:
+        for bs in batch_sizes:
             test_cases.append(
                 {
                     "num_tokens": bs,
-                    "distributed": "power_law",
-                    "power_law_alpha": alpha,
+                    "distributed": "uniform",
+                    "power_law_alpha": None,
                 }
             )
+    # Power-law cases
+    if "power_law" in requested_distributions:
+        for bs in batch_sizes:
+            for alpha in power_law_alphas:
+                test_cases.append(
+                    {
+                        "num_tokens": bs,
+                        "distributed": "power_law",
+                        "power_law_alpha": alpha,
+                    }
+                )
+    include_recorded = (
+        "recorded" in requested_distributions
+        and _has_recorded_distribution_file(output_path)
+    )
+    if include_recorded and simulated_ep_size is not None and topk is not None and total_experts is not None:
+        for bs in batch_sizes:
+            if _recorded_distribution_has_case(
+                output_path=output_path,
+                num_tokens=bs * simulated_ep_size,
+                topk=topk,
+                total_experts=total_experts,
+                preferred_recorder_ep_size=simulated_ep_size,
+            ):
+                test_cases.append(
+                    {
+                        "num_tokens": bs,
+                        "distributed": "recorded",
+                        "power_law_alpha": None,
+                    }
+                )
     return test_cases
 
 
@@ -306,12 +710,15 @@ def load_model_with_dummy_weights(server_args, port_args, tp_rank):
         if server_args.json_model_override_args:
             existing_override = json.loads(server_args.json_model_override_args)
 
-        existing_override["num_hidden_layers"] = 4
+        num_layers = _get_requested_moe_num_layers()
+        existing_override["num_hidden_layers"] = num_layers
+        if num_layers <= DEFAULT_MOE_TEST_LAYER:
+            existing_override["first_k_dense_replace"] = 0
         server_args.json_model_override_args = json.dumps(existing_override)
 
     model_config = ModelConfig.from_server_args(server_args)
     rank_print(f"Loading model with {model_config.num_hidden_layers} layers")
-    rank_print("Will test MoE module from layer 3 (4th layer, 0-indexed)")
+    rank_print(f"Will test MoE module from layer {_get_moe_test_layer(model_config.num_hidden_layers)}")
 
     model_runner = ModelRunner(
         model_config=model_config,
@@ -365,6 +772,7 @@ def benchmark_moe_layer_prefill(
     """
 
     logged_count = 0
+    max_local_assignments = _get_wideep_moe_max_local_assignments()
     for case in prefill_test_cases:
         try:
             # Backward compatible: old format was just an int
@@ -392,52 +800,24 @@ def benchmark_moe_layer_prefill(
                 pad_size = 128 - (hidden_states_per_token_iter.shape[1] % 128)
                 hidden_states_per_token_iter = torch.nn.functional.pad(hidden_states_per_token_iter, (0, pad_size))
 
-            hidden_states_fp8_tensor_iter = hidden_states_per_token_iter.to(torch.float8_e4m3fn)
-            scale_tensor_iter = _make_scale_tensor(
-                hidden_states_per_token_iter.shape[0],
-                hidden_states_per_token_iter.shape[1],
-                hidden_states_per_token_iter.device,
-            )
-
             num_tokens_iter = hidden_states_per_token_iter.shape[0]
             topk = moe_layer.topk.topk_config.top_k
             topk_idx_iter = torch.full((num_tokens_iter, topk), -1, device=device, dtype=torch.int32)
             topk_weights_iter = torch.zeros((num_tokens_iter, topk), device=device, dtype=torch.float32)
 
             if distributed == "uniform":
-                tokens_per_local_expert = int(num_token * topk * simulated_ep_size // model_total_experts)
+                tokens_per_local_expert = int(num_tokens_iter * topk // num_local_experts)
                 rank_print(f"tokens_per_local_expert: {tokens_per_local_expert}")
                 if tokens_per_local_expert <= 0:
                     continue
                 num_recv = [tokens_per_local_expert] * num_local_experts
-
-                total_valid_positions = sum(num_recv)
-                expert_indices_list = []
-                for expert_id in range(num_local_experts):
-                    expert_indices_list.extend([expert_id] * tokens_per_local_expert)
-
-                expert_indices_tensor = torch.tensor(expert_indices_list, device=device, dtype=torch.int32)
-                shuffled_indices = torch.randperm(len(expert_indices_tensor), device=device)
-                expert_indices_tensor = expert_indices_tensor[shuffled_indices]
-
-                positions_per_row = total_valid_positions // num_tokens_iter
-                extra_positions = total_valid_positions % num_tokens_iter
-
-                valid_positions_count = 0
-                for i in range(num_tokens_iter):
-                    current_row_positions = positions_per_row + (1 if i < extra_positions else 0)
-                    for j in range(current_row_positions):
-                        if valid_positions_count < total_valid_positions:
-                            topk_idx_iter[i, j % topk] = expert_indices_tensor[valid_positions_count]
-                            valid_positions_count += 1
-                        else:
-                            break
-
-                # Uniform weights across used columns
-                for i in range(num_tokens_iter):
-                    used_mask = topk_idx_iter[i] != -1
-                    if used_mask.any():
-                        topk_weights_iter[i, used_mask] = 1.0 / topk
+                expert_indices = torch.arange(
+                    num_tokens_iter * topk,
+                    device=device,
+                    dtype=torch.int32,
+                )
+                topk_idx_iter = (expert_indices % num_local_experts).reshape(num_tokens_iter, topk)
+                topk_weights_iter.fill_(1.0 / topk)
 
             elif distributed == "power_law":
                 # Use power_law_deepep_prefill to generate router logits for local experts
@@ -454,17 +834,56 @@ def benchmark_moe_layer_prefill(
                     topk_idx_sample = topk_idx_sample.to(device).contiguous()
                     topk_weights_sample = topk_weights_sample.to(device).contiguous()
                     topk_weights_sample = torch.nan_to_num(topk_weights_sample, nan=0.0, posinf=0.0, neginf=0.0)
-                    num_recv = num_recv_tensor.tolist()
+                    topk_idx_sample = topk_idx_sample.remainder(num_local_experts)
+                    num_recv = torch.bincount(
+                        topk_idx_sample.reshape(-1),
+                        minlength=num_local_experts,
+                    ).to(torch.int32).tolist()
                     power_law_samples.append((topk_idx_sample, topk_weights_sample, num_recv))
+
+            elif distributed == "recorded":
+                topk_idx_iter, topk_weights_iter, num_recv = _build_recorded_prefill_sample(
+                    num_tokens=num_tokens_iter,
+                    topk=topk,
+                    num_local_experts=num_local_experts,
+                    total_experts=model_total_experts,
+                    output_path=output_path,
+                    preferred_layer_id=test_layer,
+                    preferred_recorder_ep_size=simulated_ep_size,
+                    device=device,
+                )
+                active_local_experts = sum(1 for count in num_recv if count > 0)
+                rank_print(
+                    "recorded distribution: "
+                    f"global_tokens={num_tokens_iter}, active_local_experts={active_local_experts}, "
+                    f"max_local_assignments={max(num_recv) if num_recv else 0}"
+                )
 
             else:
                 raise ValueError(f"Unsupported distributed mode: {distributed}")
 
-            # For uniform distribution, create a single-element list for unified processing
-            if distributed == "uniform":
+            # For single-sample distributions, create a single-element list for unified processing.
+            if distributed in ("uniform", "recorded"):
                 # Safety clamp for weights
                 topk_weights_iter = torch.nan_to_num(topk_weights_iter, nan=0.0, posinf=0.0, neginf=0.0)
                 power_law_samples = [(topk_idx_iter, topk_weights_iter, num_recv)]
+
+            if max_local_assignments:
+                safe_samples = []
+                for topk_idx_sample, topk_weights_sample, num_recv_sample in power_law_samples:
+                    sample_max = max(num_recv_sample) if num_recv_sample else 0
+                    if sample_max > max_local_assignments:
+                        rank_print(
+                            "Skipping prefill case because local expert load exceeds guard: "
+                            f"global_tokens={num_tokens_iter}, distribution={distributed}, "
+                            f"max_local_assignments={sample_max}, "
+                            f"limit={max_local_assignments}"
+                        )
+                        continue
+                    safe_samples.append((topk_idx_sample, topk_weights_sample, num_recv_sample))
+                power_law_samples = safe_samples
+                if not power_law_samples:
+                    continue
 
             # Warmup
             for _ in range(num_warmup):
@@ -668,7 +1087,7 @@ def benchmark_moe_layer_decode(
 
             masked_m = torch.zeros(num_local_experts, device=device, dtype=torch.int32)
 
-            # support two distributed mode: power_law and uniform
+            # support three distributed modes: power_law, uniform, and recorded
             if distributed == "power_law":
                 masked_m_list = [
                     power_law_deepep_decode(
@@ -692,6 +1111,25 @@ def benchmark_moe_layer_decode(
                     masked_m[: int(num_token * top_k)] = 1
                 else:
                     masked_m[:] = base_tokens_per_expert
+                masked_m_list = [masked_m]
+            elif distributed == "recorded":
+                masked_m = _build_recorded_decode_masked_m(
+                    num_tokens=num_token * simulated_ep_size,
+                    topk=top_k,
+                    num_local_experts=num_local_experts,
+                    total_experts=model_total_experts,
+                    output_path=output_path,
+                    preferred_layer_id=test_layer,
+                    preferred_recorder_ep_size=simulated_ep_size,
+                    device=device,
+                )
+                active_local_experts = int((masked_m > 0).sum().item())
+                rank_print(
+                    "recorded decode distribution: "
+                    f"global_tokens={num_token * simulated_ep_size}, "
+                    f"active_local_experts={active_local_experts}, "
+                    f"max_local_assignments={int(masked_m.max().item()) if masked_m.numel() else 0}"
+                )
                 masked_m_list = [masked_m]
             else:
                 raise ValueError(f"Unsupported distributed mode: {distributed}")
@@ -953,14 +1391,16 @@ def run_moe(
         # all known names so this works for DeepSeek / Qwen / MiniMax.
         original_model_path = server_args.model_path
         server_args.model_path = _resolve_reduced_moe_model_path(original_model_path, num_experts)
-        server_args.json_model_override_args = json.dumps(
-            {
-                "num_hidden_layers": 4,
-                "n_routed_experts": num_experts,  # DeepSeek-V3
-                "num_experts": num_experts,  # Qwen3-MoE, GPT-OSS
-                "num_local_experts": num_experts,  # MiniMax-M2 (Mixtral-style)
-            }
-        )
+        num_layers = _get_requested_moe_num_layers()
+        override_args = {
+            "num_hidden_layers": num_layers,
+            "n_routed_experts": num_experts,  # DeepSeek-V3
+            "num_experts": num_experts,  # Qwen3-MoE, GPT-OSS
+            "num_local_experts": num_experts,  # MiniMax-M2 (Mixtral-style)
+        }
+        if num_layers <= DEFAULT_MOE_TEST_LAYER:
+            override_args["first_k_dense_replace"] = 0
+        server_args.json_model_override_args = json.dumps(override_args)
 
         try:
             model_runner = load_model_with_dummy_weights(server_args, port_args, tp_rank)
@@ -1031,7 +1471,7 @@ def run_moe(
             f"(num_local_experts={num_local_experts}, total_experts={model_total_experts})"
         )
 
-        prefill_test_cases = get_moe_prefill_test_cases(simulated_ep_size)
+        prefill_test_cases = get_moe_prefill_test_cases(simulated_ep_size, output_path)
         rank_print(f"Testing {len(prefill_test_cases)} prefill configurations...")
 
         # Use deepep_mode="normal" for prefill
@@ -1056,29 +1496,39 @@ def run_moe(
             model_total_experts=model_total_experts,
         )
 
-        decode_test_cases = get_moe_decode_test_cases()
-        rank_print(f"Testing {len(decode_test_cases)} decode configurations...")
-        # Use deepep_mode="low_latency" for decode
-        server_args.deepep_mode = "low_latency"
-        decode_logged_count = benchmark_moe_layer_decode(
-            model_runner,
-            server_args,
-            port_args,
-            num_warmup,
-            num_iterations,
-            test_layer,
-            rank_print,
-            server_args.device,
-            tp_rank,
-            decode_test_cases,
-            moe_layer,
-            num_local_experts,
-            simulated_ep_size,
-            output_path=output_path,
-            model_hidden_size=model_hidden_size,
-            model_inter_size=model_inter_size,
-            model_total_experts=model_total_experts,
-        )
+        if get_bool_env_var("COLLECTOR_WIDEEP_MOE_SKIP_DECODE"):
+            decode_test_cases = []
+            decode_logged_count = 0
+            rank_print("Skipping decode configurations because COLLECTOR_WIDEEP_MOE_SKIP_DECODE=1")
+        else:
+            decode_test_cases = get_moe_decode_test_cases(
+                output_path=output_path,
+                simulated_ep_size=simulated_ep_size,
+                topk=moe_layer.topk.topk_config.top_k,
+                total_experts=model_total_experts,
+            )
+            rank_print(f"Testing {len(decode_test_cases)} decode configurations...")
+            # Use deepep_mode="low_latency" for decode
+            server_args.deepep_mode = "low_latency"
+            decode_logged_count = benchmark_moe_layer_decode(
+                model_runner,
+                server_args,
+                port_args,
+                num_warmup,
+                num_iterations,
+                test_layer,
+                rank_print,
+                server_args.device,
+                tp_rank,
+                decode_test_cases,
+                moe_layer,
+                num_local_experts,
+                simulated_ep_size,
+                output_path=output_path,
+                model_hidden_size=model_hidden_size,
+                model_inter_size=model_inter_size,
+                model_total_experts=model_total_experts,
+            )
         if prefill_test_cases and prefill_logged_count == 0:
             raise RuntimeError(
                 "WideEP MoE prefill produced no perf rows; "
@@ -1116,7 +1566,8 @@ def get_wideep_moe_test_cases(total_experts=None):
     """Returns list of [num_experts] for MOE collection.
 
     Each num_experts value simulates a different EP size based on model's total experts.
-    Starts from EP=2 (half experts per GPU) to focus on wideep multi-GPU scenarios.
+    Defaults to production DeepSeek-style DeepEP coverage, EP=2/4/8.
+    EP=1 is covered by the ordinary local MoE collector.
 
     For DeepSeek-V3 (256 experts):
     - num_experts=128 → EP=2
@@ -1145,15 +1596,26 @@ def get_wideep_moe_test_cases(total_experts=None):
     if total_experts is None:
         total_experts = _get_total_experts_for_selected_model()
 
-    # Generate test cases based on total_experts
-    # num_experts must be a power of 2 and <= total_experts
-    # Start from EP=2 (total_experts // 2) to avoid single-GPU OOM and focus on wideep scenarios
-    test_cases = []
-    n = total_experts // 2  # Start from EP=2
-    while n >= 1:
-        test_cases.append([n])
-        n //= 2
-    return test_cases
+    requested_ep_sizes = _env_int_list("COLLECTOR_WIDEEP_MOE_EP_SIZES")
+    if requested_ep_sizes:
+        test_cases = []
+        for ep_size in requested_ep_sizes:
+            if ep_size <= 0:
+                raise ValueError(f"COLLECTOR_WIDEEP_MOE_EP_SIZES entries must be positive, got {ep_size}")
+            if total_experts % ep_size != 0:
+                raise ValueError(
+                    f"Cannot simulate EP={ep_size} for total_experts={total_experts}: "
+                    "total experts must be divisible by EP size"
+                )
+            test_cases.append([total_experts // ep_size])
+        return test_cases
+
+    # EP=1 is ordinary local MoE rather than an expert-parallel DeepEP case.
+    # On current H20/SGLang, forcing EP=1 through DeepEP can corrupt the CUDA
+    # context for larger prefill points. Keep it opt-in via
+    # COLLECTOR_WIDEEP_MOE_EP_SIZES=1 for debugging, but do not run it by default.
+    default_ep_sizes = [2, 4, 8]
+    return [[total_experts // ep_size] for ep_size in default_ep_sizes if total_experts % ep_size == 0]
 
 
 def run_moe_benchmark(num_experts, gpu_id, output_path=None):
@@ -1214,7 +1676,16 @@ def run_moe_benchmark(num_experts, gpu_id, output_path=None):
     print(f"{'=' * 60}")
 
     # Run the actual benchmark
-    run_moe(server_args, port_args, 3, 10, 3, num_experts, 0, output_path)
+    run_moe(
+        server_args,
+        port_args,
+        3,
+        10,
+        _get_moe_test_layer(_get_requested_moe_num_layers()),
+        num_experts,
+        0,
+        output_path,
+    )
 
     torch.cuda.empty_cache()
     print(f"Completed num_experts={num_experts} (EP size {simulated_ep_size})")

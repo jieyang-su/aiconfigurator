@@ -363,7 +363,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     torch.manual_seed(rank)
 
-    for i in (24,):
+    for i in (args.num_sms,):
         test_main(args, i, local_rank, num_ranks, rank, buffer, group)
         if local_rank == 0:
             print("", flush=True)
@@ -396,6 +396,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden", type=int, default=7168, help="Hidden dimension size (default: 7168)")
     parser.add_argument("--num-topk", type=int, default=8, help="Number of top-k experts (default: 8)")
     parser.add_argument("--num-experts", type=int, default=256, help="Number of experts (default: 256)")
+    parser.add_argument("--num-sms", type=int, default=24, help="Number of SMs to use for tuning (default: 24)")
     args = parser.parse_args()
 
     num_processes = args.num_processes

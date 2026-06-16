@@ -54,6 +54,14 @@ REGISTRY: list[OpEntry] = [
         perf_filename=PerfFile.MLA_BMM,
     ),
     OpEntry(
+        op="moe_token_distribution",
+        module="collector.sglang.collect_moe_distribution",
+        get_func="get_moe_distribution_test_cases",
+        run_func="run_moe_distribution",
+        perf_filename=PerfFile.MOE_TOKEN_DISTRIBUTION,
+        num_processes=1,
+    ),
+    OpEntry(
         op="moe",
         module="collector.sglang.collect_moe",
         get_func="get_moe_test_cases",

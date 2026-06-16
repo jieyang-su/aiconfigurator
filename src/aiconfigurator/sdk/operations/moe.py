@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from math import ceil
 from typing import TYPE_CHECKING, ClassVar
 
 from aiconfigurator.sdk import common, interpolation
@@ -866,7 +867,7 @@ class MoEDispatch(Operation):
         volume = num_tokens * self._hidden_size
         _sm_version = database.system_spec["gpu"].get("sm_version", -1)
         _num_gpus_per_node = database.system_spec["node"]["num_gpus_per_node"]
-        _node_num = self.num_gpus / _num_gpus_per_node
+        _node_num = max(1, ceil(self.num_gpus / _num_gpus_per_node))
 
         if self._quant_mode is not None:
             _quant_compress = self._quant_mode.value.memory / 2.0
@@ -2167,10 +2168,19 @@ def load_wideep_context_moe_data(wideep_context_moe_file):
         # NEW: Calculate energy from power and latency
         energy = power * latency  # watt-milliseconds
 
+        token_data = wideep_context_moe_data[quant_mode][distribution][topk][num_experts][hidden_size][inter_size][
+            moe_tp_size
+        ][moe_ep_size]
+        if num_tokens in token_data:
+            logger.debug(
+                "Skipping duplicate SGLang wideep context MoE row because an earlier source has priority: "
+                f"{quant_mode}, {distribution}, {topk}, {num_experts}, {hidden_size}, {inter_size}, "
+                f"{moe_tp_size}, {moe_ep_size}, {num_tokens}"
+            )
+            continue
+
         # Store all three values
-        wideep_context_moe_data[quant_mode][distribution][topk][num_experts][hidden_size][inter_size][moe_tp_size][
-            moe_ep_size
-        ][num_tokens] = {
+        token_data[num_tokens] = {
             "latency": latency,
             "power": power,
             "energy": energy,  # NEW: precomputed energy
@@ -2235,10 +2245,19 @@ def load_wideep_generation_moe_data(wideep_generation_moe_file):
         # NEW: Calculate energy from power and latency
         energy = power * latency  # watt-milliseconds
 
+        token_data = wideep_generation_moe_data[quant_mode][distribution][topk][num_experts][hidden_size][inter_size][
+            moe_tp_size
+        ][moe_ep_size]
+        if num_tokens in token_data:
+            logger.debug(
+                "Skipping duplicate SGLang wideep generation MoE row because an earlier source has priority: "
+                f"{quant_mode}, {distribution}, {topk}, {num_experts}, {hidden_size}, {inter_size}, "
+                f"{moe_tp_size}, {moe_ep_size}, {num_tokens}"
+            )
+            continue
+
         # Store all three values
-        wideep_generation_moe_data[quant_mode][distribution][topk][num_experts][hidden_size][inter_size][moe_tp_size][
-            moe_ep_size
-        ][num_tokens] = {
+        token_data[num_tokens] = {
             "latency": latency,
             "power": power,
             "energy": energy,  # NEW: precomputed energy

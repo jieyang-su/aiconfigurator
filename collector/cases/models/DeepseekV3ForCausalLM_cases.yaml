@@ -74,6 +74,8 @@ framework_specific_op_cases:
     mla_generation_module:
       cases: all
   sglang:
+    moe_token_distribution:
+      cases: all
     wideep_mla_context:
       cases: all
     wideep_mla_generation:

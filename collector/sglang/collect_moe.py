@@ -11,7 +11,10 @@ rank-local workload construction, quantized weight setup, and perf logging.
 
 import inspect
 import itertools
+import csv
+import json
 import os
+from pathlib import Path
 from typing import TypedDict
 from unittest.mock import MagicMock
 
@@ -147,6 +150,208 @@ _SM120_NEMOTRON_NVFP4_MODELS = {
 }
 
 
+def _env_str_set(name: str) -> set[str] | None:
+    raw_value = os.environ.get(name)
+    if not raw_value:
+        return None
+    return {item.strip() for item in raw_value.replace(",", " ").split() if item.strip()}
+
+
+def _get_recorded_distribution_name() -> str:
+    return os.environ.get("COLLECTOR_MOE_RECORDED_DISTRIBUTION", "recorded")
+
+
+def _resolve_recorded_distribution_file() -> str:
+    for env_name in (
+        "COLLECTOR_MOE_RECORDED_DISTRIBUTION_FILE",
+        "COLLECTOR_MOE_TOKEN_DISTRIBUTION_FILE",
+    ):
+        raw_value = os.environ.get(env_name)
+        if raw_value:
+            if not os.path.exists(raw_value):
+                raise FileNotFoundError(f"{env_name} points to missing file: {raw_value}")
+            return raw_value
+
+    output_dir = os.environ.get("COLLECTOR_CURRENT_OUTPUT_DIR")
+    if output_dir:
+        candidate = os.path.join(output_dir, "moe_token_distribution_perf.txt")
+        if os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        "recorded MoE distribution requested, but no moe_token_distribution_perf.txt was found. "
+        "Set COLLECTOR_MOE_RECORDED_DISTRIBUTION_FILE or run moe_token_distribution first "
+        "in the same collector output directory."
+    )
+
+
+def _has_recorded_distribution_file() -> bool:
+    try:
+        _resolve_recorded_distribution_file()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _load_recorded_distribution_rows(path: str, distribution: str) -> tuple[dict, ...]:
+    cache_key = (path, distribution)
+    cache = getattr(_load_recorded_distribution_rows, "_cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = []
+        for row in csv.DictReader(f):
+            if row.get("distribution") != distribution:
+                continue
+            if row.get("phase", "context") != "context":
+                continue
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"No distribution={distribution!r} context rows found in {path}")
+    result = tuple(rows)
+    cache[cache_key] = result
+    _load_recorded_distribution_rows._cache = cache
+    return result
+
+
+def _recorded_distribution_has_case(num_tokens: int, topk: int, num_experts: int) -> bool:
+    try:
+        _select_recorded_expert_counts(
+            distribution=_get_recorded_distribution_name(),
+            num_tokens=num_tokens,
+            topk=topk,
+            num_experts=num_experts,
+            preferred_layer_id=None,
+            preferred_recorder_ep_size=None,
+        )
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _parse_recorded_expert_counts(row: dict, num_experts: int) -> list[float]:
+    raw_counts = row.get("expert_assignments_json") or ""
+    if not raw_counts:
+        raise ValueError(
+            "recorded MoE distribution row has empty expert_assignments_json. "
+            "Re-run moe_token_distribution with the updated collector so the exact expert counts are saved."
+        )
+    counts = json.loads(raw_counts)
+    if len(counts) != num_experts:
+        raise ValueError(f"recorded expert count length mismatch: got {len(counts)}, expected {num_experts}")
+    return [max(0.0, float(value)) for value in counts]
+
+
+def _select_recorded_expert_counts(
+    *,
+    distribution: str,
+    num_tokens: int,
+    topk: int,
+    num_experts: int,
+    preferred_layer_id: int | None,
+    preferred_recorder_ep_size: int | None,
+) -> list[float]:
+    path = _resolve_recorded_distribution_file()
+    candidates = []
+    for row in _load_recorded_distribution_rows(path, distribution):
+        try:
+            if int(float(row.get("num_tokens", 0))) != int(num_tokens):
+                continue
+            if int(float(row.get("topk", topk))) != int(topk):
+                continue
+            if int(float(row.get("num_experts", num_experts))) != int(num_experts):
+                continue
+        except ValueError:
+            continue
+        candidates.append(row)
+    if not candidates:
+        raise ValueError(
+            f"No recorded MoE distribution row for num_tokens={num_tokens}, topk={topk}, "
+            f"num_experts={num_experts}"
+        )
+
+    def score(row: dict) -> tuple[int, int, float, int]:
+        try:
+            layer_id = int(float(row.get("layer_id", -1)))
+        except ValueError:
+            layer_id = -1
+        try:
+            recorder_ep_size = int(float(row.get("recorder_ep_size", -1)))
+        except ValueError:
+            recorder_ep_size = -1
+        try:
+            total_assignments = float(row.get("total_assignments", 0.0) or 0.0)
+        except ValueError:
+            total_assignments = 0.0
+        layer_match = int(preferred_layer_id is not None and layer_id == preferred_layer_id)
+        ep_match = int(
+            preferred_recorder_ep_size is not None
+            and recorder_ep_size == int(preferred_recorder_ep_size)
+        )
+        return (ep_match, layer_match, total_assignments, layer_id)
+
+    selected = max(candidates, key=score)
+    counts = _parse_recorded_expert_counts(selected, num_experts)
+    if sum(counts) <= 0:
+        raise ValueError(f"Recorded MoE distribution row for num_tokens={num_tokens} has zero assignments")
+    return counts
+
+
+def recorded_logits_v3(
+    num_tokens: int,
+    num_experts: int,
+    topk: int,
+    ep: int,
+    return_rank0_info: bool = False,
+):
+    import torch.nn.functional as F
+
+    counts = _select_recorded_expert_counts(
+        distribution=_get_recorded_distribution_name(),
+        num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        preferred_layer_id=None,
+        preferred_recorder_ep_size=ep,
+    )
+    probabilities = torch.tensor(counts, dtype=torch.float32, device="cpu")
+    if torch.count_nonzero(probabilities).item() < topk:
+        raise ValueError(
+            f"Recorded distribution has fewer active experts than topk: "
+            f"active={torch.count_nonzero(probabilities).item()}, topk={topk}"
+        )
+    probabilities = probabilities / probabilities.sum()
+
+    seed = int(os.environ.get("COLLECTOR_MOE_RECORDED_ROUTING_SEED", "20260615"))
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed + num_tokens + topk + num_experts + ep)
+    selected_experts = torch.stack(
+        [
+            torch.multinomial(probabilities, num_samples=topk, replacement=False, generator=generator)
+            for _ in range(num_tokens)
+        ]
+    )
+    expert_map = F.one_hot(selected_experts.long(), num_classes=num_experts).sum(1)
+    router_logits = F.softmax(expert_map.bfloat16(), dim=1)
+
+    if return_rank0_info:
+        experts_per_rank = num_experts // ep
+        rank0_selections_mask = selected_experts < experts_per_rank
+        rank0_token_mask = rank0_selections_mask.any(dim=1)
+        rank0_logits = router_logits[rank0_token_mask]
+        rank0_selected_slots = selected_experts[rank0_token_mask]
+        rank0_info = {
+            "rank0_token_mask": rank0_token_mask,
+            "rank0_logits": rank0_logits,
+            "rank0_selected_slots": rank0_selected_slots,
+            "rank0_num_tokens": int(rank0_logits.shape[0]),
+            "slots_per_rank": experts_per_rank,
+            "rank0_total_selections": int(rank0_selections_mask.sum().item()),
+        }
+        return router_logits, rank0_info
+    return router_logits
+
+
 def _make_moe_runner_config(swiglu_limit: float | None = None) -> MoeRunnerConfig:
     kwargs = {}
     if "swiglu_limit" in _MOE_RUNNER_CONFIG_PARAMS:
@@ -184,6 +389,11 @@ def get_moe_test_cases():
         moe_list = ["bfloat16", "fp8_block", "int4_wo"]
 
     test_cases = []
+    recorded_requested = _env_str_set("COLLECTOR_MOE_DISTRIBUTIONS") or set()
+    include_recorded = "recorded" in recorded_requested or (
+        not recorded_requested and _has_recorded_distribution_file()
+    )
+    seen_recorded_cases = set()
 
     for common_moe_testcase in get_common_moe_test_cases():
         model_name = common_moe_testcase.model_name
@@ -592,22 +802,49 @@ def get_moe_test_cases():
             if "DeepSeek-V4" in common_moe_testcase.model_name:
                 swiglu_limit = 10
 
-            test_cases.append(
-                [
-                    moe_type,
+            base_case = [
+                moe_type,
+                num_tokens,
+                common_moe_testcase.hidden_size,
+                common_moe_testcase.inter_size,
+                common_moe_testcase.topk,
+                common_moe_testcase.num_experts,
+                common_moe_testcase.tp,
+                common_moe_testcase.ep,
+                common_moe_testcase.model_name,
+                common_moe_testcase.token_expert_distribution,
+                common_moe_testcase.power_law_alpha,
+                swiglu_limit,
+            ]
+            base_distribution = common_moe_testcase.token_expert_distribution
+            if not recorded_requested or base_distribution in recorded_requested:
+                test_cases.append(base_case)
+
+            recorded_key = (
+                moe_type,
+                num_tokens,
+                common_moe_testcase.hidden_size,
+                common_moe_testcase.inter_size,
+                common_moe_testcase.topk,
+                common_moe_testcase.num_experts,
+                common_moe_testcase.tp,
+                common_moe_testcase.ep,
+                common_moe_testcase.model_name,
+            )
+            if (
+                include_recorded
+                and recorded_key not in seen_recorded_cases
+                and _recorded_distribution_has_case(
                     num_tokens,
-                    common_moe_testcase.hidden_size,
-                    common_moe_testcase.inter_size,
                     common_moe_testcase.topk,
                     common_moe_testcase.num_experts,
-                    common_moe_testcase.tp,
-                    common_moe_testcase.ep,
-                    common_moe_testcase.model_name,
-                    common_moe_testcase.token_expert_distribution,
-                    common_moe_testcase.power_law_alpha,
-                    swiglu_limit,
-                ]
-            )
+                )
+            ):
+                seen_recorded_cases.add(recorded_key)
+                recorded_case = list(base_case)
+                recorded_case[9] = "recorded"
+                recorded_case[10] = 0
+                test_cases.append(recorded_case)
 
     return test_cases
 
@@ -664,6 +901,11 @@ def benchmark_config(
         elif distributed == "power_law":
             gating_output = [
                 power_law_logits_v3(num_tokens, num_experts, topk, 1, power_law_alpha).to(device)
+                for _ in range(num_iters)
+            ]
+        elif distributed == "recorded":
+            gating_output = [
+                recorded_logits_v3(num_tokens, num_experts, topk, 1).to(device)
                 for _ in range(num_iters)
             ]
         else:
@@ -735,6 +977,8 @@ def benchmark_config(
                 ]
             elif distributed == "balanced":
                 gating_list = [balanced_logits(num_tokens, num_experts, topk).to(device) for _ in range(num_iters)]
+            elif distributed == "recorded":
+                gating_list = [recorded_logits_v3(num_tokens, num_experts, topk, 1).to(device) for _ in range(num_iters)]
             else:
                 gating_list = [
                     torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device) for _ in range(num_iters)
@@ -1017,6 +1261,11 @@ def benchmark_config(
         elif distributed == "power_law":
             router_logits_list = [
                 power_law_logits_v3(num_tokens, num_experts, topk, moe_ep_size, power_law_alpha).to(device)
+                for _ in range(num_iters)
+            ]
+        elif distributed == "recorded":
+            router_logits_list = [
+                recorded_logits_v3(num_tokens, num_experts, topk, moe_ep_size).to(device)
                 for _ in range(num_iters)
             ]
         else:
@@ -1346,6 +1595,14 @@ def build_rank0_workloads(
                 "rank0_num_tokens": int(rank0_token_mask.sum().item()),
                 "slots_per_rank": experts_per_rank,
             }
+        elif distributed == "recorded":
+            _, rank0_info = recorded_logits_v3(
+                num_tokens,
+                num_experts,
+                topk,
+                moe_ep_size,
+                return_rank0_info=True,
+            )
         else:
             raise ValueError(f"Unsupported distribution for rank0 workloads: {distributed}")
 
@@ -1383,6 +1640,7 @@ def run_moe_torch(
     perf_filename,
     device="cuda:0",
 ):
+    os.environ["COLLECTOR_CURRENT_OUTPUT_DIR"] = os.path.dirname(os.path.abspath(str(perf_filename))) or os.getcwd()
     torch.cuda.set_device(device)
     torch.set_default_device(device)
 
@@ -1415,7 +1673,7 @@ def run_moe_torch(
         block_shape = None
 
     rank0_workloads: list[Rank0Workload] | None = None
-    if moe_ep_size > 1 and distributed in ("power_law", "balanced") and not use_mxfp4_moe:
+    if moe_ep_size > 1 and distributed in ("power_law", "balanced", "recorded") and not use_mxfp4_moe:
         rank0_workloads = build_rank0_workloads(
             num_workloads=5,
             num_tokens=num_tokens,

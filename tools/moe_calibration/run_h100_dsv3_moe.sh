@@ -8,12 +8,15 @@ set -euo pipefail
 : "${SGLANG_SRC:=/workspace/sglang}"
 : "${AIC_SRC:=/workspace/aiconfigurator-jieyang}"
 : "${MODEL_PATH:=deepseek-ai/DeepSeek-V3}"
+: "${AIC_MODEL_PATH:=${MODEL_PATH}}"
 : "${CUDA_VISIBLE_DEVICES:=7}"
 : "${GPU_LIST_DOCKER:=device=7}"
 : "${SYSTEM:=h100_sxm}"
 : "${BACKEND_VERSION:=0.5.9}"
 : "${DEEPEP_DISPATCH_BACKEND_VERSION:=${BACKEND_VERSION}}"
 : "${AIC_SYSTEMS_ROOT:=${AIC_SRC}/src/aiconfigurator/systems}"
+: "${AIC_DATABASE_MODE:=SILICON}"
+: "${AIC_TRACE_DURATION_COLUMN:=duration_us}"
 : "${NUM_HIDDEN_LAYERS:=6}"
 : "${FIRST_K_DENSE_REPLACE:=3}"
 : "${EXPECTED_MOE_LAYERS:=$(( NUM_HIDDEN_LAYERS > FIRST_K_DENSE_REPLACE ? NUM_HIDDEN_LAYERS - FIRST_K_DENSE_REPLACE : 0 ))}"
@@ -30,6 +33,8 @@ set -euo pipefail
 : "${WIDEEP_DISTRIBUTION:=uniform}"
 : "${DEEPEP_NODE_NUM:=1}"
 : "${DEEPEP_SMS:=20}"
+: "${AIC_COLLECTOR_PLAN_LIMIT:=16}"
+: "${AIC_COLLECTOR_LIMIT:=4}"
 : "${TOKEN_SWEEP:=128 512 2048 4096}"
 : "${INTERP_TOKEN_SWEEP:=96 160 384 768 1536 3072 6144}"
 : "${OUT_DIR:=/workspace/moe_calibration_runs/h100_dsv3_moe_$(date +%Y%m%d_%H%M%S)}"
@@ -56,10 +61,13 @@ record_env() {
 SGLANG_SRC=${SGLANG_SRC}
 AIC_SRC=${AIC_SRC}
 MODEL_PATH=${MODEL_PATH}
+AIC_MODEL_PATH=${AIC_MODEL_PATH}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 SYSTEM=${SYSTEM}
 BACKEND_VERSION=${BACKEND_VERSION}
 DEEPEP_DISPATCH_BACKEND_VERSION=${DEEPEP_DISPATCH_BACKEND_VERSION}
+AIC_DATABASE_MODE=${AIC_DATABASE_MODE}
+AIC_TRACE_DURATION_COLUMN=${AIC_TRACE_DURATION_COLUMN}
 NUM_HIDDEN_LAYERS=${NUM_HIDDEN_LAYERS}
 FIRST_K_DENSE_REPLACE=${FIRST_K_DENSE_REPLACE}
 EXPECTED_MOE_LAYERS=${EXPECTED_MOE_LAYERS}
@@ -76,6 +84,8 @@ DISTRIBUTION=${DISTRIBUTION}
 WIDEEP_DISTRIBUTION=${WIDEEP_DISTRIBUTION}
 DEEPEP_NODE_NUM=${DEEPEP_NODE_NUM}
 DEEPEP_SMS=${DEEPEP_SMS}
+AIC_COLLECTOR_PLAN_LIMIT=${AIC_COLLECTOR_PLAN_LIMIT}
+AIC_COLLECTOR_LIMIT=${AIC_COLLECTOR_LIMIT}
 TOKEN_SWEEP=${TOKEN_SWEEP}
 INTERP_TOKEN_SWEEP=${INTERP_TOKEN_SWEEP}
 OUT_DIR=${OUT_DIR}
@@ -270,6 +280,7 @@ parse_traces() {
   python tools/moe_calibration/aic_moe_calibrate.py summarize-trace \
     --trace-csv "${OUT_DIR}/parsed/sglang_aic_moe_events.csv" \
     --stage module router collector/moe topk shared_experts routed_experts routed/dispatch routed/compute routed/combine routed/dispatch_a routed/dispatch_b routed/combine_a routed/combine_b routed/all_reduce output_postprocess output_all_reduce \
+    --duration-column "${AIC_TRACE_DURATION_COLUMN}" \
     --output "${OUT_DIR}/parsed/sglang_aic_moe_summary.csv"
   python tools/moe_calibration/aic_moe_calibrate.py breakdown-trace \
     --trace-csv "${OUT_DIR}/parsed/sglang_aic_moe_events.csv" \
@@ -286,7 +297,7 @@ query_aic() {
     --system "${SYSTEM}" \
     --backend sglang \
     --backend-version "${BACKEND_VERSION}" \
-    --database-mode SILICON \
+    --database-mode "${AIC_DATABASE_MODE}" \
     --phase context \
     --num-tokens ${TOKEN_SWEEP} ${INTERP_TOKEN_SWEEP} \
     --hidden-size "${HIDDEN_SIZE}" \
@@ -308,7 +319,7 @@ query_wideep_compute_aic() {
     --system "${SYSTEM}" \
     --backend sglang \
     --backend-version "${BACKEND_VERSION}" \
-    --database-mode SILICON \
+    --database-mode "${AIC_DATABASE_MODE}" \
     --phase context \
     --num-tokens ${TOKEN_SWEEP} ${INTERP_TOKEN_SWEEP} \
     --hidden-size "${HIDDEN_SIZE}" \
@@ -332,6 +343,7 @@ compare_real_vs_aic() {
     --real-stage topk+routed/compute \
     --distribution "${DISTRIBUTION}" \
     --phase context \
+    --duration-column "${AIC_TRACE_DURATION_COLUMN}" \
     --output "${OUT_DIR}/parsed/aic_vs_sglang_topk_compute.csv"
 
   python "${AIC_SRC}/tools/moe_calibration/aic_moe_calibrate.py" compare \
@@ -340,6 +352,7 @@ compare_real_vs_aic() {
     --real-stage collector/moe \
     --distribution "${DISTRIBUTION}" \
     --phase context \
+    --duration-column "${AIC_TRACE_DURATION_COLUMN}" \
     --output "${OUT_DIR}/parsed/aic_vs_sglang_collector_moe.csv"
 }
 
@@ -352,6 +365,7 @@ compare_wideep_compute_real_vs_aic() {
     --real-stage routed/compute \
     --distribution "${WIDEEP_DISTRIBUTION}" \
     --phase context \
+    --duration-column "${AIC_TRACE_DURATION_COLUMN}" \
     --output "${OUT_DIR}/parsed/aic_vs_sglang_wideep_compute.csv"
 }
 
@@ -381,7 +395,7 @@ query_deepep_dispatch_aic() {
     --system "${SYSTEM}" \
     --backend sglang \
     --backend-version "${DEEPEP_DISPATCH_BACKEND_VERSION}" \
-    --database-mode SILICON \
+    --database-mode "${AIC_DATABASE_MODE}" \
     --phase context \
     --num-tokens ${TOKEN_SWEEP} ${INTERP_TOKEN_SWEEP} \
     --hidden-size "${HIDDEN_SIZE}" \
@@ -403,6 +417,7 @@ compare_deepep_dispatch_real_vs_aic() {
     --real-stage routed/dispatch+routed/combine \
     --distribution "${WIDEEP_DISTRIBUTION}" \
     --phase context \
+    --duration-column "${AIC_TRACE_DURATION_COLUMN}" \
     --output "${OUT_DIR}/parsed/aic_vs_sglang_deepep_dispatch_combine.csv"
 }
 
@@ -415,6 +430,7 @@ compare_deepep_tbo_real_vs_aic() {
     --real-stage routed/dispatch_a+routed/dispatch_b+routed/combine_a+routed/combine_b \
     --distribution "${WIDEEP_DISTRIBUTION}" \
     --phase context \
+    --duration-column "${AIC_TRACE_DURATION_COLUMN}" \
     --output "${OUT_DIR}/parsed/aic_vs_sglang_deepep_tbo_dispatch_combine.csv"
 }
 
@@ -480,30 +496,32 @@ PY
 }
 
 run_aic_collector_smoke() {
-  cd "${AIC_SRC}"
+  local collector_root="${OUT_DIR}/aic/collector_moe_smoke"
+  mkdir -p "${collector_root}"
+  cd "${collector_root}"
   export PYTHONPATH="${AIC_SRC}/src:${AIC_SRC}:${PYTHONPATH:-}"
   export CUDA_VISIBLE_DEVICES
-  export COLLECTOR_LOG_DIR="${OUT_DIR}/aic/collector_moe_smoke"
-  mkdir -p "${COLLECTOR_LOG_DIR}"
-  python collector/collect.py \
+  python "${AIC_SRC}/collector/collect.py" \
     --backend sglang \
-    --model-path "${MODEL_PATH}" \
+    --model-path "${AIC_MODEL_PATH}" \
     --ops moe \
     --sm 90 \
-    --limit 4 \
+    --limit "${AIC_COLLECTOR_LIMIT}" \
     --keep-csv \
     2>&1 | tee "${OUT_DIR}/logs/aic_collect_moe_smoke.log"
 }
 
 run_aic_collector_plan() {
-  cd "${AIC_SRC}"
+  local collector_root="${OUT_DIR}/aic/collector_moe_plan"
+  mkdir -p "${collector_root}"
+  cd "${collector_root}"
   export PYTHONPATH="${AIC_SRC}/src:${AIC_SRC}:${PYTHONPATH:-}"
-  python collector/collect.py \
+  python "${AIC_SRC}/collector/collect.py" \
     --backend sglang \
-    --model-path "${MODEL_PATH}" \
+    --model-path "${AIC_MODEL_PATH}" \
     --ops moe \
     --sm 90 \
-    --limit 16 \
+    --limit "${AIC_COLLECTOR_PLAN_LIMIT}" \
     --plan-only \
     2>&1 | tee "${OUT_DIR}/logs/aic_collect_moe_plan.log"
 }

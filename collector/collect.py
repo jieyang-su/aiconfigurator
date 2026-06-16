@@ -1085,13 +1085,24 @@ def collect_ops(
 
             get_func = getattr(get_module, collection["get_func"])
             run_func = getattr(run_module, collection["run_func"])
+            resolved_perf_filename = _resolve_perf_filename(collection["perf_filename"])
             run_func = functools.partial(
                 run_func,
-                perf_filename=_resolve_perf_filename(collection["perf_filename"]),
+                perf_filename=resolved_perf_filename,
             )
 
             def get_func_with_limit(get_func=get_func):
-                cases = _get_test_cases(get_func, model_path)
+                previous_output_dir = os.environ.get("COLLECTOR_CURRENT_OUTPUT_DIR")
+                os.environ["COLLECTOR_CURRENT_OUTPUT_DIR"] = os.path.dirname(
+                    os.path.abspath(str(resolved_perf_filename))
+                )
+                try:
+                    cases = _get_test_cases(get_func, model_path)
+                finally:
+                    if previous_output_dir is None:
+                        os.environ.pop("COLLECTOR_CURRENT_OUTPUT_DIR", None)
+                    else:
+                        os.environ["COLLECTOR_CURRENT_OUTPUT_DIR"] = previous_output_dir
                 skipped = []
                 if op_plan is not None:
                     from collector.model_cases import filter_test_cases_with_report
@@ -1116,16 +1127,49 @@ def collect_ops(
                     rng = random.Random(shuffle_seed)
                     rng.shuffle(cases)
                 if limit is not None:
+                    if collection["type"] == "moe_token_distribution" and limit > 0:
+                        by_ep_size = {}
+                        for case in cases:
+                            if not isinstance(case, (list, tuple)) or len(case) < 4:
+                                continue
+                            ep_size = case[3]
+                            current = by_ep_size.get(ep_size)
+                            if current is None or case[0] < current[0]:
+                                by_ep_size[ep_size] = case
+                        if by_ep_size:
+                            selected = [by_ep_size[ep_size] for ep_size in sorted(by_ep_size)[:limit]]
+                            remaining = [case for case in cases if case not in selected]
+                            cases = [*selected, *remaining[: max(0, limit - len(selected))]]
+                            return cases[:limit]
+                    if collection["type"] == "moe" and limit > 0:
+                        recorded_cases = [
+                            case
+                            for case in cases
+                            if isinstance(case, (list, tuple)) and len(case) > 9 and case[9] == "recorded"
+                        ]
+                        if recorded_cases:
+                            first_recorded = recorded_cases[0]
+                            remaining = [case for case in cases if case is not first_recorded]
+                            cases = [first_recorded, *remaining[: max(0, limit - 1)]]
+                            return cases
                     cases = cases[:limit]
                 return cases
 
             merged_resume = {**(resume_options or {}), "backend": backend}
+            collection_num_processes = collection.get("num_processes")
+            if collection_num_processes is None:
+                collection_num_processes = num_processes
+            else:
+                logger.info(
+                    f"{collection['name']}.{collection['type']}: overriding worker count "
+                    f"{num_processes} -> {collection_num_processes}"
+                )
             errors = collect_module_safe(
                 collection["name"],
                 collection["type"],
                 get_func_with_limit,
                 run_func,
-                num_processes,
+                collection_num_processes,
                 resume_options=merged_resume,
                 expected_failure_context=(
                     {
@@ -1627,9 +1671,12 @@ def main():
     shuffle = args.shuffle
     limit = args.limit
     if args.smoke:
+        os.environ["COLLECTOR_SMOKE"] = "1"
         shuffle = True
         limit = args.limit if args.limit is not None else 4
         logger.info(f"Smoke test mode enabled — sampling {limit} random test cases per op")
+    else:
+        os.environ.pop("COLLECTOR_SMOKE", None)
 
     # Warn if profiling without limit (profiling can be very slow)
     if args.profile and limit is None:
