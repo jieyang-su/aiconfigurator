@@ -32,6 +32,10 @@ from utils import (
 )
 
 
+def _parse_int_list(value: str) -> list[int]:
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
 # noinspection PyShadowingNames
 def test_main(
     args: argparse.Namespace,
@@ -348,34 +352,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_nodes = int(os.getenv("WORLD_SIZE", 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
-    #num_sms = [16, 20, 24]
-    num_sms = [16]
-    tokens = [
-        16,
-        32,
-        64,
-        128,
-        256,
-        512,
-        1024,
-        2048,
-    ]
-    # tokens = [
-    #     16,
-    #     32,
-    #     64,
-    #     128,
-    #     256,
-    #     512,
-    #     1024,
-    #     2048,
-    #     4096,
-    #     8192,
-    #     16384,
-    #     32768,
-    #     65536,
-    # ]
-    ll_tokens = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 256]
+    num_sms = _parse_int_list(args.num_sms)
+    tokens = _parse_int_list(args.tokens)
+    ll_tokens = _parse_int_list(args.ll_tokens)
     if not args.test_ll_compatibility:
         for num_sm in num_sms:
             num_qps_per_rank = num_sm
@@ -459,6 +438,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num-topk", type=int, default=8, help="Number of top-k experts (default: 8)")
     parser.add_argument("--num-experts", type=int, default=256, help="Number of experts (default: 256)")
+    parser.add_argument(
+        "--tokens",
+        type=str,
+        default="16,32,64,128,256,512,1024,2048",
+        help="Comma-separated normal-mode token counts.",
+    )
+    parser.add_argument(
+        "--ll-tokens",
+        type=str,
+        default="1,2,4,8,12,16,24,32,48,64,96,128,160,256",
+        help="Comma-separated low-latency token counts.",
+    )
+    parser.add_argument("--num-sms", type=str, default="16", help="Comma-separated SM counts for normal-mode tuning.")
     parser.add_argument(
         "--test-ll-compatibility",
         action="store_true",

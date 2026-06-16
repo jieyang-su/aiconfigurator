@@ -754,6 +754,8 @@ def try_create_excel_report_multi_sheet(logfile_to_data: dict[str, list[dict]], 
 
 
 def main():
+    global FRAMEWORK, VERSION, DEVICE, KERNEL_SOURCE
+
     parser = argparse.ArgumentParser(description="Generate TXT reports from all .log files in directory")
     parser.add_argument(
         "--log-dir",
@@ -770,7 +772,25 @@ def main():
         default="./wideep_deepep_ll_perf.txt",
         help="ll output TXT file path (default: ./wideep_deepep_ll_perf.txt)",
     )
+    parser.add_argument(
+        "--node-num",
+        type=int,
+        default=None,
+        help="Override node_num written to output rows; defaults to extracting node_# from log filenames.",
+    )
+    parser.add_argument("--framework", default=FRAMEWORK, help=f"framework field to write (default: {FRAMEWORK})")
+    parser.add_argument("--version", default=VERSION, help=f"version field to write (default: {VERSION})")
+    parser.add_argument("--device", default=DEVICE, help=f"device field to write (default: {DEVICE})")
+    parser.add_argument(
+        "--kernel-source",
+        default=KERNEL_SOURCE,
+        help=f"kernel_source field to write (default: {KERNEL_SOURCE})",
+    )
     args = parser.parse_args()
+    FRAMEWORK = args.framework
+    VERSION = args.version
+    DEVICE = args.device
+    KERNEL_SOURCE = args.kernel_source
 
     print("Starting to parse DeepEP 16-node cross-node test logs...")
     print(f"Log directory: {args.log_dir}")
@@ -798,7 +818,9 @@ def main():
         else:
             data = parse_log_file(log_file_str)
         if data:
-            node_num_val = _extract_node_num_from_filename(log_file_str)
+            node_num_val = args.node_num
+            if node_num_val is None:
+                node_num_val = _extract_node_num_from_filename(log_file_str)
             # Inject node_num into each row
             for r in data:
                 r["node_num"] = node_num_val
