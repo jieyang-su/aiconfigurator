@@ -840,6 +840,7 @@ from aiconfigurator.sdk.operations.mla import (  # noqa: F401
     load_context_mla_module_data,
     load_generation_mla_data,
     load_generation_mla_module_data,
+    load_mla_concat_k_data,
     load_mla_bmm_data,
     load_wideep_context_mla_data,
     load_wideep_generation_mla_data,
@@ -1980,6 +1981,25 @@ class PerfDatabase:
             num_heads,
             kvcache_quant_mode,
             fmha_quant_mode,
+            database_mode,
+        )
+
+    @functools.lru_cache(maxsize=32768)
+    def query_mla_concat_k(
+        self,
+        num_tokens: int,
+        num_heads: int,
+        kernel_source: str | None = None,
+        database_mode: common.DatabaseMode | None = None,
+    ) -> PerformanceResult | tuple[float, float, float]:
+        """Query DeepSeek MHA prefill K concat latency. Delegates to MLAConcatK."""
+        from aiconfigurator.sdk.operations.mla import MLAConcatK
+
+        return MLAConcatK._query_mla_concat_k_table(
+            self,
+            num_tokens,
+            num_heads,
+            kernel_source,
             database_mode,
         )
 

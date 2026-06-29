@@ -171,6 +171,17 @@ class DeepSeekModel(BaseModel):
                             512,
                             gemm_quant_mode,
                         ),
+                        *(
+                            [
+                                ops.MLAConcatK(
+                                    "context_mla_concat_k",
+                                    self._num_layers,
+                                    128 // tp_size,
+                                )
+                            ]
+                            if self._backend_name == "sglang"
+                            else []
+                        ),
                         ops.ContextAttention(
                             "context_attention",
                             self._num_layers,

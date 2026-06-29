@@ -34,6 +34,7 @@ from aiconfigurator.sdk.operations.mamba import GDNKernel, Mamba2, Mamba2Kernel
 from aiconfigurator.sdk.operations.mla import (
     ContextMLA,
     GenerationMLA,
+    MLAConcatK,
     MLABmm,
     MLAModule,
     WideEPContextMLA,
@@ -67,6 +68,7 @@ __all__ = [
     "GenerationDSAModule",
     "GenerationDeepSeekV4AttentionModule",
     "GenerationMLA",
+    "MLAConcatK",
     "MLABmm",
     "MLAModule",
     "Mamba2",

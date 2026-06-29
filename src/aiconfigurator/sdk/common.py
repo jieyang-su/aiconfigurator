@@ -796,6 +796,7 @@ class PerfDataFilename(Enum):
     encoder_attention = "encoder_attention_perf.parquet"
     context_mla = "context_mla_perf.parquet"
     generation_mla = "generation_mla_perf.parquet"
+    mla_concat_k = "mla_concat_k_perf.parquet"
     mla_bmm = "mla_bmm_perf.parquet"
     moe = "moe_perf.parquet"
     custom_allreduce = "custom_allreduce_perf.parquet"
