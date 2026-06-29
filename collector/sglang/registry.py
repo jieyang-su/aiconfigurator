@@ -33,6 +33,13 @@ REGISTRY: list[OpEntry] = [
         perf_filename=PerfFile.GENERATION_MLA,
     ),
     OpEntry(
+        op="mla_concat_k",
+        module="collector.sglang.collect_mla",
+        get_func="get_mla_concat_k_test_cases",
+        run_func="run_mla_concat_k",
+        perf_filename=PerfFile.MLA_CONCAT_K,
+    ),
+    OpEntry(
         op="mla_bmm_gen_pre",
         module="collector.sglang.collect_mla_bmm",
         get_func="get_mla_gen_pre_test_cases",
