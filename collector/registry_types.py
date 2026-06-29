@@ -31,6 +31,7 @@ class PerfFile(str, Enum):
     MOE_TOKEN_DISTRIBUTION = "moe_token_distribution_perf.txt"
     CONTEXT_MLA = "context_mla_perf.txt"
     GENERATION_MLA = "generation_mla_perf.txt"
+    MLA_CONCAT_K = "mla_concat_k_perf.txt"
     MLA_BMM = "mla_bmm_perf.txt"
     GDN = "gdn_perf.txt"
     MAMBA2 = "mamba2_perf.txt"

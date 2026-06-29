@@ -9,7 +9,7 @@ this file owns SGLang MLA backend choice, paged KV-cache setup, DP-attention
 mocking, SM-specific skips, and perf logging.
 """
 
-__compat__ = "sglang>=0.5.10rc0"
+__compat__ = "sglang>=0.5.9"
 
 import math
 import os
@@ -21,6 +21,7 @@ import sglang.srt.server_args
 import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -63,6 +64,7 @@ QK_ROPE_HEAD_DIM = 64
 MLA_PAGE_SIZE = 64
 # Scaling follows production: 1 / sqrt(qk_nope + qk_rope)
 MLA_SCALING = 1 / math.sqrt(QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM)
+DSV3_FULL_NUM_HEADS = 128
 INT32_MAX = 2**31 - 1
 # Largest kv slot index we can safely touch before the old flashmla kernels overflow
 MAX_KV_LOC = (INT32_MAX // (KV_LORA_RANK + QK_ROPE_HEAD_DIM)) - MLA_PAGE_SIZE
@@ -108,21 +110,13 @@ class MockModelConfig:
         self.is_hybrid_swa = None
         self.swa_attention_layer_ids = None
         self.full_attention_layer_ids = None
-        self.swa_v_head_dim = v_head_dim
         self.num_attention_heads = num_attention_heads
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
-        self.head_dim = kv_lora_rank + qk_rope_head_dim
         self.scaling = scaling
         self.is_local_attention_model = False
-
-        class MockHFTextConfig:
-            def __init__(self, num_heads):
-                self.num_attention_heads = num_heads
-
-        self.hf_text_config = MockHFTextConfig(num_attention_heads)
 
     def get_num_kv_heads(self, tp_size: int):
         return 1
@@ -132,9 +126,6 @@ class MockServerArgs:
     def __init__(self, kv_cache_dtype: torch.dtype, page_size: int):
         self.enable_lora = False
         self.enable_deterministic_inference = False
-        self.enable_dp_attention = False
-        self.is_embedding = False
-        self.disable_radix_cache = True
         self.kv_cache_dtype = "fp8" if kv_cache_dtype == torch.float8_e4m3fn else "bfloat16"
         self.speculative_eagle_topk = 0
         self.speculative_num_draft_tokens = 0
@@ -175,10 +166,8 @@ class MockModelRunner:
         self.attn_backend = None
         self.sliding_window_size = None
         self.is_hybrid = False
-        self.tp_size = 1
         self.hybrid_gdn_config = None
         self.kimi_linear_config = None
-        self.linear_attn_model_spec = None
         self.model_config = MockModelConfig(num_attention_heads=num_attention_heads, scaling=scaling)
         # Keep attributes for compatibility across sglang versions (older code ignores them)
         self.is_hybrid_swa = self.model_config.is_hybrid_swa
@@ -231,10 +220,95 @@ def benchmark_layer(layer, forward_batch, q, k, v, q_rope, k_rope, **kwargs):
     return results["latency_ms"], results["power_stats"]
 
 
+def _validate_prefill_mha_or_raise(
+    *,
+    selected_backend: str,
+    local_num_heads: int,
+    num_kv_heads: int,
+    head_dim_total: int,
+    v_head_dim: int,
+    forward_batch: ForwardBatch,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_cache_dtype: torch.dtype,
+    q_rope_arg: torch.Tensor | None,
+    k_rope_arg: torch.Tensor | None,
+):
+    """Fail closed instead of silently collecting absorbed MLA for prefill."""
+    expected_head_dim = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
+    if selected_backend == "triton":
+        raise RuntimeError(
+            "collect_mla prefill must use the DeepSeek MHA branch, but the "
+            "selected Triton MLA backend does not exercise the same SGLang "
+            "prefill path. Refusing to collect misleading context_mla rows."
+        )
+    if num_kv_heads != local_num_heads:
+        raise RuntimeError(
+            f"collect_mla prefill must be MHA/GQA-style with num_kv_heads == "
+            f"local_num_heads, got {num_kv_heads=} {local_num_heads=}."
+        )
+    if head_dim_total != expected_head_dim or v_head_dim != QK_NOPE_HEAD_DIM:
+        raise RuntimeError(
+            "collect_mla prefill must use DeepSeek MHA dimensions "
+            f"(head_dim={expected_head_dim}, v_head_dim={QK_NOPE_HEAD_DIM}), "
+            f"got {head_dim_total=} {v_head_dim=}."
+        )
+    if q_rope_arg is not None or k_rope_arg is not None:
+        raise RuntimeError("collect_mla prefill MHA must pass fully-concatenated q/k tensors, not MLA rope kwargs.")
+    if q.shape[-1] != expected_head_dim or k.shape[-1] != expected_head_dim or v.shape[-1] != QK_NOPE_HEAD_DIM:
+        raise RuntimeError(
+            "collect_mla prefill MHA tensor shapes are not aligned with SGLang DeepSeek MHA: "
+            f"{q.shape=} {k.shape=} {v.shape=}."
+        )
+    if q.shape[1] != local_num_heads or k.shape[1] != local_num_heads or v.shape[1] != local_num_heads:
+        raise RuntimeError(
+            "collect_mla prefill MHA tensor head counts are not local-head aligned: "
+            f"{q.shape=} {k.shape=} {v.shape=} {local_num_heads=}."
+        )
+    if q.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
+        raise RuntimeError(f"collect_mla prefill MHA expects BF16 q/v activations, got {q.dtype=} {v.dtype=}.")
+    expected_k_dtype = torch.float8_e4m3fn if kv_cache_dtype == torch.float8_e4m3fn else torch.bfloat16
+    if k.dtype != expected_k_dtype:
+        raise RuntimeError(
+            f"collect_mla prefill MHA expects k dtype to mirror SGLang concat target dtype, "
+            f"got {k.dtype=} expected {expected_k_dtype=} for {kv_cache_dtype=}."
+        )
+    if getattr(forward_batch, "attn_attend_prefix_cache", None) is not False:
+        raise RuntimeError(
+            "collect_mla prefill must set forward_batch.attn_attend_prefix_cache=False "
+            "to force SGLang FlashAttentionBackend's MHA branch."
+        )
+    if getattr(forward_batch, "mha_return_lse", None) is not False:
+        raise RuntimeError("collect_mla prefill no-prefix MHA must not request LSE.")
+
+
+def benchmark_kernel(kernel_func, device):
+    with benchmark_with_power(
+        device=device,
+        kernel_func=kernel_func,
+        num_warmups=3,
+        num_runs=20,
+        repeat_n=1,
+    ) as results:
+        pass
+
+    return results["latency_ms"], results["power_stats"]
+
+
 def get_context_mla_test_cases():
-    # Follow SGLang's default MLA backend selection: SM89 and below fall back to Triton.
+    # This collector covers the CUDA MLA backends used by SGLang defaults on SM90+.
+    sm_version = get_sm_version()
+    if sm_version < 90:
+        return []
+
     backend = _select_default_mla_backend()
-    dtype_list = [torch.bfloat16] if backend == "triton" else [torch.bfloat16, torch.float8_e4m3fn]
+    if backend == "triton":
+        raise RuntimeError(
+            "collect_mla context collection is intentionally disabled for the Triton MLA backend "
+            "because it cannot be forced to match the DeepSeek prefill MHA branch in this collector."
+        )
+    dtype_list = [torch.bfloat16, torch.float8_e4m3fn]
     test_cases = []
     n_list = [64, 128]
     b_list = [1, 2, 4, 8, 16, 32, 64, 128, 256]
@@ -264,9 +338,43 @@ def get_context_mla_test_cases():
     return test_cases
 
 
-def get_generation_mla_test_cases():
-    # Follow SGLang's default MLA backend selection: SM89 and below fall back to Triton.
+def get_mla_concat_k_test_cases():
+    # Match the context MLA case grid; concat_mla_k is a prefill-only
+    # DeepSeek MHA preparation kernel.
     sm_version = get_sm_version()
+    if sm_version < 90:
+        return []
+
+    test_cases = []
+    n_list = [64, 128]
+    b_list = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    s_list = [1, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 10240, 12288, 16384, 32768]
+    for n in n_list:
+        for b in b_list:
+            for s in s_list:
+                for tp_size in [1, 2, 4, 8, 16, 32, 64]:
+                    if b * s > 65536:
+                        continue
+                    test_cases.append(
+                        [
+                            s,
+                            b,
+                            n,
+                            tp_size,
+                            64,
+                            10,
+                            6,
+                        ]
+                    )
+    return test_cases
+
+
+def get_generation_mla_test_cases():
+    # This collector covers the CUDA MLA backends used by SGLang defaults on SM90+.
+    sm_version = get_sm_version()
+    if sm_version < 90:
+        return []
+
     backend = _select_default_mla_backend()
     if backend == "triton":
         # SGLang's Triton MLA path stores BF16 MLA KV cache.
@@ -383,27 +491,23 @@ def run_mla(
     qk_rope_head_dim = QK_ROPE_HEAD_DIM
     qk_nope_head_dim = QK_NOPE_HEAD_DIM
 
-    if selected_backend == "trtllm_mla":
-        if is_context_phase:
-            # Prefill: Non-absorbed, standard projected heads
-            # q_nope (128) + q_rope (64) = 192
-            v_head_dim = qk_nope_head_dim
-            head_dim_total = qk_nope_head_dim + qk_rope_head_dim
-        else:
-            # Decode: Weight absorbed
-            # latent (512) + rope (64) = 576
-            v_head_dim = kv_lora_rank
-            head_dim_total = kv_lora_rank + qk_rope_head_dim
+    if is_context_phase and selected_backend != "triton":
+        # SGLang DeepSeek prefill uses the non-absorbed MHA path on Hopper:
+        # q/k head_dim = qk_nope(128) + qk_rope(64), v_head_dim = 128,
+        # and K/V have the same local head count as Q.  The old FA3 path below
+        # incorrectly used absorbed decode-style latent KV (512 + 64, 1 KV head).
+        v_head_dim = qk_nope_head_dim
+        head_dim_total = qk_nope_head_dim + qk_rope_head_dim
+        num_kv_heads = local_num_heads
     else:
         v_head_dim = kv_lora_rank
         head_dim_total = kv_lora_rank + qk_rope_head_dim
+        num_kv_heads = 1
 
     # Keep model_config consistent with chosen dims
     # Must update config BEFORE creating attn_backend so it picks up the right v_head_dim
     model_runner.model_config.kv_lora_rank = kv_lora_rank
     model_runner.model_config.v_head_dim = v_head_dim
-    model_runner.model_config.head_dim = head_dim_total
-    model_runner.model_config.swa_v_head_dim = v_head_dim
     model_runner.model_config.qk_nope_head_dim = qk_nope_head_dim
     model_runner.model_config.qk_rope_head_dim = qk_rope_head_dim
     model_runner.model_config.scaling = MLA_SCALING
@@ -443,7 +547,7 @@ def run_mla(
         num_heads=local_num_heads,
         head_dim=head_dim_total,
         scaling=MLA_SCALING,
-        num_kv_heads=1,
+        num_kv_heads=num_kv_heads,
         layer_id=0,
         v_head_dim=v_head_dim,
     ).to(torch_device)
@@ -465,7 +569,8 @@ def run_mla(
             device=torch_device,
             dtype=torch.bfloat16,
         )
-        k_shape = (batch_size * input_len, 1, v_head_dim)
+        k_head_count = num_kv_heads
+        k_shape = (batch_size * input_len, k_head_count, v_head_dim)
         k_nope = torch.randn(k_shape, device=torch_device, dtype=torch.bfloat16)
         k_rope = torch.randn(
             batch_size * input_len,
@@ -474,11 +579,18 @@ def run_mla(
             device=torch_device,
             dtype=torch.bfloat16,
         )
-        # v has the same head dimension as the non-rope K fragment for each backend path.
-        v = k_nope
+        v = torch.randn(k_shape, device=torch_device, dtype=torch.bfloat16)
         if kernel_source == "triton":
             q = torch.cat([q_nope, q_rope], dim=-1)
             k = torch.cat([k_nope, k_rope], dim=-1)
+        elif num_kv_heads == local_num_heads:
+            q = torch.cat([q_nope, q_rope], dim=-1)
+            k = torch.cat([k_nope, k_rope.expand(-1, local_num_heads, -1)], dim=-1)
+            if kv_cache_dtype == torch.float8_e4m3fn:
+                # forward_mha._concat_and_cast_mha_k targets the KV-pool dtype
+                # for FA3 when kv_cache_dtype is not "auto"; the backend casts
+                # k back to q.dtype inside flash_attn_varlen_func.
+                k = k.to(kv_cache_dtype)
         else:
             q = q_nope
             k = k_nope
@@ -503,6 +615,11 @@ def run_mla(
             extend_num_tokens=int(seq_lens.sum().item()),
             positions=positions,
         )
+        if num_kv_heads == local_num_heads:
+            # DeepSeek prefill MHA path: attend only the fresh extend tokens in
+            # this standalone no-prefix collector case, and do not request LSE.
+            forward_batch.set_attn_attend_prefix_cache(False)
+            forward_batch.mha_return_lse = False
     else:
         history_len = input_len
         seq_lens = torch.full((batch_size,), history_len + 1, dtype=torch.int32, device=torch_device)
@@ -582,6 +699,21 @@ def run_mla(
     forward_batch.req_to_token_pool = req_to_token_pool
     forward_batch.token_to_kv_pool = kv_pool
     forward_batch.attn_backend = attn_backend
+    if is_context_phase:
+        _validate_prefill_mha_or_raise(
+            selected_backend=selected_backend,
+            local_num_heads=local_num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_total=head_dim_total,
+            v_head_dim=v_head_dim,
+            forward_batch=forward_batch,
+            q=q,
+            k=k,
+            v=v,
+            kv_cache_dtype=kv_cache_dtype,
+            q_rope_arg=q_rope_arg,
+            k_rope_arg=k_rope_arg,
+        )
     attn_backend.init_forward_metadata(forward_batch)
 
     latency, power_stats = benchmark_layer(
@@ -592,6 +724,7 @@ def run_mla(
         v,
         q_rope_arg,
         k_rope_arg,
+        save_kv_cache=not (is_context_phase and num_kv_heads == local_num_heads),
         **extra_kwargs,
     )
 
@@ -620,6 +753,117 @@ def run_mla(
         version=pkg_resources.get_distribution("sglang").version,
         device_name=torch.cuda.get_device_name(device),
         op_name=f"mla_{'context' if is_context_phase else 'generation'}",
+        kernel_source=kernel_source,
+        perf_filename=perf_filename,
+        power_stats=power_stats,
+    )
+
+
+def _use_special_concat_mla_k(local_num_heads: int) -> bool:
+    # Mirrors SGLang 0.5.9 forward_mha.py::_concat_and_cast_mha_k special path.
+    return (
+        local_num_heads == DSV3_FULL_NUM_HEADS
+        and QK_NOPE_HEAD_DIM == 128
+        and QK_ROPE_HEAD_DIM == 64
+    )
+
+
+def _can_use_triton_concat(local_num_heads: int) -> bool:
+    return (
+        local_num_heads > 0
+        and (local_num_heads & (local_num_heads - 1) == 0)
+        and (QK_NOPE_HEAD_DIM & (QK_NOPE_HEAD_DIM - 1) == 0)
+        and (QK_ROPE_HEAD_DIM & (QK_ROPE_HEAD_DIM - 1) == 0)
+    )
+
+
+def run_mla_concat_k(
+    input_len,
+    batch_size,
+    num_heads,
+    tp_size,
+    tokens_per_block,
+    warming_up,
+    test_ite,
+    *,
+    perf_filename,
+    device="cuda:0",
+):
+    torch.cuda.set_device(device)
+    torch_device = torch.device(device)
+    random.seed(0)
+    torch.manual_seed(0)
+    del tokens_per_block, warming_up, test_ite
+
+    assert num_heads % tp_size == 0, "num_heads must be divisible by tp_size"
+    local_num_heads = num_heads // tp_size
+    num_tokens = batch_size * input_len
+    k = torch.empty(
+        num_tokens,
+        local_num_heads,
+        QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM,
+        device=torch_device,
+        dtype=torch.bfloat16,
+    )
+    k_nope = torch.randn(
+        num_tokens,
+        local_num_heads,
+        QK_NOPE_HEAD_DIM,
+        device=torch_device,
+        dtype=torch.bfloat16,
+    )
+    k_rope = torch.randn(
+        num_tokens,
+        1,
+        QK_ROPE_HEAD_DIM,
+        device=torch_device,
+        dtype=torch.bfloat16,
+    )
+
+    try:
+        from sgl_kernel import concat_mla_k
+    except ImportError:
+        concat_mla_k = None
+
+    if concat_mla_k is not None and _use_special_concat_mla_k(local_num_heads):
+        kernel_source = "concat_mla_k"
+
+        def kernel_func():
+            concat_mla_k(k, k_nope, k_rope)
+
+    elif _can_use_triton_concat(local_num_heads):
+        kernel_source = "concat_and_cast_mha_k_triton"
+
+        def kernel_func():
+            concat_and_cast_mha_k_triton(k, k_nope, k_rope)
+
+    else:
+        kernel_source = "torch_cat_assign"
+
+        def kernel_func():
+            k[..., :QK_NOPE_HEAD_DIM] = k_nope
+            k[..., QK_NOPE_HEAD_DIM:] = k_rope
+
+    latency, power_stats = benchmark_kernel(kernel_func, torch_device)
+
+    log_perf(
+        item_list=[
+            {
+                "concat_dtype": "bfloat16",
+                "num_tokens": num_tokens,
+                "num_heads": local_num_heads,
+                "batch_size": batch_size,
+                "isl": input_len,
+                "tp_size": tp_size,
+                "qk_nope_head_dim": QK_NOPE_HEAD_DIM,
+                "qk_rope_head_dim": QK_ROPE_HEAD_DIM,
+                "latency": latency,
+            }
+        ],
+        framework="SGLang",
+        version=pkg_resources.get_distribution("sglang").version,
+        device_name=torch.cuda.get_device_name(device),
+        op_name="mla_concat_k",
         kernel_source=kernel_source,
         perf_filename=perf_filename,
         power_stats=power_stats,
