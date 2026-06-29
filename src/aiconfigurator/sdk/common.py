@@ -647,6 +647,7 @@ class PerfDataFilename(Enum):
     context_attention = "context_attention_perf.txt"
     context_mla = "context_mla_perf.txt"
     generation_mla = "generation_mla_perf.txt"
+    mla_concat_k = "mla_concat_k_perf.txt"
     mla_bmm = "mla_bmm_perf.txt"
     moe = "moe_perf.txt"
     custom_allreduce = "custom_allreduce_perf.txt"

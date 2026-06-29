@@ -1175,6 +1175,44 @@ def load_generation_mla_data(generation_mla_file):
     return generation_mla_data
 
 
+def load_mla_concat_k_data(mla_concat_k_file):
+    """
+    Load DeepSeek MHA prefill K-concat data.
+
+    Data layout:
+        kernel_source -> local_num_heads -> num_tokens -> metric dict
+    """
+    rows = _read_filtered_rows(mla_concat_k_file)
+    if rows is None:
+        logger.debug(f"MLA concat-k data file {mla_concat_k_file} not found.")
+        return None
+    mla_concat_k_data = defaultdict(lambda: defaultdict(dict))
+
+    has_power = len(rows) > 0 and "power" in rows[0]
+    if not has_power:
+        logger.debug("Legacy database format detected (mla_concat_k) - power will default to 0.0")
+
+    for row in rows:
+        kernel_source = row["kernel_source"]
+        num_tokens = int(row["num_tokens"])
+        num_heads = int(row["num_heads"])
+        latency = float(row["latency"])
+        power = float(row.get("power", 0.0))
+        energy = power * latency
+
+        try:
+            mla_concat_k_data[kernel_source][num_heads][num_tokens]
+            logger.debug(f"value conflict in mla concat-k data: {kernel_source} {num_heads} {num_tokens}")
+        except KeyError:
+            mla_concat_k_data[kernel_source][num_heads][num_tokens] = {
+                "latency": latency,
+                "power": power,
+                "energy": energy,
+            }
+
+    return mla_concat_k_data
+
+
 def load_mla_bmm_data(mla_bmm_file):
     """
     Load the mla bmm data for trtllm with power support (backward compatible).
@@ -2656,6 +2694,7 @@ class PerfDatabase:
                 PerfDataFilename.oneccl: load_nccl_data,
                 PerfDataFilename.context_mla: load_context_mla_data,
                 PerfDataFilename.generation_mla: load_generation_mla_data,
+                PerfDataFilename.mla_concat_k: load_mla_concat_k_data,
                 PerfDataFilename.mla_bmm: load_mla_bmm_data,
                 PerfDataFilename.mamba2: load_mamba2_data,
                 PerfDataFilename.gdn: load_gdn_data,
@@ -2728,6 +2767,7 @@ class PerfDatabase:
         # More model-specific ops
         self._context_mla_data = _load_op_data(PerfDataFilename.context_mla)
         self._generation_mla_data = _load_op_data(PerfDataFilename.generation_mla)
+        self._mla_concat_k_data = _load_op_data(PerfDataFilename.mla_concat_k)
         self._mla_bmm_data = _load_op_data(PerfDataFilename.mla_bmm)
         self._context_mla_module_data = _load_op_data(PerfDataFilename.mla_context_module)
         self._generation_mla_module_data = _load_op_data(PerfDataFilename.mla_generation_module)
@@ -3119,6 +3159,39 @@ class PerfDatabase:
                         target_z_list=target_z_list,
                         sqrt_y_value=True,
                     )
+
+        # MLA prefill K concat is a memory-like 2D surface:
+        # kernel_source -> local heads -> total K tokens.
+        if getattr(self, "_mla_concat_k_data", None):
+            for kernel_source in self._mla_concat_k_data:
+                data_dict = self._mla_concat_k_data[kernel_source]
+                target_x_list = list(data_dict.keys())  # local num_heads
+                token_targets = (
+                    [1, 16, 32, 64, 128, 256, 512, 1024, 2048]
+                    + [4096 + i * 2048 for i in range(14)]
+                    + [32768 + 16384 * i for i in range(6)]
+                    + [131072 + 32768 * i for i in range(12)]
+                    + [524288 + 65536 * i for i in range(9)]
+                )
+                for num_heads in target_x_list:
+                    token_dict = data_dict[num_heads]
+                    if not token_dict:
+                        continue
+                    token_points = sorted(token_dict.keys())
+                    for num_tokens in token_targets:
+                        if num_tokens in token_dict:
+                            continue
+                        left, right = self._nearest_1d_point_helper(
+                            num_tokens,
+                            token_points,
+                            inner_only=False,
+                        )
+                        token_dict[num_tokens] = self._interp_1d(
+                            [left, right],
+                            [token_dict[left], token_dict[right]],
+                            num_tokens,
+                        )
+
         # wideep generation mla
         if getattr(self, "_wideep_generation_mla_data", None):
             for kernel_source in self._wideep_generation_mla_data:
@@ -4585,6 +4658,120 @@ class PerfDatabase:
                     f"{kvcache_quant_mode=}, {fmha_quant_mode=}"
                 ),
             )
+
+    @functools.lru_cache(maxsize=32768)
+    def query_mla_concat_k(
+        self,
+        num_tokens: int,
+        num_heads: int,
+        kernel_source: str | None = None,
+        database_mode: common.DatabaseMode | None = None,
+    ) -> PerformanceResult | tuple[float, float, float]:
+        """
+        Query DeepSeek MHA prefill K concat latency and energy.
+
+        Args:
+            num_tokens: Total K tokens to concatenate. In MHA one-shot prefill this is
+                batch_size * (fresh_len + prefix_len).
+            num_heads: Local attention heads after TP split.
+            kernel_source: Optional explicit backend. If omitted, follows SGLang 0.5.9
+                `_concat_and_cast_mha_k` branch selection for DeepSeek V3/R1 shapes.
+            database_mode: Database mode (SILICON, EMPIRICAL, SOL, HYBRID).
+        """
+
+        def select_kernel_source(num_heads: int) -> str:
+            if num_heads == 128:
+                return "concat_mla_k"
+            # DeepSeek V3/R1 uses qk_nope=128 and qk_rope=64; for power-of-two
+            # local heads SGLang falls back to the Triton concat-and-cast kernel.
+            if num_heads > 0 and (num_heads & (num_heads - 1)) == 0:
+                return "concat_and_cast_mha_k_triton"
+            return "torch_cat_assign"
+
+        def get_sol(num_tokens: int, num_heads: int) -> tuple[float, float, float]:
+            # BF16 k_nope read + shared k_rope read + BF16 output K write.
+            mem_bytes = (
+                num_tokens * num_heads * 128 * 2
+                + num_tokens * 64 * 2
+                + num_tokens * num_heads * (128 + 64) * 2
+            )
+            sol_mem = mem_bytes / self.system_spec["gpu"]["mem_bw"] * 1000
+            sol_math = 0.0
+            return sol_mem, sol_math, sol_mem
+
+        def get_empirical(num_tokens: int, num_heads: int) -> float:
+            latency = get_sol(num_tokens, num_heads)[0]
+            scale_factor = 0.7
+            return latency / scale_factor
+
+        if database_mode is None:
+            database_mode = self._default_database_mode
+        if database_mode == common.DatabaseMode.SOL:
+            sol_latency = get_sol(num_tokens, num_heads)[0]
+            return PerformanceResult(sol_latency, energy=0.0)
+        elif database_mode == common.DatabaseMode.SOL_FULL:
+            return get_sol(num_tokens, num_heads)
+        elif database_mode == common.DatabaseMode.EMPIRICAL:
+            emp_latency = get_empirical(num_tokens, num_heads)
+            return PerformanceResult(emp_latency, energy=0.0)
+        else:
+            selected_kernel_source = kernel_source or select_kernel_source(num_heads)
+
+            def get_silicon():
+                if not self._mla_concat_k_data.loaded:
+                    return PerformanceResult(
+                        get_empirical(num_tokens, num_heads),
+                        energy=0.0,
+                        source="empirical",
+                    )
+                self._mla_concat_k_data.raise_if_not_loaded()
+                source_dict = self._mla_concat_k_data[selected_kernel_source]
+                if num_heads not in source_dict:
+                    available_heads = sorted(source_dict.keys())
+                    left_heads, right_heads = self._nearest_1d_point_helper(
+                        num_heads,
+                        available_heads,
+                        inner_only=False,
+                    )
+                    left_result = self._interp_1d_tokens(source_dict[left_heads], num_tokens)
+                    right_result = self._interp_1d_tokens(source_dict[right_heads], num_tokens)
+                    result = self._interp_1d(
+                        [left_heads, right_heads],
+                        [left_result, right_result],
+                        num_heads,
+                    )
+                else:
+                    result = self._interp_1d_tokens(source_dict[num_heads], num_tokens)
+
+                if isinstance(result, dict):
+                    latency = result["latency"]
+                    energy = result.get("energy", 0.0)
+                else:
+                    latency = result
+                    energy = 0.0
+                return PerformanceResult(latency, energy=energy)
+
+            return self._query_silicon_or_hybrid(
+                get_silicon=get_silicon,
+                get_empirical=lambda: get_empirical(num_tokens, num_heads),
+                database_mode=database_mode,
+                error_msg=(
+                    f"Failed to query mla concat-k data for {num_tokens=}, {num_heads=}, "
+                    f"{selected_kernel_source=}"
+                ),
+            )
+
+    def _interp_1d_tokens(self, token_dict: dict, num_tokens: int):
+        left, right = self._nearest_1d_point_helper(
+            num_tokens,
+            sorted(token_dict.keys()),
+            inner_only=False,
+        )
+        return self._interp_1d(
+            [left, right],
+            [token_dict[left], token_dict[right]],
+            num_tokens,
+        )
 
     @functools.lru_cache(maxsize=32768)
     def query_generation_mla(

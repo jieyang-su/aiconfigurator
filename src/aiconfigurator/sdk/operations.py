@@ -1047,6 +1047,44 @@ class ContextMLA(Operation):
         return self._weights * self._scale_factor
 
 
+class MLAConcatK(Operation):
+    """
+    DeepSeek MHA prefill K concat operation.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        num_heads: int,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._num_heads = num_heads
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """Query prefill K concat latency with energy data."""
+        batch_size = kwargs.get("batch_size")
+        s = kwargs.get("s")
+        prefix = kwargs.get("prefix") or 0
+        if batch_size is None or s is None:
+            raise ValueError(f"{self.__class__.__name__} requires batch_size and s in query kwargs")
+        num_tokens = batch_size * (s + prefix)
+
+        result = database.query_mla_concat_k(
+            num_tokens=num_tokens,
+            num_heads=self._num_heads,
+        )
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", "silicon"),
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
 class GenerationMLA(Operation):
     """
     Generation MLA operation. now only contains MQA part.

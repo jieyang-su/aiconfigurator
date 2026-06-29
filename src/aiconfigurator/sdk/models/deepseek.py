@@ -62,7 +62,7 @@ class DeepSeekModel(BaseModel):
             model_info["model_path"],
             backend_name,
         )
-        return cls(*moe_args, *base_args, extra_params)
+        return cls(*moe_args, *base_args, extra_params, backend_name=backend_name)
 
     def __init__(self, topk: int, num_experts: int, moe_inter_size: int, *args, backend_name: str = "") -> None:
         super().__init__(*args)
@@ -161,6 +161,17 @@ class DeepSeekModel(BaseModel):
                             32768 // tp_size,
                             512,
                             gemm_quant_mode,
+                        ),
+                        *(
+                            [
+                                ops.MLAConcatK(
+                                    "context_mla_concat_k",
+                                    self._num_layers,
+                                    128 // tp_size,
+                                )
+                            ]
+                            if self._backend_name == "sglang"
+                            else []
                         ),
                         ops.ContextAttention(
                             "context_attention",
