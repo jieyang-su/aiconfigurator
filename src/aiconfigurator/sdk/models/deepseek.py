@@ -110,11 +110,9 @@ class DeepSeekModel(BaseModel):
         gemm_quant_mode = self.config.gemm_quant_mode
         moe_quant_mode = self.config.moe_quant_mode
 
-        mla_bmm_quant_mode = (
-            common.GEMMQuantMode.fp8
-            if gemm_quant_mode != common.GEMMQuantMode.bfloat16
-            else common.GEMMQuantMode.bfloat16
-        )
+        # Old granular generation MLA path derived an mla_bmm_quant_mode here
+        # for MLABmm(pre/post). The ordinary DeepSeek generation path now uses
+        # module-level MLA data, so the BMM precision is handled by MLAModule.
 
         h = self._hidden_size  # 7168
         tp_size = self.config.tp_size
@@ -135,19 +133,30 @@ class DeepSeekModel(BaseModel):
             [
                 ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3),
                 ops.ElementWise("context_add_norm_1", self._num_layers, 2 * h, 2 * h, 0.8),
-                ops.FallbackOp(
+                # qkv_a/downscale is outside SGLang's MLA module collector boundary.
+                # Keep it as a shared op so both module and granular paths count it once.
+                ops.GEMM("context_downscale_gemm", self._num_layers, 2112, h, gemm_quant_mode),
+                # Old behavior:
+                #   ops.FallbackOp(primary=ops.MLAModule(...), fallback=[context_downscale_gemm, ...])
+                # That made the path depend on perf-table availability and counted
+                # downscale only when falling back. The refreshed H100 comparison
+                # shows the semantic rule should be explicit: prefix=0 uses the
+                # module table; prefix>0 uses granular ops where prefix correction
+                # is applied at the attention-kernel level.
+                ops.PrefixConditionalOp(
                     "context_mla_block",
-                    primary=ops.MLAModule(
-                        "context_mla_module",
-                        self._num_layers,
-                        True,
-                        128 // tp_size,
-                        kvcache_quant_mode,
-                        fmha_quant_mode,
-                        gemm_quant_mode,
-                    ),
-                    fallback=[
-                        ops.GEMM("context_downscale_gemm", self._num_layers, 2112, h, gemm_quant_mode),
+                    no_prefix_ops=[
+                        ops.MLAModule(
+                            "context_mla_module",
+                            self._num_layers,
+                            True,
+                            128 // tp_size,
+                            kvcache_quant_mode,
+                            fmha_quant_mode,
+                            gemm_quant_mode,
+                        )
+                    ],
+                    prefix_ops=[
                         ops.GEMM(
                             "context_q_b_proj_gemm",
                             self._num_layers,
@@ -316,79 +325,29 @@ class DeepSeekModel(BaseModel):
                     2 * h,
                     0.8,
                 ),
-                ops.FallbackOp(
-                    "generation_mla_block",
-                    primary=ops.MLAModule(
-                        "generation_mla_module",
-                        self._num_layers * self._mtp_scale_factor,
-                        False,
-                        128 // tp_size,
-                        kvcache_quant_mode,
-                        fmha_quant_mode,
-                        gemm_quant_mode,
-                    ),
-                    fallback=[
-                        ops.GEMM(
-                            "generation_downscale_gemm",
-                            self._num_layers * self._mtp_scale_factor,
-                            2112,
-                            h,
-                            gemm_quant_mode,
-                        ),
-                        ops.GEMM(
-                            "generation_q_b_proj_gemm",
-                            self._num_layers * self._mtp_scale_factor,
-                            24576 // tp_size,
-                            1536,
-                            gemm_quant_mode,
-                        ),
-                        *(
-                            # KIMI K2.5 on vLLM: same reasoning as ContextAttention above —
-                            # vLLM absorbs the KV projection and runs standard GenerationAttention
-                            # with v_head_dim=128. TRT-LLM and SGLang use the full MLA path
-                            # (MLABmm + GenerationMLA + MLABmm).
-                            [
-                                ops.GenerationAttention(
-                                    "generation_attention",
-                                    self._num_layers * self._mtp_scale_factor,
-                                    self._num_heads // tp_size,
-                                    self._num_kv_heads // tp_size,
-                                    kvcache_quant_mode,
-                                    head_size=self._vllm_head_size,
-                                )
-                            ]
-                            if self._backend_name == "vllm"
-                            else [
-                                ops.MLABmm(
-                                    "generation_bmm_pre",
-                                    self._num_layers * self._mtp_scale_factor,
-                                    self._num_heads // tp_size,
-                                    mla_bmm_quant_mode,
-                                    if_pre=True,
-                                ),
-                                ops.GenerationMLA(
-                                    "generation_attention",
-                                    self._num_layers * self._mtp_scale_factor,
-                                    128 // tp_size,
-                                    kvcache_quant_mode,
-                                ),
-                                ops.MLABmm(
-                                    "generation_bmm_post",
-                                    self._num_layers * self._mtp_scale_factor,
-                                    self._num_heads // tp_size,
-                                    mla_bmm_quant_mode,
-                                    if_pre=False,
-                                ),
-                            ]
-                        ),
-                        ops.GEMM(
-                            "generation_proj_gemm",
-                            self._num_layers * self._mtp_scale_factor,
-                            h,
-                            h // tp_size,
-                            gemm_quant_mode,
-                        ),
-                    ],
+                # qkv_a/downscale is not part of the collected MLA module; model it
+                # once before the module op. Decode/generation always follows the
+                # module-level MLA path for ordinary DeepSeek SGLang comparisons.
+                ops.GEMM(
+                    "generation_downscale_gemm",
+                    self._num_layers * self._mtp_scale_factor,
+                    2112,
+                    h,
+                    gemm_quant_mode,
+                ),
+                # Old behavior:
+                #   ops.FallbackOp(primary=ops.MLAModule(...), fallback=[generation_downscale_gemm, ...])
+                # This mixed the module path with a data-availability fallback and
+                # could duplicate the qkv_a/downscale semantic when comparing with
+                # the collector boundary. Keep generation on the module path.
+                ops.MLAModule(
+                    "generation_mla_module",
+                    self._num_layers * self._mtp_scale_factor,
+                    False,
+                    128 // tp_size,
+                    kvcache_quant_mode,
+                    fmha_quant_mode,
+                    gemm_quant_mode,
                 ),
                 ops.ElementWise(
                     "generation_add_norm_2",

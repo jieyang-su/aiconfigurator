@@ -1954,6 +1954,42 @@ class MLAModule(Operation):
         return self._weights * self._scale_factor
 
 
+class PrefixConditionalOp(Operation):
+    """
+    Route context operations by whether the request has a prefix cache hit.
+
+    This is intentionally stricter than FallbackOp: it chooses the modeling path
+    from request semantics, not from database availability. DeepSeek prefill uses
+    module-level MLA only for prefix=0; prefix>0 is modeled by granular ops where
+    prefix correction belongs to the attention kernel.
+    """
+
+    def __init__(self, name: str, no_prefix_ops: list[Operation], prefix_ops: list[Operation]) -> None:
+        super().__init__(name, 1.0)  # scale_factor handled by inner ops
+        self._no_prefix_ops = no_prefix_ops
+        self._prefix_ops = prefix_ops
+
+    def _selected_ops(self, **kwargs) -> list[Operation]:
+        prefix = kwargs.get("prefix") or 0
+        return self._no_prefix_ops if prefix == 0 else self._prefix_ops
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        total_latency = 0.0
+        total_energy = 0.0
+        source = "silicon"
+        for op in self._selected_ops(**kwargs):
+            result = op.query(database, **kwargs)
+            total_latency += float(result)
+            total_energy += getattr(result, "energy", 0.0)
+            result_source = getattr(result, "source", source)
+            if result_source != source:
+                source = "mixed"
+        return PerformanceResult(total_latency, energy=total_energy, source=source)
+
+    def get_weights(self, **kwargs):
+        return sum(op.get_weights(**kwargs) for op in self._selected_ops(**kwargs))
+
+
 class FallbackOp(Operation):
     """
     Try a primary operation first; if it raises PerfDataNotAvailableError,
