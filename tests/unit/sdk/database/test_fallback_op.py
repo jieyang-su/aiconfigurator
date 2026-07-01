@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from aiconfigurator.sdk import common
-from aiconfigurator.sdk.operations import FallbackOp, MLAModule, PerformanceResult
+from aiconfigurator.sdk.operations import FallbackOp, MLAModule, PerformanceResult, PrefixConditionalOp
 from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
 
 
@@ -337,3 +337,37 @@ class TestMLAModule:
 
         assert float(result) == pytest.approx(5.0)
         assert result.energy == pytest.approx(50.0)
+
+
+class TestPrefixConditionalOp:
+    """Test cases for prefix-based MLA path routing."""
+
+    def test_prefix_zero_uses_no_prefix_ops(self):
+        """prefix=0 uses the module-level/no-prefix path."""
+        mock_db = _make_mock_db()
+        no_prefix = _make_mock_op(10.0, 100.0)
+        prefix = _make_mock_op(3.0, 30.0)
+
+        op = PrefixConditionalOp("test_prefix_route", no_prefix_ops=[no_prefix], prefix_ops=[prefix])
+        result = op.query(mock_db, prefix=0)
+
+        assert float(result) == 10.0
+        assert result.energy == 100.0
+        no_prefix.query.assert_called_once()
+        prefix.query.assert_not_called()
+
+    def test_prefix_positive_uses_prefix_ops(self):
+        """prefix>0 uses the granular/prefix-aware path."""
+        mock_db = _make_mock_db()
+        no_prefix = _make_mock_op(10.0, 100.0)
+        prefix_1 = _make_mock_op(3.0, 30.0)
+        prefix_2 = _make_mock_op(4.0, 40.0)
+
+        op = PrefixConditionalOp("test_prefix_route", no_prefix_ops=[no_prefix], prefix_ops=[prefix_1, prefix_2])
+        result = op.query(mock_db, prefix=128)
+
+        assert float(result) == 7.0
+        assert result.energy == 70.0
+        no_prefix.query.assert_not_called()
+        prefix_1.query.assert_called_once()
+        prefix_2.query.assert_called_once()

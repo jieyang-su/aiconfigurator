@@ -41,7 +41,7 @@ from aiconfigurator.sdk.operations.mla import (
     WideEPGenerationMLA,
 )
 from aiconfigurator.sdk.operations.moe import MoE, MoEDispatch, TrtLLMWideEPMoE, TrtLLMWideEPMoEDispatch
-from aiconfigurator.sdk.operations.overlap import FallbackOp, OverlapOp
+from aiconfigurator.sdk.operations.overlap import FallbackOp, OverlapOp, PrefixConditionalOp
 
 # Re-export commonly-imported names that the prior monolithic operations.py
 # exposed at module level. Some test files and external callers do
@@ -78,6 +78,7 @@ __all__ = [
     "Operation",
     "OverlapOp",
     "PerformanceResult",
+    "PrefixConditionalOp",
     "TrtLLMWideEPMoE",
     "TrtLLMWideEPMoEDispatch",
     "WideEPContextMLA",

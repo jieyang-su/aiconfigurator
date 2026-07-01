@@ -37,6 +37,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class PrefixConditionalOp(Operation):
+    """Route context operations by whether the request has prefix tokens."""
+
+    def __init__(self, name: str, no_prefix_ops: list[Operation], prefix_ops: list[Operation]) -> None:
+        super().__init__(name, 1.0)
+        self._no_prefix_ops = no_prefix_ops
+        self._prefix_ops = prefix_ops
+
+    def _selected_ops(self, **kwargs) -> list[Operation]:
+        prefix = kwargs.get("prefix") or 0
+        return self._no_prefix_ops if prefix == 0 else self._prefix_ops
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        total = PerformanceResult(0.0, energy=0.0, source="empirical")
+        for op in self._selected_ops(**kwargs):
+            total += op.query(database, **kwargs)
+        return total
+
+    def get_weights(self, **kwargs):
+        return sum(op.get_weights(**kwargs) for op in self._selected_ops(**kwargs))
+
+
 class FallbackOp(Operation):
     """
     Try a primary operation first; if it raises PerfDataNotAvailableError,
