@@ -112,7 +112,7 @@ class DeepSeekModel(BaseModel):
 
         # Old granular generation MLA path derived an mla_bmm_quant_mode here
         # for MLABmm(pre/post). The ordinary DeepSeek generation path now uses
-        # module-level MLA data, so the BMM precision is handled by MLAModule.
+        # module-level MLA data, so BMM precision is handled by the module query.
 
         h = self._hidden_size  # 7168
         tp_size = self.config.tp_size
@@ -123,6 +123,12 @@ class DeepSeekModel(BaseModel):
 
         kvcache_quant_mode = self.config.kvcache_quant_mode
         fmha_quant_mode = self.config.fmha_quant_mode
+        attn_backend = self.config.attention_backend
+        # wideep_*_mla_perf.txt is the only archived module-level SGLang MLA
+        # data family for DeepSeek, and its historical mla_dtype key is fp8_block.
+        # Keep granular prefix attention on fmha_quant_mode, but force module
+        # lookups through the available WideEP table dtype.
+        mla_module_quant_mode = common.FMHAQuantMode.fp8_block
         workload_distribution = (
             self.config.workload_distribution + f"_{self._power_law_alpha}"
             if self.config.workload_distribution == "power_law"
@@ -146,14 +152,17 @@ class DeepSeekModel(BaseModel):
                 ops.PrefixConditionalOp(
                     "context_mla_block",
                     no_prefix_ops=[
-                        ops.MLAModule(
+                        # The archived SGLang module data lives in
+                        # wideep_context_mla_perf.txt. Reuse the WideEP op
+                        # wrapper here instead of the legacy mla_*_module path,
+                        # whose txt files are not present in systems/data.
+                        ops.WideEPContextMLA(
                             "context_mla_module",
                             self._num_layers,
-                            True,
-                            128 // tp_size,
+                            tp_size,
                             kvcache_quant_mode,
-                            fmha_quant_mode,
-                            gemm_quant_mode,
+                            mla_module_quant_mode,
+                            attn_backend,
                         )
                     ],
                     prefix_ops=[
@@ -340,14 +349,16 @@ class DeepSeekModel(BaseModel):
                 # This mixed the module path with a data-availability fallback and
                 # could duplicate the qkv_a/downscale semantic when comparing with
                 # the collector boundary. Keep generation on the module path.
-                ops.MLAModule(
+                # The archived SGLang generation module data lives in
+                # wideep_generation_mla_perf.txt, so use the WideEP query
+                # wrapper rather than the absent legacy mla_*_module files.
+                ops.WideEPGenerationMLA(
                     "generation_mla_module",
                     self._num_layers * self._mtp_scale_factor,
-                    False,
-                    128 // tp_size,
+                    tp_size,
                     kvcache_quant_mode,
-                    fmha_quant_mode,
-                    gemm_quant_mode,
+                    mla_module_quant_mode,
+                    attn_backend,
                 ),
                 ops.ElementWise(
                     "generation_add_norm_2",
