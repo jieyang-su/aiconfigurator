@@ -42,8 +42,10 @@ corresponding cache slot is ``None`` and consumers must guard.
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from math import ceil
+from statistics import median
 from typing import TYPE_CHECKING, ClassVar
 
 from aiconfigurator.sdk import common, interpolation
@@ -55,6 +57,221 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _ordinary_recorded_phase_distribution(
+    distribution: str,
+    is_context: bool,
+    *,
+    enable_eplb: bool = False,
+) -> str:
+    phase = "context" if is_context else "generation"
+    if distribution == "recorded":
+        eplb_tag = "eplb" if is_context and enable_eplb else "no_eplb"
+        return f"recorded_{phase}_{eplb_tag}"
+    if distribution == "recorded_no_eplb":
+        return f"recorded_{phase}_no_eplb"
+    if distribution == "recorded_eplb":
+        return f"recorded_{phase}_eplb"
+    return distribution
+
+
+def _normalize_ordinary_moe_distribution_for_load(distribution: str, phase: str | None = None) -> str:
+    phase = (phase or "").strip().lower()
+    if distribution in {"recorded_no_eplb", "recorded_eplb"} and phase in {"context", "generation"}:
+        return _ordinary_recorded_phase_distribution(distribution, is_context=phase == "context")
+
+    prefix = "recorded_dummy_"
+    suffixes = {
+        "_rank_local_no_eplb": "no_eplb",
+        "_rank_local_eplb": "eplb",
+    }
+    for suffix, eplb_tag in suffixes.items():
+        if distribution.startswith(prefix) and distribution.endswith(suffix):
+            stem = distribution[len(prefix) : -len(suffix)]
+            for candidate_phase in ("context", "generation"):
+                marker = f"_{candidate_phase}"
+                if stem.endswith(marker):
+                    return f"recorded_{candidate_phase}_{eplb_tag}"
+            if phase in {"context", "generation"}:
+                return f"recorded_{phase}_{eplb_tag}"
+    return distribution
+
+
+def _select_moe_distribution(distribution_map: dict, *candidates: str) -> str:
+    """Pick the first available distribution with explicit, visible fallback."""
+
+    for candidate in candidates:
+        if candidate and candidate in distribution_map:
+            return candidate
+    for fallback in ("power_law_1.01", "power_law_1.2", "balanced", "uniform"):
+        if fallback in distribution_map:
+            logger.warning(
+                "Falling back MoE workload distribution to '%s' because candidates %s are unavailable; "
+                "available=%s",
+                fallback,
+                candidates,
+                sorted(str(key) for key in distribution_map.keys()),
+            )
+            return fallback
+    available = sorted(str(key) for key in distribution_map.keys())
+    raise KeyError(f"No compatible MoE workload distribution found; candidates={candidates}, available={available}")
+
+
+def _moe_distribution_leaf(
+    distribution_map: dict,
+    distribution: str,
+    *,
+    topk: int,
+    num_experts: int,
+    hidden_size: int,
+    inter_size: int,
+    moe_tp_size: int,
+    moe_ep_size: int,
+) -> dict:
+    return distribution_map[distribution][topk][num_experts][hidden_size][inter_size][moe_tp_size][moe_ep_size]
+
+
+def _select_moe_leaf(
+    distribution_map: dict,
+    *candidates: str,
+    topk: int,
+    num_experts: int,
+    hidden_size: int,
+    inter_size: int,
+    moe_tp_size: int,
+    moe_ep_size: int,
+) -> tuple[str, dict]:
+    used_distribution = _select_moe_distribution(distribution_map, *candidates)
+    try:
+        return used_distribution, _moe_distribution_leaf(
+            distribution_map,
+            used_distribution,
+            topk=topk,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            inter_size=inter_size,
+            moe_tp_size=moe_tp_size,
+            moe_ep_size=moe_ep_size,
+        )
+    except KeyError:
+        pass
+
+    for fallback in ("power_law_1.01", "power_law_1.2", "balanced", "uniform"):
+        if fallback == used_distribution or fallback not in distribution_map:
+            continue
+        try:
+            leaf = _moe_distribution_leaf(
+                distribution_map,
+                fallback,
+                topk=topk,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                inter_size=inter_size,
+                moe_tp_size=moe_tp_size,
+                moe_ep_size=moe_ep_size,
+            )
+        except KeyError:
+            continue
+        logger.warning(
+            "Falling back MoE workload distribution to '%s' because distribution '%s' lacks shape "
+            "(topk=%s, num_experts=%s, hidden_size=%s, inter_size=%s, moe_tp_size=%s, moe_ep_size=%s); "
+            "available distributions=%s",
+            fallback,
+            used_distribution,
+            topk,
+            num_experts,
+            hidden_size,
+            inter_size,
+            moe_tp_size,
+            moe_ep_size,
+            sorted(str(key) for key in distribution_map.keys()),
+        )
+        return fallback, leaf
+
+    raise KeyError(
+        "No compatible MoE shape found for candidates="
+        f"{candidates}, selected_distribution={used_distribution}, shape="
+        f"(topk={topk}, num_experts={num_experts}, hidden_size={hidden_size}, inter_size={inter_size}, "
+        f"moe_tp_size={moe_tp_size}, moe_ep_size={moe_ep_size})"
+    )
+
+
+def _sglang_eplb_token_correction_factor() -> float:
+    """Optional legacy token correction for SGLang EPLB context MoE.
+
+    SGLang WideEP MoE tables already encode the measured workload
+    distribution, for example DeepSeek-V3 uses ``power_law_0.6`` for EPLB
+    context.  Applying an unconditional token shrink on top of that double
+    counts the EPLB effect and makes exact table points query interpolated
+    smaller-token rows.  Keep the old heuristic available for reproducing
+    historical runs, but make calibrated systems data the default.
+    """
+
+    raw = os.environ.get("AIC_SGLANG_EPLB_TOKEN_CORRECTION_FACTOR", "1.0")
+    try:
+        factor = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid AIC_SGLANG_EPLB_TOKEN_CORRECTION_FACTOR=%r; using 1.0.",
+            raw,
+        )
+        return 1.0
+    if factor <= 0:
+        logger.warning(
+            "AIC_SGLANG_EPLB_TOKEN_CORRECTION_FACTOR must be > 0, got %s; using 1.0.",
+            raw,
+        )
+        return 1.0
+    return factor
+
+
+def _sglang_wideep_moe_overflow_policy() -> str:
+    """Overflow policy for SGLang WideEP MoE silicon tables.
+
+    ``recorded_bounded_slope`` only applies to Recorded WideEP rows whose
+    operator regime is tagged as contiguous.  It keeps extrapolation in the
+    operator-measurement space: use the last measured point plus a bounded
+    positive slope from the last few single-card Recorded intervals.  Other
+    distributions/regimes fall back to the historical SOL-util extrapolation.
+
+    ``last`` is useful for reproducing plateau-style experiments; it keeps
+    queries beyond the largest sampled token on the last measured latency.
+    """
+
+    policy = os.environ.get(
+        "AIC_SGLANG_WIDEEP_MOE_OVERFLOW_POLICY",
+        "recorded_bounded_slope",
+    )
+    policy = policy.strip().lower()
+    if policy in {"util", "last", "recorded_bounded_slope", "recorded_operator_curve"}:
+        return policy
+    logger.warning(
+        "Invalid AIC_SGLANG_WIDEEP_MOE_OVERFLOW_POLICY=%r; using 'recorded_bounded_slope'.",
+        policy,
+    )
+    return "recorded_bounded_slope"
+
+
+def _sglang_wideep_moe_overflow_recent_intervals() -> int:
+    """How many recent positive contiguous intervals to use for overflow slope."""
+
+    raw = os.environ.get("AIC_SGLANG_WIDEEP_MOE_OVERFLOW_RECENT_INTERVALS", "3")
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid AIC_SGLANG_WIDEEP_MOE_OVERFLOW_RECENT_INTERVALS=%r; using 3.",
+            raw,
+        )
+        return 3
+    if value <= 0:
+        logger.warning(
+            "AIC_SGLANG_WIDEEP_MOE_OVERFLOW_RECENT_INTERVALS must be > 0, got %s; using 3.",
+            raw,
+        )
+        return 3
+    return value
 
 
 def _cache_key(database: PerfDatabase) -> tuple:
@@ -359,6 +576,365 @@ class MoE(Operation):
             # formula fallback, so keep the source tag aligned with _interp_pr.
             return database._interp_pr(est_latency, energy=est_energy)
 
+        def _estimate_overflow_with_last_point(moe_dict: dict) -> PerformanceResult:
+            token_points = sorted(moe_dict.keys())
+            last_point = moe_dict[token_points[-1]]
+            if isinstance(last_point, dict):
+                latency = float(last_point["latency"])
+                energy = float(last_point.get("energy", 0.0))
+            else:
+                latency = float(last_point)
+                energy = 0.0
+            return database._interp_pr(latency, energy=energy)
+
+        def _is_recorded_distribution(distribution: str) -> bool:
+            return distribution in {"recorded", "recorded_no_eplb", "recorded_eplb"}
+
+        def _point_latency(point) -> float:
+            if isinstance(point, dict):
+                return float(point["latency"])
+            return float(point)
+
+        def _point_energy(point) -> float:
+            if isinstance(point, dict):
+                return float(point.get("energy", 0.0))
+            return 0.0
+
+        def _point_regime(point) -> str:
+            if isinstance(point, dict):
+                return str(point.get("gemm_path", "") or point.get("kernel_regime", ""))
+            return ""
+
+        def _estimate_recorded_contiguous_overflow_with_bounded_slope(
+            query_tokens: int,
+            moe_dict: dict,
+        ) -> PerformanceResult | None:
+            """Right-extrapolate Recorded contiguous rows without synthetic anchors.
+
+            The slope is learned from already-collected single-card Recorded
+            points in the same table leaf.  We deliberately use only recent
+            positive intervals and cap to the p50 of those intervals.  This
+            avoids both extremes seen in practice:
+
+            * SOL-util overflow can explode sparse Recorded context rows;
+            * last-point overflow hides a small but real post-saturation tail.
+
+            Returning ``None`` means the leaf is not a Recorded contiguous
+            regime and should use the caller's normal overflow policy.
+            """
+
+            token_points = sorted(moe_dict.keys())
+            if len(token_points) < 2 or query_tokens <= token_points[-1]:
+                return None
+            last_token = token_points[-1]
+            last_point = moe_dict[last_token]
+            if "contiguous" not in _point_regime(last_point):
+                return None
+
+            slopes: list[float] = []
+            tail_token_floor = median(token_points)
+            recent_intervals = _sglang_wideep_moe_overflow_recent_intervals()
+            for left, right in zip(token_points, token_points[1:]):
+                if left < tail_token_floor:
+                    continue
+                left_point = moe_dict[left]
+                right_point = moe_dict[right]
+                if "contiguous" not in _point_regime(left_point) or "contiguous" not in _point_regime(right_point):
+                    continue
+                slope = (_point_latency(right_point) - _point_latency(left_point)) / max(1, right - left)
+                if slope > 0.0:
+                    slopes.append(float(slope))
+            slopes = slopes[-recent_intervals:]
+
+            if not slopes:
+                # If the real single-card tail is fully flat or noisy downward,
+                # be conservative and use the final measured point.  This is
+                # still a query-time extrapolation, not an inserted sample.
+                return _estimate_overflow_with_last_point(moe_dict)
+
+            bounded_slope = median(slopes)
+            est_latency = _point_latency(last_point) + bounded_slope * (query_tokens - last_token)
+            last_energy = _point_energy(last_point)
+            est_energy = 0.0
+            if last_energy > 0.0:
+                est_energy = last_energy * (est_latency / max(_point_latency(last_point), 1e-8))
+            return database._interp_pr(est_latency, energy=est_energy)
+
+        def _estimate_ordinary_recorded_context_overflow_with_bounded_slope(
+            query_tokens: int,
+            moe_dict: dict,
+        ) -> PerformanceResult | None:
+            """Right-extrapolate ordinary Recorded context from its own tail.
+
+            Ordinary MoE rows do not carry WideEP contiguous/regime metadata,
+            so this uses only the same table leaf's measured AIC curve: take
+            recent positive slopes from the upper half of token anchors and
+            continue with their median.  This keeps right extrapolation in
+            AIC-only measurement space and avoids both SOL-util blowups and a
+            fully flat ``right_last`` tail.
+            """
+
+            token_points = sorted(moe_dict.keys())
+            if len(token_points) < 2 or query_tokens <= token_points[-1]:
+                return None
+
+            slopes: list[float] = []
+            tail_token_floor = median(token_points)
+            recent_intervals = _sglang_wideep_moe_overflow_recent_intervals()
+            for left, right in zip(token_points, token_points[1:]):
+                if left < tail_token_floor:
+                    continue
+                slope = (_point_latency(moe_dict[right]) - _point_latency(moe_dict[left])) / max(1, right - left)
+                if slope > 0.0:
+                    slopes.append(float(slope))
+            slopes = slopes[-recent_intervals:]
+
+            if not slopes:
+                return _estimate_overflow_with_last_point(moe_dict)
+
+            last_token = token_points[-1]
+            last_point = moe_dict[last_token]
+            est_latency = _point_latency(last_point) + median(slopes) * (query_tokens - last_token)
+            last_energy = _point_energy(last_point)
+            est_energy = 0.0
+            if last_energy > 0.0:
+                est_energy = last_energy * (est_latency / max(_point_latency(last_point), 1e-8))
+            return database._interp_pr(est_latency, energy=est_energy)
+
+        def _leaf_token_points(leaf: dict) -> list[int]:
+            return sorted(int(token) for token in leaf.keys())
+
+        def _interp_leaf_latency(leaf: dict, token: int) -> float | None:
+            token_points = _leaf_token_points(leaf)
+            if not token_points:
+                return None
+            if token in leaf:
+                return _point_latency(leaf[token])
+            if token < token_points[0] or token > token_points[-1]:
+                return None
+            left, right = interpolation.nearest_1d_point_helper(
+                token,
+                token_points,
+                inner_only=False,
+            )
+            result = interpolation.interp_1d(
+                [left, right],
+                [leaf[left], leaf[right]],
+                token,
+            )
+            return _point_latency(result)
+
+        def _get_regular_moe_branch(distribution: str) -> dict | None:
+            regular_data = getattr(database, "_moe_data", None)
+            if regular_data is None:
+                return None
+            regular_data.raise_if_not_loaded()
+            node = regular_data.get(quant_mode, {}).get(distribution, {})
+            node = node.get(topk, {}).get(num_experts, {}).get(hidden_size, {}).get(inter_size, {}).get(moe_tp_size, {})
+            if not isinstance(node, dict):
+                return None
+            return node
+
+        def _select_operator_leaf(
+            distribution: str,
+            *,
+            min_last_token: int,
+            prefer_cover_query: int,
+        ) -> tuple[int, dict] | None:
+            """Pick a single-card MoE leaf to provide extrapolation shape.
+
+            Prefer same EP when it has enough high-token coverage; otherwise
+            fall back to the nearest lower EP with real high-token points.  This
+            is deliberately operator-data-only: no server/profile numbers enter
+            this selection.
+            """
+
+            branch = _get_regular_moe_branch(distribution)
+            if not branch:
+                return None
+
+            candidates: list[tuple[tuple[int, int, int, int], int, dict]] = []
+            for ep_size, leaf in branch.items():
+                if not isinstance(leaf, dict):
+                    continue
+                token_points = _leaf_token_points(leaf)
+                if len(token_points) < 2 or token_points[-1] < min_last_token:
+                    continue
+                ep_size_int = int(ep_size)
+                covers_query = int(token_points[-1] >= prefer_cover_query)
+                same_ep = int(ep_size_int == moe_ep_size)
+                not_larger_ep = int(ep_size_int <= moe_ep_size)
+                # Highest tuple wins.
+                score = (
+                    covers_query,
+                    same_ep,
+                    not_larger_ep,
+                    -abs(ep_size_int - moe_ep_size),
+                )
+                candidates.append((score, ep_size_int, leaf))
+            if not candidates:
+                return None
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            _, ep_size, leaf = candidates[0]
+            return ep_size, leaf
+
+        def _balanced_scaled_operator_delta(
+            recorded_leaf: dict,
+            balanced_leaf: dict | None,
+            from_token: int,
+            to_token: int,
+        ) -> float | None:
+            """Operator-prior delta from real single-card curves.
+
+            Recorded rank-local curves currently cover the near tail (up to
+            4096 in the refresh run).  For farther points, continue the curve
+            using the measured high-token balanced MoE curvature, scaled to the
+            Recorded-vs-balanced slope on the shared high-token interval.  This
+            avoids synthetic saturation anchors and avoids carrying one fixed
+            slope forever.
+            """
+
+            if to_token <= from_token:
+                return 0.0
+
+            recorded_points = _leaf_token_points(recorded_leaf)
+            if len(recorded_points) < 2:
+                return None
+            recorded_max = recorded_points[-1]
+            delta = 0.0
+            cursor = from_token
+
+            if cursor < min(to_token, recorded_max):
+                right = min(to_token, recorded_max)
+                left_lat = _interp_leaf_latency(recorded_leaf, cursor)
+                right_lat = _interp_leaf_latency(recorded_leaf, right)
+                if left_lat is None or right_lat is None:
+                    return None
+                delta += right_lat - left_lat
+                cursor = right
+
+            if cursor >= to_token:
+                return delta
+
+            if balanced_leaf is None:
+                return None
+            balanced_points = _leaf_token_points(balanced_leaf)
+            if len(balanced_points) < 2 or balanced_points[-1] < to_token:
+                return None
+
+            # Scale balanced far-tail curvature to Recorded on their latest
+            # shared real interval.
+            shared = [token for token in recorded_points if token in balanced_leaf]
+            if len(shared) >= 2:
+                left_shared, right_shared = shared[-2], shared[-1]
+            else:
+                left_shared, right_shared = recorded_points[-2], recorded_points[-1]
+            recorded_right = _interp_leaf_latency(recorded_leaf, right_shared)
+            recorded_left = _interp_leaf_latency(recorded_leaf, left_shared)
+            balanced_right = _interp_leaf_latency(balanced_leaf, right_shared)
+            balanced_left = _interp_leaf_latency(balanced_leaf, left_shared)
+            if (
+                recorded_right is None
+                or recorded_left is None
+                or balanced_right is None
+                or balanced_left is None
+                or (balanced_right - balanced_left) <= 0.0
+            ):
+                far_scale = 1.0
+            else:
+                recorded_shared_delta = recorded_right - recorded_left
+                balanced_shared_delta = balanced_right - balanced_left
+                far_scale = max(0.25, min(4.0, recorded_shared_delta / balanced_shared_delta))
+
+            left_balanced = _interp_leaf_latency(balanced_leaf, cursor)
+            right_balanced = _interp_leaf_latency(balanced_leaf, to_token)
+            if left_balanced is None or right_balanced is None:
+                return None
+            delta += far_scale * (right_balanced - left_balanced)
+            return delta
+
+        def _operator_distribution_for_recorded(distribution: str) -> str:
+            return _ordinary_recorded_phase_distribution(distribution, is_context)
+
+        def _estimate_recorded_contiguous_overflow_with_operator_curve(
+            query_tokens: int,
+            moe_dict: dict,
+            used_workload_distribution: str,
+        ) -> PerformanceResult | None:
+            """Right-extrapolate contiguous Recorded rows from operator curves.
+
+            WideEP rows provide the anchor latency and anchor slope.  Regular
+            single-card MoE rows provide only the shape of the continuation:
+            Recorded rank-local near-tail where available, then measured
+            balanced high-token curvature scaled on their overlap.  Server
+            profile data is intentionally not used here.
+            """
+
+            token_points = sorted(moe_dict.keys())
+            if len(token_points) < 2 or query_tokens <= token_points[-1]:
+                return None
+            last_token = token_points[-1]
+            last_point = moe_dict[last_token]
+            if "contiguous" not in _point_regime(last_point):
+                return None
+
+            recorded_operator_distribution = _operator_distribution_for_recorded(
+                used_workload_distribution
+            )
+            selected_recorded = _select_operator_leaf(
+                recorded_operator_distribution,
+                min_last_token=last_token,
+                prefer_cover_query=min(query_tokens, 4096),
+            )
+            if selected_recorded is None:
+                return None
+            _, recorded_leaf = selected_recorded
+
+            selected_balanced = _select_operator_leaf(
+                "balanced",
+                min_last_token=last_token,
+                prefer_cover_query=query_tokens,
+            )
+            balanced_leaf = selected_balanced[1] if selected_balanced is not None else None
+
+            anchor_scale = None
+            for left, right in reversed(list(zip(token_points, token_points[1:]))):
+                left_point = moe_dict[left]
+                right_point = moe_dict[right]
+                if "contiguous" not in _point_regime(left_point) or "contiguous" not in _point_regime(right_point):
+                    continue
+                wideep_delta = _point_latency(right_point) - _point_latency(left_point)
+                if wideep_delta <= 0.0:
+                    continue
+                operator_delta = _balanced_scaled_operator_delta(
+                    recorded_leaf,
+                    balanced_leaf,
+                    left,
+                    right,
+                )
+                if operator_delta is None or operator_delta <= 0.0:
+                    continue
+                anchor_scale = max(0.01, min(4.0, wideep_delta / operator_delta))
+                break
+            if anchor_scale is None:
+                return None
+
+            operator_delta = _balanced_scaled_operator_delta(
+                recorded_leaf,
+                balanced_leaf,
+                last_token,
+                query_tokens,
+            )
+            if operator_delta is None or operator_delta < 0.0:
+                return None
+
+            est_latency = _point_latency(last_point) + anchor_scale * operator_delta
+            last_energy = _point_energy(last_point)
+            est_energy = 0.0
+            if last_energy > 0.0:
+                est_energy = last_energy * (est_latency / max(_point_latency(last_point), 1e-8))
+            return database._interp_pr(est_latency, energy=est_energy)
+
         def _require_moe_token_points(
             moe_dict: dict,
             query_tokens: int,
@@ -422,30 +998,91 @@ class MoE(Operation):
             def get_silicon():
                 if database.backend == common.BackendName.sglang.value:
                     # deepep_moe is for sglang wideep only
-                    # Apply num_tokens correction when eplb is enabled (only during prefill)
-                    num_tokens_corrected = int(num_tokens * 0.8) if enable_eplb and is_context else num_tokens
+                    correction_factor = (
+                        _sglang_eplb_token_correction_factor() if enable_eplb and is_context else 1.0
+                    )
+                    num_tokens_corrected = max(1, int(num_tokens * correction_factor))
                     if moe_backend == "deepep_moe":
                         if is_context:
                             moe_data = database._wideep_context_moe_data
                         else:
                             moe_data = database._wideep_generation_moe_data
+                        query_workload_distribution = workload_distribution
                     else:
                         moe_data = database._moe_data
+                        query_workload_distribution = _ordinary_recorded_phase_distribution(
+                            workload_distribution,
+                            is_context,
+                            enable_eplb=enable_eplb,
+                        )
 
                     moe_data.raise_if_not_loaded()
 
-                    used_workload_distribution = (
-                        workload_distribution if workload_distribution in moe_data[quant_mode] else "uniform"
+                    used_workload_distribution, moe_dict = _select_moe_leaf(
+                        moe_data[quant_mode],
+                        query_workload_distribution,
+                        workload_distribution,
+                        topk=topk,
+                        num_experts=num_experts,
+                        hidden_size=hidden_size,
+                        inter_size=inter_size,
+                        moe_tp_size=moe_tp_size,
+                        moe_ep_size=moe_ep_size,
                     )
-                    moe_dict = moe_data[quant_mode][used_workload_distribution][topk][num_experts][hidden_size][
-                        inter_size
-                    ][moe_tp_size][moe_ep_size]
                     token_points = _require_moe_token_points(
                         moe_dict,
                         num_tokens_corrected,
                         used_workload_distribution,
                     )
                     if num_tokens_corrected > token_points[-1]:
+                        overflow_policy = _sglang_wideep_moe_overflow_policy()
+                        if (
+                            overflow_policy in {"recorded_bounded_slope", "recorded_operator_curve"}
+                            and moe_backend != "deepep_moe"
+                            and is_context
+                            and _is_recorded_distribution(used_workload_distribution)
+                        ):
+                            bounded = _estimate_ordinary_recorded_context_overflow_with_bounded_slope(
+                                num_tokens_corrected,
+                                moe_dict,
+                            )
+                            if bounded is not None:
+                                return bounded
+                        if (
+                            overflow_policy in {"recorded_bounded_slope", "recorded_operator_curve"}
+                            and moe_backend == "deepep_moe"
+                            and _is_recorded_distribution(used_workload_distribution)
+                        ):
+                            if overflow_policy == "recorded_operator_curve":
+                                operator_curve = _estimate_recorded_contiguous_overflow_with_operator_curve(
+                                    num_tokens_corrected,
+                                    moe_dict,
+                                    used_workload_distribution,
+                                )
+                                bounded = _estimate_recorded_contiguous_overflow_with_bounded_slope(
+                                    num_tokens_corrected,
+                                    moe_dict,
+                                )
+                                if operator_curve is not None and bounded is not None:
+                                    # Both estimates are derived from single-card
+                                    # operator data.  Use the conservative
+                                    # continuation to avoid local EPLB slope
+                                    # amplification while still allowing measured
+                                    # high-token operator curvature to lower an
+                                    # overly aggressive bounded tail.
+                                    return operator_curve if float(operator_curve) < float(bounded) else bounded
+                                if operator_curve is not None:
+                                    return operator_curve
+                                if bounded is not None:
+                                    return bounded
+                            bounded = _estimate_recorded_contiguous_overflow_with_bounded_slope(
+                                num_tokens_corrected,
+                                moe_dict,
+                            )
+                            if bounded is not None:
+                                return bounded
+                        if overflow_policy == "last":
+                            return _estimate_overflow_with_last_point(moe_dict)
                         return _estimate_overflow_with_last_token_util(
                             num_tokens_corrected,
                             moe_dict,
@@ -491,10 +1128,9 @@ class MoE(Operation):
                         and is_gated
                     ):
                         try:
-                            used_workload_distribution = (
-                                workload_distribution
-                                if workload_distribution in database._moe_low_latency_data[quant_mode]
-                                else "uniform"
+                            used_workload_distribution = _select_moe_distribution(
+                                database._moe_low_latency_data[quant_mode],
+                                workload_distribution,
                             )
                             moe_dict = database._moe_low_latency_data[quant_mode][used_workload_distribution][topk][
                                 num_experts
@@ -512,19 +1148,17 @@ class MoE(Operation):
                                 f"{inter_size} {moe_tp_size} {moe_ep_size}."
                             )
                         except:
-                            used_workload_distribution = (
-                                workload_distribution
-                                if workload_distribution in database._moe_data[quant_mode]
-                                else "uniform"
+                            used_workload_distribution = _select_moe_distribution(
+                                database._moe_data[quant_mode],
+                                workload_distribution,
                             )
                             moe_dict = database._moe_data[quant_mode][used_workload_distribution][topk][num_experts][
                                 hidden_size
                             ][inter_size][moe_tp_size][moe_ep_size]
                     else:
-                        used_workload_distribution = (
-                            workload_distribution
-                            if workload_distribution in database._moe_data[quant_mode]
-                            else "uniform"
+                        used_workload_distribution = _select_moe_distribution(
+                            database._moe_data[quant_mode],
+                            workload_distribution,
                         )
                         moe_dict = database._moe_data[quant_mode][used_workload_distribution][topk][num_experts][
                             hidden_size
@@ -562,8 +1196,9 @@ class MoE(Operation):
                     return database._interp_pr(lat, energy=energy)
                 elif database.backend == common.BackendName.vllm.value:
                     database._moe_data.raise_if_not_loaded()
-                    used_workload_distribution = (
-                        workload_distribution if workload_distribution in database._moe_data[quant_mode] else "uniform"
+                    used_workload_distribution = _select_moe_distribution(
+                        database._moe_data[quant_mode],
+                        workload_distribution,
                     )
                     moe_dict = database._moe_data[quant_mode][used_workload_distribution][topk][num_experts][
                         hidden_size
@@ -2074,6 +2709,10 @@ def load_moe_data(moe_file):
             row["distribution"],
             row["latency"],
         )
+        workload_distribution = _normalize_ordinary_moe_distribution_for_load(
+            workload_distribution,
+            row.get("phase"),
+        )
         kernel_source = row["kernel_source"]  # moe_torch_flow, moe_torch_flow_min_latency, moe_torch_flow
         num_tokens = int(num_tokens)
         hidden_size = int(hidden_size)
@@ -2086,6 +2725,8 @@ def load_moe_data(moe_file):
 
         # NEW: Read power with backward compatibility
         power = float(row.get("power", 0.0))
+        gemm_path = row.get("gemm_path", "")
+        kernel_regime = row.get("kernel_regime", "")
 
         # NEW: Calculate energy from power and latency
         energy = power * latency  # watt-milliseconds
@@ -2164,6 +2805,8 @@ def load_wideep_context_moe_data(wideep_context_moe_file):
 
         # NEW: Read power with backward compatibility
         power = float(row.get("power", 0.0))
+        gemm_path = row.get("gemm_path", "")
+        kernel_regime = row.get("kernel_regime", "")
 
         # NEW: Calculate energy from power and latency
         energy = power * latency  # watt-milliseconds
@@ -2184,6 +2827,8 @@ def load_wideep_context_moe_data(wideep_context_moe_file):
             "latency": latency,
             "power": power,
             "energy": energy,  # NEW: precomputed energy
+            "gemm_path": gemm_path,
+            "kernel_regime": kernel_regime,
         }
         logger.debug(
             f"Loaded SGLang wideep context MoE data: {quant_mode}, {distribution}, {topk}, "
@@ -2241,6 +2886,8 @@ def load_wideep_generation_moe_data(wideep_generation_moe_file):
 
         # NEW: Read power with backward compatibility
         power = float(row.get("power", 0.0))
+        gemm_path = row.get("gemm_path", "")
+        kernel_regime = row.get("kernel_regime", "")
 
         # NEW: Calculate energy from power and latency
         energy = power * latency  # watt-milliseconds
@@ -2261,6 +2908,8 @@ def load_wideep_generation_moe_data(wideep_generation_moe_file):
             "latency": latency,
             "power": power,
             "energy": energy,  # NEW: precomputed energy
+            "gemm_path": gemm_path,
+            "kernel_regime": kernel_regime,
         }
         logger.debug(
             f"Loaded SGLang wideep generation MoE data: {quant_mode}, {distribution}, {topk}, "

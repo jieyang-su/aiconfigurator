@@ -13,6 +13,7 @@ import inspect
 import itertools
 import csv
 import json
+import math
 import os
 from pathlib import Path
 from typing import TypedDict
@@ -57,6 +58,11 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import BypassedTopKOutput, StandardTopKOutput, TopKConfig, select_experts
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_hip
+
+from collector.wideep.sglang.rank_local_moe_replay import (
+    MANIFEST_FILENAME as RANK_LOCAL_REPLAY_MANIFEST,
+    select_replay_workloads,
+)
 
 try:
     import sglang.srt.layers.quantization.mxfp4 as _mxfp4_mod
@@ -157,8 +163,166 @@ def _env_str_set(name: str) -> set[str] | None:
     return {item.strip() for item in raw_value.replace(",", " ").split() if item.strip()}
 
 
+def _env_int_set(name: str) -> set[int] | None:
+    raw_value = os.environ.get(name)
+    if not raw_value:
+        return None
+    return {int(item.strip()) for item in raw_value.replace(",", " ").split() if item.strip()}
+
+
+def _rank_local_replay_phases() -> list[str]:
+    raw_phases = _env_str_set("COLLECTOR_MOE_RANK_LOCAL_REPLAY_PHASES")
+    if not raw_phases:
+        return ["context"]
+    phases = [phase for phase in ("context", "generation") if phase in raw_phases]
+    invalid = raw_phases.difference(phases)
+    if invalid:
+        raise ValueError(
+            "COLLECTOR_MOE_RANK_LOCAL_REPLAY_PHASES only supports "
+            f"context/generation, got {sorted(invalid)}"
+        )
+    return phases
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _use_cuda_graph_for_phase(phase: str) -> bool:
+    if phase == "context":
+        return _env_bool("COLLECTOR_MOE_CONTEXT_USE_CUDA_GRAPH", False)
+    if phase == "generation":
+        return _env_bool("COLLECTOR_MOE_GENERATION_USE_CUDA_GRAPH", True)
+    return _env_bool("COLLECTOR_MOE_USE_CUDA_GRAPH", True)
+
+
 def _get_recorded_distribution_name() -> str:
     return os.environ.get("COLLECTOR_MOE_RECORDED_DISTRIBUTION", "recorded")
+
+
+def _public_recorded_distribution(enable_eplb: bool) -> str:
+    return "recorded_eplb" if enable_eplb else "recorded_no_eplb"
+
+
+def _get_rank_local_replay_dir() -> Path | None:
+    explicit = os.environ.get("COLLECTOR_MOE_RANK_LOCAL_REPLAY_DIR")
+    if explicit:
+        path = Path(explicit)
+    else:
+        output_dir = os.environ.get("COLLECTOR_CURRENT_OUTPUT_DIR")
+        if not output_dir:
+            return None
+        path = Path(output_dir) / "moe_token_distribution_replay"
+    if not (path / RANK_LOCAL_REPLAY_MANIFEST).is_file():
+        return None
+    return path
+
+
+def _rank_local_replay_distributions(
+    *,
+    num_tokens: int,
+    ep_size: int,
+    num_experts: int,
+) -> list[str]:
+    replay_dir = _get_rank_local_replay_dir()
+    if replay_dir is None:
+        return []
+    phases = _rank_local_replay_phases()
+    with (replay_dir / RANK_LOCAL_REPLAY_MANIFEST).open(
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        rows = list(csv.DictReader(f))
+    specs = {
+        (
+            row.get("phase", "context"),
+            row.get("workload_source", "runtime"),
+            str(row.get("enable_eplb", "")).lower() in ("1", "true"),
+        )
+        for row in rows
+        if row.get("phase") in phases
+        and int(row.get("num_tokens", -1)) == int(num_tokens)
+        and int(row.get("requested_ep_size", -1)) == int(ep_size)
+        and int(row.get("num_experts", -1)) == int(num_experts)
+    }
+    distributions = []
+    for phase, source, enable_eplb in sorted(specs):
+        suffix = "rank_local_eplb" if enable_eplb else "rank_local_no_eplb"
+        if phases == ["context"]:
+            distributions.append(f"recorded_{source}_{suffix}")
+        else:
+            distributions.append(f"recorded_{source}_{phase}_{suffix}")
+    return distributions
+
+
+def _rank_local_replay_tokens(
+    *,
+    ep_size: int,
+    num_experts: int,
+) -> set[int]:
+    replay_dir = _get_rank_local_replay_dir()
+    if replay_dir is None:
+        return set()
+    phases = _rank_local_replay_phases()
+    with (replay_dir / RANK_LOCAL_REPLAY_MANIFEST).open(
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        return {
+            int(row.get("num_tokens", -1))
+            for row in csv.DictReader(f)
+            if row.get("phase") in phases
+            and int(row.get("requested_ep_size", -1)) == int(ep_size)
+            and int(row.get("num_experts", -1)) == int(num_experts)
+        }
+
+
+def _parse_rank_local_distribution(distributed: str) -> tuple[str, str, bool] | None:
+    prefix = "recorded_"
+    if not distributed.startswith(prefix):
+        return None
+    value = distributed[len(prefix) :]
+    phase = "context"
+    if value.endswith("_rank_local_no_eplb"):
+        source = value.removesuffix("_rank_local_no_eplb")
+        for candidate_phase in ("context", "generation"):
+            marker = f"_{candidate_phase}"
+            if source.endswith(marker):
+                return source.removesuffix(marker), candidate_phase, False
+        return source, phase, False
+    if value.endswith("_rank_local_eplb"):
+        source = value.removesuffix("_rank_local_eplb")
+        for candidate_phase in ("context", "generation"):
+            marker = f"_{candidate_phase}"
+            if source.endswith(marker):
+                return source.removesuffix(marker), candidate_phase, True
+        return source, phase, True
+
+    # Backward compatibility for rows produced before the descriptive naming
+    # convention was introduced.
+    marker = "_rank_local_eplb"
+    if marker in value:
+        source, raw_eplb = value.rsplit(marker, 1)
+        if raw_eplb in ("0", "1"):
+            return source, phase, raw_eplb == "1"
+    return None
+
+
+def _public_distribution_for_output(
+    distributed: str,
+    power_law_alpha: float | None,
+) -> tuple[str, str]:
+    replay_spec = _parse_rank_local_distribution(distributed)
+    if replay_spec is None:
+        return (
+            "power_law_" + str(power_law_alpha) if distributed == "power_law" else distributed,
+            "",
+        )
+    _, phase, enable_eplb = replay_spec
+    return _public_recorded_distribution(enable_eplb), phase
 
 
 def _resolve_recorded_distribution_file() -> str:
@@ -390,10 +554,25 @@ def get_moe_test_cases():
 
     test_cases = []
     recorded_requested = _env_str_set("COLLECTOR_MOE_DISTRIBUTIONS") or set()
+    requested_moe_types = _env_str_set("COLLECTOR_MOE_TYPES")
+    requested_tp_sizes = _env_int_set("COLLECTOR_MOE_TP_SIZES")
+    requested_ep_sizes = _env_int_set("COLLECTOR_MOE_EP_SIZES")
+    requested_tokens = _env_int_set("COLLECTOR_MOE_TOKENS")
+    requested_recorded_tokens = (
+        _env_int_set("COLLECTOR_MOE_RECORDED_TOKENS")
+        or _env_int_set("COLLECTOR_MOE_RANK_LOCAL_REPLAY_TOKENS")
+        or requested_tokens
+    )
     include_recorded = "recorded" in recorded_requested or (
         not recorded_requested and _has_recorded_distribution_file()
     )
+    include_rank_local_replay = (
+        not recorded_requested
+        or "recorded" in recorded_requested
+        or "rank_local_replay" in recorded_requested
+    )
     seen_recorded_cases = set()
+    seen_rank_local_replay_cases = set()
 
     for common_moe_testcase in get_common_moe_test_cases():
         model_name = common_moe_testcase.model_name
@@ -410,9 +589,36 @@ def get_moe_test_cases():
         elif sm_version >= 120 and model_name in _SM120_NEMOTRON_NVFP4_MODELS:
             model_moe_list = [*model_moe_list, "nvfp4"]
 
-        num_tokens_list = [num_tokens for num_tokens in common_moe_testcase.num_tokens_list if num_tokens <= 20480]
+        base_num_tokens_list = [
+            num_tokens
+            for num_tokens in common_moe_testcase.num_tokens_list
+            if num_tokens <= 20480
+        ]
+        num_tokens_set = set(base_num_tokens_list)
+        if include_rank_local_replay:
+            replay_tokens = _rank_local_replay_tokens(
+                ep_size=common_moe_testcase.ep,
+                num_experts=common_moe_testcase.num_experts,
+            )
+            if requested_recorded_tokens is not None:
+                replay_tokens = replay_tokens.intersection(requested_recorded_tokens)
+            num_tokens_set.update(token for token in replay_tokens if token <= 20480)
+        num_tokens_list = sorted(num_tokens_set)
 
         for moe_type, num_tokens in itertools.product(model_moe_list, num_tokens_list):
+            if requested_moe_types is not None and moe_type not in requested_moe_types:
+                continue
+            base_token_requested = (
+                requested_tokens is None or int(num_tokens) in requested_tokens
+            )
+            recorded_token_requested = (
+                requested_recorded_tokens is None
+                or int(num_tokens) in requested_recorded_tokens
+            )
+            if requested_tp_sizes is not None and int(common_moe_testcase.tp) not in requested_tp_sizes:
+                continue
+            if requested_ep_sizes is not None and int(common_moe_testcase.ep) not in requested_ep_sizes:
+                continue
             if not moe_model_allows_quantization("sglang", model_name, moe_type):
                 continue
             is_native_dsv4 = model_name.startswith("deepseek-ai/DeepSeek-V4-")
@@ -817,8 +1023,45 @@ def get_moe_test_cases():
                 swiglu_limit,
             ]
             base_distribution = common_moe_testcase.token_expert_distribution
-            if not recorded_requested or base_distribution in recorded_requested:
+            if base_token_requested and (
+                not recorded_requested or base_distribution in recorded_requested
+            ):
                 test_cases.append(base_case)
+
+            if include_rank_local_replay and recorded_token_requested:
+                for replay_distribution in _rank_local_replay_distributions(
+                    num_tokens=num_tokens,
+                    ep_size=common_moe_testcase.ep,
+                    num_experts=common_moe_testcase.num_experts,
+                ):
+                    if moe_type == "int4_wo" and common_moe_testcase.ep >= 8:
+                        # The Marlin W4A16 MoE kernel does not accept a
+                        # rank-local replay batch whose local M is zero
+                        # (Invalid MNK=[0, ...]).  Sparse recorded dummy
+                        # distributions can legitimately produce an empty
+                        # local-rank workload at larger EP.  Keep these cases
+                        # out of the generic MoE collection plan; WideEP/DeepEP
+                        # calibration uses the fp8 wideep_moe collector path.
+                        continue
+                    replay_key = (
+                        moe_type,
+                        num_tokens,
+                        common_moe_testcase.hidden_size,
+                        common_moe_testcase.inter_size,
+                        common_moe_testcase.topk,
+                        common_moe_testcase.num_experts,
+                        common_moe_testcase.tp,
+                        common_moe_testcase.ep,
+                        common_moe_testcase.model_name,
+                        replay_distribution,
+                    )
+                    if replay_key in seen_rank_local_replay_cases:
+                        continue
+                    seen_rank_local_replay_cases.add(replay_key)
+                    replay_case = list(base_case)
+                    replay_case[9] = replay_distribution
+                    replay_case[10] = 0
+                    test_cases.append(replay_case)
 
             recorded_key = (
                 moe_type,
@@ -833,6 +1076,7 @@ def get_moe_test_cases():
             )
             if (
                 include_recorded
+                and recorded_token_requested
                 and recorded_key not in seen_recorded_cases
                 and _recorded_distribution_has_case(
                     num_tokens,
@@ -883,6 +1127,7 @@ def benchmark_config(
     moe_tp_size: int = 1,
     moe_ep_size: int = 1,
     model_name: str = "",
+    phase: str = "generation",
 ) -> float:
     device = torch.device("cuda")
     use_mxfp4_moe = use_mxfp4_w4a16 or use_mxfp4_w4a8
@@ -1413,6 +1658,7 @@ def benchmark_config(
         num_warmups=5,
         num_runs=num_iters,
         repeat_n=1,
+        use_cuda_graph=_use_cuda_graph_for_phase(phase),
         # sglang >=0.5.10 adds @torch.compile paths inside fused_experts_impl
         # (moe_sum_reduce_torch_compile) that can hang during CUDA graph capture.
         # allow_graph_fail gracefully falls back to eager execution.
@@ -1463,6 +1709,7 @@ def benchmark(
     moe_tp_size: int = 1,
     moe_ep_size: int = 1,
     model_name: str = "",
+    phase: str = "generation",
 ) -> tuple[dict[str, int], float]:
     torch.cuda.manual_seed_all(0)
     benchmark_num_tokens = (
@@ -1497,6 +1744,7 @@ def benchmark(
             moe_tp_size=moe_tp_size,
             moe_ep_size=moe_ep_size,
             model_name=model_name,
+            phase=phase,
         )
         return kernel_time, power_stats
 
@@ -1548,6 +1796,7 @@ def benchmark(
         moe_tp_size=moe_tp_size,
         moe_ep_size=moe_ep_size,
         model_name=model_name,
+        phase=phase,
     )
     return kernel_time, power_stats
 
@@ -1556,6 +1805,283 @@ class Rank0Workload(TypedDict):
     hidden_states: torch.Tensor
     topk_output: StandardTopKOutput
     masked_m: torch.Tensor
+
+
+def _keep_aic_latency_sources() -> bool:
+    for name in (
+        "COLLECTOR_DSV3_KEEP_LATENCY_SOURCES",
+        "COLLECTOR_DSV3_KEEP_MATERIALIZED_SOURCES",
+    ):
+        value = os.environ.get(name)
+        if value is not None:
+            return value.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
+def _mean_float(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def _p90_float(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, math.ceil(0.9 * len(ordered)) - 1))
+    return float(ordered[index])
+
+
+def _rank_local_replay_source_features(
+    rank_results: list[tuple[float, dict | None]],
+    replay_rank_workloads: list[list[Rank0Workload]],
+) -> dict[str, object]:
+    latencies = [float(result[0]) for result in rank_results]
+    max_latency = max(latencies) if latencies else 0.0
+    max_rank = latencies.index(max_latency) if latencies else -1
+
+    rank_workload_counts: list[float] = []
+    rank_rows_max: list[float] = []
+    rank_rows_sum: list[float] = []
+    rank_masked_m_max: list[float] = []
+    rank_active_experts_max: list[float] = []
+    rank_assignments_max: list[float] = []
+    for workloads in replay_rank_workloads:
+        rank_workload_counts.append(float(len(workloads)))
+        row_counts = [float(workload["hidden_states"].shape[0]) for workload in workloads]
+        masked_max_values: list[float] = []
+        active_expert_values: list[float] = []
+        assignment_values: list[float] = []
+        for workload in workloads:
+            masked_m = workload["masked_m"]
+            if masked_m.numel() == 0:
+                masked_max_values.append(0.0)
+                active_expert_values.append(0.0)
+                assignment_values.append(0.0)
+                continue
+            masked_max_values.append(float(masked_m.max().item()))
+            active_expert_values.append(float((masked_m > 0).sum().item()))
+            assignment_values.append(float(masked_m.sum().item()))
+
+        rank_rows_max.append(max(row_counts) if row_counts else 0.0)
+        rank_rows_sum.append(sum(row_counts))
+        rank_masked_m_max.append(max(masked_max_values) if masked_max_values else 0.0)
+        rank_active_experts_max.append(max(active_expert_values) if active_expert_values else 0.0)
+        rank_assignments_max.append(max(assignment_values) if assignment_values else 0.0)
+
+    return {
+        "ordinary_rank_local_latency_mean": _mean_float(latencies),
+        "ordinary_rank_local_latency_p90": _p90_float(latencies),
+        "ordinary_rank_local_latency_max": max_latency,
+        "ordinary_rank_local_latency_min": min(latencies) if latencies else 0.0,
+        "ordinary_rank_local_latency_max_rank": max_rank,
+        "ordinary_rank_local_latency_spread": (max_latency - min(latencies)) if latencies else 0.0,
+        "ordinary_rank_local_workload_count_mean": _mean_float(rank_workload_counts),
+        "ordinary_rank_local_rows_max": max(rank_rows_max) if rank_rows_max else 0.0,
+        "ordinary_rank_local_rows_mean": _mean_float(rank_rows_max),
+        "ordinary_rank_local_rows_sum_mean": _mean_float(rank_rows_sum),
+        "ordinary_rank_local_masked_m_max": max(rank_masked_m_max) if rank_masked_m_max else 0.0,
+        "ordinary_rank_local_active_experts_max": max(rank_active_experts_max) if rank_active_experts_max else 0.0,
+        "ordinary_rank_local_assignments_max": max(rank_assignments_max) if rank_assignments_max else 0.0,
+        "ordinary_rank_local_measurement_scope": "single_card_rank_local_replay",
+    }
+
+
+def _pack_rank_local_replay_for_ordinary_moe(
+    local_topk_ids: torch.Tensor,
+    *,
+    table_num_tokens: int,
+    phase: str,
+    topk: int,
+    moe_ep_size: int,
+) -> torch.Tensor:
+    """Convert assignment-expanded replay rows to ordinary fused-MoE token rows.
+
+    WideEP/DeepEP replay is post-dispatch and may represent one received
+    assignment per row.  Ordinary fused MoE expects rank-local token rows:
+    only tokens that route to this local expert slice are materialized, with
+    local expert IDs in the top-k columns.  This matches build_rank0_workloads()
+    for balanced/power_law, which applies a token_mask before benchmarking.
+    """
+
+    local_topk_ids = local_topk_ids.to(dtype=torch.int32).contiguous()
+    if local_topk_ids.numel() == 0:
+        return local_topk_ids
+
+    def apply_generation_decode_cap(rows: int) -> int:
+        if phase != "generation" or int(table_num_tokens) <= int(
+            os.environ.get("COLLECTOR_ORDINARY_MOE_DECODE_CHUNK_MIN_TOKENS", "512")
+        ):
+            return rows
+        decode_cap = max(
+            1,
+            int(os.environ.get("COLLECTOR_ORDINARY_MOE_DECODE_CHUNK_ROWS", "4096")),
+        )
+        local_decode_rows = int(
+            math.ceil(int(table_num_tokens) / max(1, int(moe_ep_size)))
+        )
+        return min(rows, local_decode_rows, decode_cap)
+
+    valid_per_row = (local_topk_ids >= 0).sum(dim=1)
+    is_assignment_expanded = bool(int(valid_per_row.max().item()) <= 1)
+    if not is_assignment_expanded:
+        target_rows = apply_generation_decode_cap(int(local_topk_ids.shape[0]))
+        if target_rows >= int(local_topk_ids.shape[0]):
+            return local_topk_ids
+        return local_topk_ids[:target_rows].contiguous()
+
+    current_rows = int(local_topk_ids.shape[0])
+    if int(moe_ep_size) <= 1:
+        estimated_local_token_rows = int(table_num_tokens)
+    else:
+        # Profile-free estimate of how many global token rows have at least
+        # one of their top-k experts on a given EP rank.  It is the same
+        # pre-dispatch token-row semantics as the balanced/power_law rank0
+        # path, without using server/profile truth.
+        local_hit_probability = 1.0 - (1.0 - 1.0 / float(moe_ep_size)) ** int(topk)
+        estimated_local_token_rows = int(round(int(table_num_tokens) * local_hit_probability))
+    target_rows = min(max(1, estimated_local_token_rows), current_rows)
+    target_rows = apply_generation_decode_cap(target_rows)
+    if current_rows <= target_rows and int(moe_ep_size) > 1:
+        return local_topk_ids
+
+    valid_ids = local_topk_ids[local_topk_ids >= 0].flatten()
+    output = torch.full(
+        (target_rows, int(topk)),
+        -1,
+        dtype=torch.int32,
+        device=local_topk_ids.device,
+    )
+    if valid_ids.numel() == 0:
+        return output
+
+    capacity = target_rows * int(topk)
+    valid_ids = valid_ids[:capacity]
+    row_ids = torch.arange(
+        int(valid_ids.numel()),
+        device=local_topk_ids.device,
+        dtype=torch.long,
+    )
+    output[row_ids // int(topk), row_ids % int(topk)] = valid_ids.to(torch.int32)
+    return output.contiguous()
+
+
+def build_replay_rank_workloads(
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    topk: int,
+    num_experts: int,
+    moe_ep_size: int,
+    distributed: str,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> list[list[Rank0Workload]]:
+    replay_spec = _parse_rank_local_distribution(distributed)
+    if replay_spec is None:
+        raise ValueError(f"Not a rank-local replay distribution: {distributed}")
+    source, phase, enable_eplb = replay_spec
+    replay_dir = _get_rank_local_replay_dir()
+    if replay_dir is None:
+        raise FileNotFoundError("No rank-local MoE replay directory found")
+
+    with (replay_dir / RANK_LOCAL_REPLAY_MANIFEST).open(
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        matching_rows = [
+            row
+            for row in csv.DictReader(f)
+            if row.get("phase") == phase
+            and int(row.get("num_tokens", -1)) == int(num_tokens)
+            and int(row.get("requested_ep_size", -1)) == int(moe_ep_size)
+            and int(row.get("num_experts", -1)) == int(num_experts)
+            and row.get("workload_source", "runtime") == source
+            and (
+                str(row.get("enable_eplb", "")).lower() in ("1", "true")
+            )
+            == enable_eplb
+        ]
+    if not matching_rows:
+        raise FileNotFoundError(
+            f"No ordinary MoE replay for tokens={num_tokens}, ep={moe_ep_size}, "
+            f"experts={num_experts}, source={source}, eplb={enable_eplb}"
+        )
+    layer_id = max(int(row["layer_id"]) for row in matching_rows)
+    materialization_methods = {
+        row.get("materialization_method", "") for row in matching_rows
+    }
+    use_ordinary_token_replay = materialization_methods == {
+        "single_card_deterministic_router_layout"
+    }
+    if use_ordinary_token_replay and os.environ.get(
+        "COLLECTOR_ORDINARY_MOE_SYNTHETIC_REPLAY_FALLBACK",
+        "false",
+    ).lower() in ("1", "true", "yes"):
+        raise RuntimeError(
+            "Synthetic ordinary MoE replay fallback was removed from the default "
+            "path; consume the materialized rank-local replay bundle instead."
+        )
+    samples = select_replay_workloads(
+        replay_dir=replay_dir,
+        phase=phase,
+        table_num_tokens=num_tokens,
+        layer_id=layer_id,
+        ep_size=moe_ep_size,
+        num_experts=num_experts,
+        enable_eplb=enable_eplb,
+        workload_source=source,
+    )
+
+    rank_workloads: list[list[Rank0Workload]] = [
+        [] for _ in range(moe_ep_size)
+    ]
+    for sample in samples:
+        for workload in sample:
+            local_topk_ids = workload.local_topk_ids.to(
+                device=device,
+                dtype=torch.int32,
+            )
+            local_topk_ids = _pack_rank_local_replay_for_ordinary_moe(
+                local_topk_ids,
+                table_num_tokens=num_tokens,
+                phase=phase,
+                topk=topk,
+                moe_ep_size=moe_ep_size,
+            )
+            topk_weights = torch.where(
+                local_topk_ids >= 0,
+                torch.full_like(
+                    local_topk_ids,
+                    1.0 / max(1, topk),
+                    dtype=torch.float32,
+                ),
+                torch.zeros_like(local_topk_ids, dtype=torch.float32),
+            )
+            rank_workloads[workload.rank].append(
+                {
+                    "hidden_states": torch.randn(
+                        int(local_topk_ids.shape[0]),
+                        hidden_size,
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "topk_output": StandardTopKOutput(
+                        topk_weights=topk_weights,
+                        topk_ids=local_topk_ids,
+                        router_logits=torch.empty(
+                            (int(local_topk_ids.shape[0]), 0),
+                            dtype=torch.float32,
+                            device=device,
+                        ),
+                    ),
+                    "masked_m": workload.masked_m.to(
+                        device=device,
+                        dtype=torch.int32,
+                    ),
+                }
+            )
+    return rank_workloads
 
 
 def build_rank0_workloads(
@@ -1673,7 +2199,22 @@ def run_moe_torch(
         block_shape = None
 
     rank0_workloads: list[Rank0Workload] | None = None
-    if moe_ep_size > 1 and distributed in ("power_law", "balanced", "recorded") and not use_mxfp4_moe:
+    replay_spec = _parse_rank_local_distribution(distributed)
+    replay_rank_workloads: list[list[Rank0Workload]] | None = None
+    if replay_spec is not None:
+        if use_mxfp4_moe:
+            raise ValueError("MXFP4 MoE does not support rank-local replay")
+        replay_rank_workloads = build_replay_rank_workloads(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            topk=topk,
+            num_experts=num_experts,
+            moe_ep_size=moe_ep_size,
+            distributed=distributed,
+            dtype=torch.bfloat16,
+            device=torch.device(device),
+        )
+    elif moe_ep_size > 1 and distributed in ("power_law", "balanced", "recorded") and not use_mxfp4_moe:
         rank0_workloads = build_rank0_workloads(
             num_workloads=5,
             num_tokens=num_tokens,
@@ -1687,7 +2228,50 @@ def run_moe_torch(
             device=torch.device(device),
         )
 
-    if rank0_workloads is not None:
+    output_distribution, output_phase = _public_distribution_for_output(
+        distributed,
+        power_law_alpha,
+    )
+
+    if replay_rank_workloads is not None:
+        rank_results = []
+        for rank, workloads in enumerate(replay_rank_workloads):
+            if not workloads:
+                raise ValueError(f"Replay has no workloads for rank={rank}")
+            rank_results.append(
+                benchmark(
+                    num_tokens,
+                    num_local_experts,
+                    2 * inter_size // moe_tp_size,
+                    hidden_size,
+                    topk,
+                    torch.bfloat16,
+                    moe_type == "fp8_block",
+                    False,
+                    False,
+                    use_nvfp4=use_nvfp4_kernel,
+                    use_trtllm_bf16_fp4=use_trtllm_bf16_fp4,
+                    use_int4_w4a16=use_int4_w4a16,
+                    use_mxfp4_w4a16=False,
+                    use_mxfp4_w4a8=False,
+                    block_shape=block_shape,
+                    distributed=distributed,
+                    power_law_alpha=power_law_alpha,
+                    workloads=workloads,
+                    swiglu_limit=swiglu_limit,
+                    moe_tp_size=moe_tp_size,
+                    moe_ep_size=moe_ep_size,
+                    model_name=model_name,
+                    phase=output_phase,
+                )
+            )
+        latency, power_stats = max(rank_results, key=lambda result: result[0])
+        rank_local_source_features = (
+            _rank_local_replay_source_features(rank_results, replay_rank_workloads)
+            if _keep_aic_latency_sources()
+            else {}
+        )
+    elif rank0_workloads is not None:
         latency, power_stats = benchmark(
             num_tokens,
             num_local_experts,
@@ -1711,7 +2295,9 @@ def run_moe_torch(
             moe_tp_size=moe_tp_size,
             moe_ep_size=moe_ep_size,
             model_name=model_name,
+            phase=output_phase,
         )
+        rank_local_source_features = {}
     else:
         latency, power_stats = benchmark(
             num_tokens,
@@ -1735,23 +2321,27 @@ def run_moe_torch(
             moe_tp_size=moe_tp_size,
             moe_ep_size=moe_ep_size,
             model_name=model_name,
+            phase=output_phase,
         )
+        rank_local_source_features = {}
+
+    perf_item = {
+        "moe_dtype": moe_type,
+        "num_tokens": num_tokens,
+        "hidden_size": hidden_size,
+        "inter_size": inter_size,
+        "topk": topk,
+        "num_experts": num_experts,
+        "moe_tp_size": moe_tp_size,
+        "moe_ep_size": moe_ep_size,
+        "distribution": output_distribution,
+        "phase": output_phase,
+        "latency": latency,
+    }
+    perf_item.update(rank_local_source_features)
 
     log_perf(
-        item_list=[
-            {
-                "moe_dtype": moe_type,
-                "num_tokens": num_tokens,
-                "hidden_size": hidden_size,
-                "inter_size": inter_size,
-                "topk": topk,
-                "num_experts": num_experts,
-                "moe_tp_size": moe_tp_size,
-                "moe_ep_size": moe_ep_size,
-                "distribution": "power_law_" + str(power_law_alpha) if distributed == "power_law" else distributed,
-                "latency": latency,
-            }
-        ],
+        item_list=[perf_item],
         framework="SGLang",
         version=pkg_resources.get_distribution("sglang").version,
         device_name=torch.cuda.get_device_name(device),

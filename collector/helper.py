@@ -677,67 +677,84 @@ def log_perf(
     power_stats: dict | None = None,
 ):
     lock_file = perf_filename + ".lock"
-
-    # Try for 1 sec (10 * 0.1s)
+    lock_timeout_s = float(os.environ.get("COLLECTOR_PERF_LOCK_TIMEOUT_S", "120"))
+    stale_lock_s = float(os.environ.get("COLLECTOR_PERF_LOCK_STALE_S", "1800"))
+    retry_interval_s = float(os.environ.get("COLLECTOR_PERF_LOCK_RETRY_INTERVAL_S", "0.1"))
+    deadline = time.monotonic() + lock_timeout_s
     got_lock = False
-    for _ in range(10):
+    lock_token = f"pid={os.getpid()} time={time.time()}\n"
+    while time.monotonic() < deadline:
         try:
             fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
+            with os.fdopen(fd, "w") as f:
+                f.write(lock_token)
             got_lock = True
             break
-        except OSError:
-            time.sleep(0.1)
+        except FileExistsError:
+            try:
+                lock_age_s = time.time() - os.path.getmtime(lock_file)
+                if stale_lock_s > 0 and lock_age_s > stale_lock_s:
+                    os.unlink(lock_file)
+                    continue
+            except FileNotFoundError:
+                continue
+            time.sleep(retry_interval_s)
 
     if not got_lock:
-        print(f"Skipping log: can not get lock for {perf_filename}")
-        return
+        raise TimeoutError(
+            f"Timed out after {lock_timeout_s:.1f}s waiting for perf log lock: {lock_file}"
+        )
 
     try:
-        with open(perf_filename, "a", newline="") as f:
-            # Add header only if file is empty
-            is_empty = os.fstat(f.fileno()).st_size == 0
+        base_data = {
+            "framework": framework,
+            "version": version,
+            "device": device_name,
+            "op_name": op_name,
+            "kernel_source": kernel_source,
+        }
 
-            base_data = {
-                "framework": framework,
-                "version": version,
-                "device": device_name,
-                "op_name": op_name,
-                "kernel_source": kernel_source,
-            }
-
-            # Get headers from first item if exists
-            fieldnames = list(base_data.keys())
-            if item_list:
-                fieldnames += list(item_list[0].keys())
-            # Add power_stats keys if present
+        new_rows = []
+        for item in item_list:
+            row = base_data | item
             if power_stats:
                 for key in ["power", "power_limit"]:
-                    if key not in fieldnames:
-                        fieldnames.append(key)
+                    row[key] = power_stats.get(key, "")
+            new_rows.append(row)
 
+        existing_rows = []
+        fieldnames = []
+        if os.path.exists(perf_filename) and os.path.getsize(perf_filename) > 0:
+            with open(perf_filename, newline="") as f:
+                reader = csv.DictReader(f)
+                fieldnames = list(reader.fieldnames or ())
+                existing_rows = list(reader)
+
+        for row in [*existing_rows, *new_rows]:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+
+        with open(perf_filename, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
-
-            if is_empty:
-                writer.writeheader()
-
-            for item in item_list:
-                row = base_data | item
-                # Add power_stats values if present
-                if power_stats:
-                    for key in ["power", "power_limit"]:
-                        row[key] = power_stats.get(key, "")
-                writer.writerow(row)
+            writer.writeheader()
+            writer.writerows(existing_rows)
+            writer.writerows(new_rows)
 
             # Force disk write (for NFS)
             f.flush()
             os.fsync(f.fileno())
     except Exception as e:
-        print(f"Error writing log: {e}")
+        raise RuntimeError(f"Error writing perf log {perf_filename}: {e}") from e
     finally:
-        # Delete the lock file, even if writing crashed
-        if got_lock and os.path.exists(lock_file):
-            os.unlink(lock_file)
+        if got_lock:
+            try:
+                with open(lock_file, encoding="utf-8") as f:
+                    current_token = f.read()
+                if current_token == lock_token:
+                    os.unlink(lock_file)
+            except FileNotFoundError:
+                pass
 
 
 def convert_perf_csv_to_parquet(

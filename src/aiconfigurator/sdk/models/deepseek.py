@@ -13,6 +13,12 @@ from aiconfigurator.sdk.models.helpers import calc_expectation
 logger = logging.getLogger(__name__)
 
 
+def _recorded_distribution_name(distribution: str, *, enable_eplb: bool) -> str:
+    if distribution == "recorded":
+        return "recorded_eplb" if enable_eplb else "recorded_no_eplb"
+    return distribution
+
+
 @register_model("DEEPSEEK", "KIMIK25")
 class DeepSeekModel(BaseModel):
     """
@@ -596,7 +602,10 @@ class TrtllmWideEPDeepSeekModel(BaseModel):
             else:
                 workload_distribution = f"{self.config.workload_distribution}_{self._power_law_alpha}"
         else:
-            workload_distribution = self.config.workload_distribution
+            workload_distribution = _recorded_distribution_name(
+                self.config.workload_distribution,
+                enable_eplb=eplb_enabled,
+            )
 
         # ===================== WideEP Configuration Validation =====================
         # Based on TensorRT-LLM WideEPMoE constraints (fused_moe_wide_ep.py)
@@ -1051,12 +1060,18 @@ class WideEPDeepSeekModel(BaseModel):
         context_workload_distribution = (
             self.config.workload_distribution + f"_{self._power_law_alpha_prefill}"
             if self.config.workload_distribution == "power_law"
-            else self.config.workload_distribution
+            else _recorded_distribution_name(
+                self.config.workload_distribution,
+                enable_eplb=self.config.enable_eplb,
+            )
         )
         generation_workload_distribution = (
             self.config.workload_distribution + f"_{self._power_law_alpha_decode}"
             if self.config.workload_distribution == "power_law"
-            else self.config.workload_distribution
+            else _recorded_distribution_name(
+                self.config.workload_distribution,
+                enable_eplb=False,
+            )
         )
 
         sms = self.config.sms

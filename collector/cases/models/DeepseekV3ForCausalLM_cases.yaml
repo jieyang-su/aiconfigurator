@@ -26,6 +26,24 @@ model_case_values:
       topk: 8
       num_experts: 256
       wideep: true
+      token_counts:
+        - 8
+        - 32
+        - 64
+        - 128
+        - 512
+        - 640
+        - 1536
+        - 2048
+        - 2560
+        - 4096
+        - 5120
+        - 8192
+        - 10240
+        - 12288
+        - 14336
+        - 16384
+        - 18888
   mla:
     - model_paths:
         - deepseek-ai/DeepSeek-R1

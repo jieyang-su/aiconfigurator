@@ -78,9 +78,16 @@ def get_base_framework_op_case_specs(backend: str, op_name: str) -> list[dict[st
     return [case for case in cases if isinstance(case, dict)]
 
 
+def _legacy_base_op_cases() -> set[str]:
+    raw = os.environ.get("COLLECTOR_LEGACY_BASE_OP_CASES", "")
+    return {item.strip() for item in raw.replace(",", " ").split() if item.strip()}
+
+
 def get_merged_base_op_case_specs(backend: str, op_name: str) -> list[dict[str, object]]:
     """Return base op specs with backend-specific overrides applied by case id."""
     merged_cases = [copy.deepcopy(case) for case in get_base_op_case_specs(op_name)]
+    if op_name in _legacy_base_op_cases():
+        return merged_cases
     index_by_id = {case.get("id"): index for index, case in enumerate(merged_cases) if case.get("id")}
 
     for override in get_base_framework_op_case_specs(backend, op_name):
@@ -900,7 +907,7 @@ def get_moe_backend_test_cases(backend: str) -> list[MoeCommonTestCase]:
 
 def get_common_moe_test_cases():
     moe_sweep = _required_base_common_case_values("moe")
-    num_tokens = _as_int_list(moe_sweep.get("token_counts"), field_name="moe.token_counts")
+    base_num_tokens = _as_int_list(moe_sweep.get("token_counts"), field_name="moe.token_counts")
     tp_list = _as_int_list(moe_sweep.get("tensor_parallel_sizes"), field_name="moe.tensor_parallel_sizes")
     ep_list = _as_int_list(moe_sweep.get("expert_parallel_sizes"), field_name="moe.expert_parallel_sizes")
     num_gpu_list = _as_int_list(moe_sweep.get("gpu_counts"), field_name="moe.gpu_counts")
@@ -928,6 +935,10 @@ def get_common_moe_test_cases():
         topk = int(model_config["topk"])
         num_experts = int(model_config["num_experts"])
         model_name = str(model_config["model_path"])
+        num_tokens = _as_int_list(
+            model_config.get("token_counts", base_num_tokens),
+            field_name=f"model_case_values.moe.{model_name}.token_counts",
+        )
 
         max_tp_exclusive = model_config.get("max_tp_exclusive")
         if max_tp_exclusive is not None and tp >= int(max_tp_exclusive):

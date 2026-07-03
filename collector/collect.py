@@ -75,6 +75,10 @@ import json
 import multiprocessing as mp
 import pstats
 import signal
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 import traceback
 from collections import Counter
@@ -95,6 +99,34 @@ from helper import (
 logger = None
 RESUME_SCHEMA_VERSION = "collector-resume-v1"
 STALL_THRESHOLD = 30  # iterations (x 0.5 s sleep = 15 s) before stall bailout
+
+_DYNAMIC_FALSE_VALUES = {"0", "false", "no", "off"}
+_DSV3_LATENCY_WORKSPACE_ENV = "COLLECTOR_DSV3_LATENCY_WORKSPACE_DIR"
+
+_DSEEK_V3_EP8_CONTEXT_TOKENS = "8 16 32 64 128 512 640 1536 2048 2560 4096 5120 8192 10240 12288 14336 16384"
+_DSEEK_V3_EP8_GENERATION_TOKENS = "8 32 40 64 128 288 512 896 1024"
+_DSEEK_V3_ORDINARY_MOE_TOKENS = (
+    "1 2 4 8 32 40 64 128 288 512 640 896 1024 "
+    "1536 2048 2560 4096 5120 8192 10240 12288 14336 16384"
+)
+_DSEEK_V3_ORDINARY_MOE_REPLAY_TOKENS = (
+    "1 2 4 8 16 32 40 64 128 288 512 640 896 1024 "
+    "1536 2048 2560 4096 5120 8192 10240 12288 14336 16384"
+)
+_DSEEK_V3_RECORDED_MOE_EP_SIZES = "1,2,4,8,16,32"
+_DSEEK_V3_MOE_DISTRIBUTION_GENERATION_TOKENS = (
+    "8 32 40 64 128 288 512 640 896 1024 "
+    "1536 2048 2560 4096 5120 8192 10240 12288 14336 16384"
+)
+_DSEEK_V3_ORDINARY_MOE_RECORDED_TOKENS = (
+    "1 2 4 8 32 40 64 128 288 512 640 896 1024 "
+    "1536 2048 2560 4096 5120 8192 10240 12288 14336 16384"
+)
+_DSEEK_V3_LEGACY_BASE_OP_CASES = (
+    "attention_context",
+    "attention_encoder",
+    "attention_generation",
+)
 
 
 def _require_torch():
@@ -139,6 +171,958 @@ def _perf_output_roots() -> list[Path]:
             seen.add(resolved)
             unique_roots.append(root)
     return unique_roots
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _resolve_recorded_materialization_source_path(
+    *,
+    env_names: tuple[str, ...],
+    run_dir: Path,
+    phase: str,
+) -> Path | None:
+    for env_name in env_names:
+        override = os.environ.get(env_name, "").strip()
+        if override:
+            return Path(override).resolve()
+    filename = (
+        "wideep_context_moe_perf.txt"
+        if phase == "context"
+        else "wideep_generation_moe_perf.txt"
+    )
+    raw_source = _dsv3_latency_source_root(run_dir) / "raw_collector_source" / filename
+    if raw_source.exists():
+        return raw_source.resolve()
+    return (run_dir / filename).resolve()
+
+
+def _bool_env_enabled(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in _DYNAMIC_FALSE_VALUES
+
+
+def _keep_dsv3_latency_sources() -> bool:
+    """Keep raw/materialized AIC MoE sources for offline latency experiments.
+
+    The newer name describes the intended use more clearly: these files are
+    not validation truth, but collector-owned inputs for trying alternate
+    latency source selection.  Keep the historical env var as a compatibility
+    alias for existing scripts.
+    """
+
+    if "COLLECTOR_DSV3_KEEP_LATENCY_SOURCES" in os.environ:
+        return _bool_env_enabled("COLLECTOR_DSV3_KEEP_LATENCY_SOURCES", False)
+    return _bool_env_enabled("COLLECTOR_DSV3_KEEP_MATERIALIZED_SOURCES", False)
+
+
+def _keep_dsv3_materialized_sources() -> bool:
+    return _keep_dsv3_latency_sources()
+
+
+def _dsv3_clean_latency_enabled() -> bool:
+    return _bool_env_enabled("COLLECTOR_DSV3_CLEAN_LATENCY", True)
+
+
+def _dsv3_latency_source_root(run_dir: Path) -> Path:
+    workspace = os.environ.get(_DSV3_LATENCY_WORKSPACE_ENV, "").strip()
+    if workspace:
+        return Path(workspace).resolve()
+    return run_dir
+
+
+def _capture_dsv3_latency_sources(run_dir: Path) -> bool:
+    return _keep_dsv3_latency_sources() or _dsv3_latency_source_root(run_dir) != run_dir
+
+
+@contextlib.contextmanager
+def _dsv3_latency_workspace(args, ops: list[str] | None, run_dir: Path):
+    if (
+        not _is_deepseek_v3_ep8_flow(args, ops)
+        or not _dsv3_clean_latency_enabled()
+        or _keep_dsv3_latency_sources()
+    ):
+        yield
+        return
+
+    previous = os.environ.get(_DSV3_LATENCY_WORKSPACE_ENV)
+    with tempfile.TemporaryDirectory(prefix="dsv3_latency_sources_") as tmp_dir:
+        os.environ[_DSV3_LATENCY_WORKSPACE_ENV] = tmp_dir
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop(_DSV3_LATENCY_WORKSPACE_ENV, None)
+            else:
+                os.environ[_DSV3_LATENCY_WORKSPACE_ENV] = previous
+
+
+@contextlib.contextmanager
+def _dsv3_materialized_source_dir(run_dir: Path, dirname: str):
+    if _keep_dsv3_materialized_sources():
+        path = run_dir / dirname
+        path.mkdir(parents=True, exist_ok=True)
+        yield path
+        return
+    workspace_root = _dsv3_latency_source_root(run_dir)
+    if workspace_root != run_dir:
+        path = workspace_root / dirname
+        path.mkdir(parents=True, exist_ok=True)
+        yield path
+        return
+    with tempfile.TemporaryDirectory(prefix=f"{dirname}_") as tmp_dir:
+        yield Path(tmp_dir)
+
+
+def _preserve_raw_collector_file(run_dir: Path, path: Path) -> None:
+    """Save the pre-materialization collector output once per run."""
+
+    if not _capture_dsv3_latency_sources(run_dir):
+        return
+    if not path.exists():
+        return
+    raw_dir = _dsv3_latency_source_root(run_dir) / "raw_collector_source"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    destination = raw_dir / path.name
+    if destination.exists():
+        return
+    shutil.copy2(path, destination)
+
+
+def _preserve_dsv3_latency_source_input(
+    *,
+    run_dir: Path,
+    role: str,
+    path: Path | None,
+) -> None:
+    """Copy a source-family input used by Recorded materialization.
+
+    These files are captured into an internal temporary workspace when clean
+    latency is enabled.  They are only persisted in the run directory when
+    COLLECTOR_DSV3_KEEP_LATENCY_SOURCES is enabled.
+    """
+
+    if not _capture_dsv3_latency_sources(run_dir) or path is None or not path.exists():
+        return
+    bundle_dir = _dsv3_latency_source_root(run_dir) / "aic_latency_source_bundle" / "recorded_materialization_inputs"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    destination = bundle_dir / f"{role}{path.suffix or '.txt'}"
+    shutil.copy2(path, destination)
+
+
+def _preserve_dsv3_latency_source_manifest(
+    *,
+    run_dir: Path,
+    inputs: dict[str, Path | None],
+) -> None:
+    if not _capture_dsv3_latency_sources(run_dir):
+        return
+    bundle_dir = _dsv3_latency_source_root(run_dir) / "aic_latency_source_bundle"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema_version": 1,
+        "description": (
+            "AIC-only source files preserved for offline MoE latency source "
+            "selection. These files are not server/profile truth."
+        ),
+        "env": {
+            "COLLECTOR_DSV3_KEEP_LATENCY_SOURCES": os.environ.get(
+                "COLLECTOR_DSV3_KEEP_LATENCY_SOURCES",
+                "",
+            ),
+            "COLLECTOR_DSV3_KEEP_MATERIALIZED_SOURCES": os.environ.get(
+                "COLLECTOR_DSV3_KEEP_MATERIALIZED_SOURCES",
+                "",
+            ),
+        },
+        "recorded_materialization_inputs": {
+            role: "" if path is None else str(path)
+            for role, path in sorted(inputs.items())
+        },
+    }
+    (bundle_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _csv_ints(values: list[int]) -> str:
+    return ",".join(str(value) for value in values)
+
+
+def _visible_gpu_count_for_defaults() -> int:
+    raw = os.environ.get("COLLECTOR_MOE_DISTRIBUTION_VISIBLE_DEVICES")
+    if not raw:
+        raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw:
+        return max(1, len([item for item in raw.split(",") if item.strip()]))
+    if torch is not None and torch.cuda.is_available():
+        return max(1, int(torch.cuda.device_count() or 1))
+    return 1
+
+
+def _env_ints(name: str) -> list[int] | None:
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    return [int(item) for item in raw.replace(",", " ").split() if item.strip()]
+
+
+def _append_env_words(name: str, values: tuple[str, ...]) -> bool:
+    before = os.environ.get(name, "")
+    items = [item.strip() for item in before.replace(",", " ").split() if item.strip()]
+    changed = False
+    for value in values:
+        if value not in items:
+            items.append(value)
+            changed = True
+    if changed:
+        os.environ[name] = " ".join(items)
+    return changed
+
+
+def _is_deepseek_v3_ep8_flow(args, ops: list[str] | None) -> bool:
+    requested_ops = set(ops or [])
+    if args.backend != "sglang":
+        return False
+    model_path = (args.model_path or "").lower()
+    if "deepseek" not in model_path or "v3" not in model_path:
+        return False
+    return "moe_token_distribution" in requested_ops and (
+        "moe" in requested_ops or "wideep_moe" in requested_ops
+    )
+
+
+def _maybe_apply_deepseek_v3_ep8_defaults(args, ops: list[str] | None) -> None:
+    if not _is_deepseek_v3_ep8_flow(args, ops):
+        return
+    legacy_base_changed = _append_env_words("COLLECTOR_LEGACY_BASE_OP_CASES", _DSEEK_V3_LEGACY_BASE_OP_CASES)
+    # DeepSeek-V3 MoE calibration is profile-free by default: each requested EP
+    # shape is materialized as rank-local replay and benchmarked by a single GPU
+    # worker.  Visible GPUs may run independent cases in parallel, but no case
+    # uses multiple physical GPUs as real EP ranks unless single-GPU simulation
+    # is explicitly disabled.
+    os.environ.setdefault("COLLECTOR_DSV3_EP8_SINGLE_GPU_SIM", "true")
+    single_gpu_sim = _bool_env_enabled("COLLECTOR_DSV3_EP8_SINGLE_GPU_SIM", True)
+    if single_gpu_sim:
+        os.environ.setdefault("COLLECTOR_MOE_DISTRIBUTION_SINGLE_CARD_EP_SIM", "true")
+        os.environ.setdefault("COLLECTOR_MOE_DISTRIBUTION_MATERIALIZED_PROFILE", "deterministic")
+        if (
+            os.environ.get("COLLECTOR_MOE_DISTRIBUTION_MATERIALIZED_PROFILE", "")
+            .strip()
+            .lower()
+            != "deterministic"
+        ):
+            if logger is not None:
+                logger.warning(
+                    "Ignoring COLLECTOR_MOE_DISTRIBUTION_MATERIALIZED_PROFILE=%s; "
+                    "single-card EP simulation now only supports deterministic replay",
+                    os.environ.get("COLLECTOR_MOE_DISTRIBUTION_MATERIALIZED_PROFILE"),
+                )
+            os.environ["COLLECTOR_MOE_DISTRIBUTION_MATERIALIZED_PROFILE"] = "deterministic"
+        os.environ.setdefault("COLLECTOR_MOE_DISTRIBUTION_LOAD_FORMAT", "dummy")
+        os.environ.setdefault("COLLECTOR_MOE_DISTRIBUTION_WORKLOAD_SOURCE", "dummy")
+        os.environ.setdefault("COLLECTOR_MOE_RANK_LOCAL_REPLAY_PHASES", "context,generation")
+        os.environ.setdefault("COLLECTOR_WIDEEP_MOE_REPLAY_SOURCE", "dummy")
+        os.environ.setdefault("COLLECTOR_WIDEEP_MOE_DISTRIBUTIONS", "recorded uniform power_law")
+        os.environ.setdefault("COLLECTOR_DSV3_SINGLE_CARD_CASE_PARALLEL", "true")
+    materialized_distribution = _bool_env_enabled(
+        "COLLECTOR_MOE_DISTRIBUTION_SINGLE_CARD_EP_SIM",
+        False,
+    )
+    before = (
+        os.environ.get("COLLECTOR_MOE_DISTRIBUTION_EP_SIZES"),
+        os.environ.get("COLLECTOR_WIDEEP_MOE_EP_SIZES"),
+        os.environ.get("COLLECTOR_MOE_DISTRIBUTION_TOKENS"),
+        os.environ.get("COLLECTOR_WIDEEP_MOE_PREFILL_TOKENS"),
+        os.environ.get("COLLECTOR_MOE_DISTRIBUTION_GENERATION_TOKENS"),
+        os.environ.get("COLLECTOR_WIDEEP_MOE_DECODE_TOKENS"),
+        os.environ.get("COLLECTOR_DSV3_EP8_SINGLE_GPU_SIM"),
+        os.environ.get("COLLECTOR_MOE_DISTRIBUTION_SINGLE_CARD_EP_SIM"),
+        os.environ.get("COLLECTOR_MOE_DISTRIBUTION_MATERIALIZED_PROFILE"),
+    )
+    # Real-EP mode is retained as an explicit escape hatch.  It caps live
+    # recorder EP sizes to visible GPUs and defaults WideEP to EP8 only.
+    if single_gpu_sim and not materialized_distribution:
+        visible = _visible_gpu_count_for_defaults()
+        supported_live_eps = [ep for ep in (1, 2, 4, 8) if ep <= visible]
+        requested_live_eps = _env_ints("COLLECTOR_MOE_DISTRIBUTION_EP_SIZES")
+        if requested_live_eps is None:
+            os.environ["COLLECTOR_MOE_DISTRIBUTION_EP_SIZES"] = _csv_ints(supported_live_eps)
+        else:
+            capped = [ep for ep in requested_live_eps if ep <= visible]
+            os.environ["COLLECTOR_MOE_DISTRIBUTION_EP_SIZES"] = _csv_ints(capped or [1])
+        os.environ.setdefault("COLLECTOR_WIDEEP_MOE_EP_SIZES", "8")
+    if materialized_distribution:
+        os.environ.setdefault("COLLECTOR_MOE_DISTRIBUTION_EP_SIZES", _DSEEK_V3_RECORDED_MOE_EP_SIZES)
+        os.environ.setdefault("COLLECTOR_WIDEEP_MOE_EP_SIZES", "2,4,8")
+        os.environ.setdefault("COLLECTOR_MOE_DISTRIBUTION_EPLB_MODES", "false,true")
+    ordinary_replay_tokens = (
+        _DSEEK_V3_ORDINARY_MOE_REPLAY_TOKENS
+        if materialized_distribution
+        else _DSEEK_V3_EP8_CONTEXT_TOKENS
+    )
+    os.environ.setdefault("COLLECTOR_MOE_DISTRIBUTION_TOKENS", ordinary_replay_tokens)
+    os.environ.setdefault("COLLECTOR_WIDEEP_MOE_PREFILL_TOKENS", _DSEEK_V3_EP8_CONTEXT_TOKENS)
+    os.environ.setdefault(
+        "COLLECTOR_MOE_DISTRIBUTION_GENERATION_TOKENS",
+        _DSEEK_V3_MOE_DISTRIBUTION_GENERATION_TOKENS
+        if materialized_distribution
+        else ordinary_replay_tokens,
+    )
+    os.environ.setdefault("COLLECTOR_WIDEEP_MOE_DECODE_TOKENS", _DSEEK_V3_EP8_GENERATION_TOKENS)
+    os.environ.setdefault("COLLECTOR_MOE_TOKENS", _DSEEK_V3_ORDINARY_MOE_TOKENS)
+    os.environ.setdefault("COLLECTOR_MOE_RECORDED_TOKENS", _DSEEK_V3_ORDINARY_MOE_RECORDED_TOKENS)
+    os.environ.setdefault("COLLECTOR_MOE_EP_SIZES", _DSEEK_V3_RECORDED_MOE_EP_SIZES)
+    if "COLLECTOR_MOE_DISTRIBUTION_EPLB_MODES" not in os.environ:
+        wideep_eplb = os.environ.get("COLLECTOR_WIDEEP_MOE_ENABLE_EPLB")
+        if wideep_eplb is not None:
+            os.environ["COLLECTOR_MOE_DISTRIBUTION_EPLB_MODES"] = (
+                "true"
+                if wideep_eplb.strip().lower() not in _DYNAMIC_FALSE_VALUES
+                else "false"
+            )
+    after = (
+        os.environ.get("COLLECTOR_MOE_DISTRIBUTION_EP_SIZES"),
+        os.environ.get("COLLECTOR_WIDEEP_MOE_EP_SIZES"),
+        os.environ.get("COLLECTOR_MOE_DISTRIBUTION_TOKENS"),
+        os.environ.get("COLLECTOR_WIDEEP_MOE_PREFILL_TOKENS"),
+        os.environ.get("COLLECTOR_MOE_DISTRIBUTION_GENERATION_TOKENS"),
+        os.environ.get("COLLECTOR_WIDEEP_MOE_DECODE_TOKENS"),
+        os.environ.get("COLLECTOR_DSV3_EP8_SINGLE_GPU_SIM"),
+        os.environ.get("COLLECTOR_MOE_DISTRIBUTION_SINGLE_CARD_EP_SIM"),
+        os.environ.get("COLLECTOR_MOE_DISTRIBUTION_MATERIALIZED_PROFILE"),
+    )
+    if logger is not None and before != after:
+        logger.info(
+            "DeepSeek-V3 MoE calibration defaults applied: "
+            "COLLECTOR_MOE_DISTRIBUTION_EP_SIZES=%s, "
+            "COLLECTOR_WIDEEP_MOE_EP_SIZES=%s, "
+            "context_tokens=%s, generation_tokens=%s, "
+            "single_gpu_sim=%s, single_card_ep_sim=%s, materialized_profile=%s",
+            after[0],
+            after[1],
+            after[2],
+            after[4],
+            after[6],
+            after[7],
+            after[8],
+        )
+        if single_gpu_sim:
+            logger.info(
+                "DeepSeek-V3 MoE single-card EP simulation: each case uses one "
+                "GPU worker with deterministic profile-free rank-local replay; "
+                "visible GPUs may parallelize independent cases, but they are "
+                "not used as real EP ranks. "
+                "Historical bootstrap replay is not used. Server/profile data is "
+                "used only by the final validation compare."
+            )
+        if legacy_base_changed:
+            logger.info(
+                "DeepSeek-V3 full collection: using legacy base case sweeps for "
+                "non-MoE attention ops (%s); MoE/WideEP keeps recorded calibration points.",
+                os.environ.get("COLLECTOR_LEGACY_BASE_OP_CASES"),
+            )
+
+
+def _read_perf_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    import csv
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        return list(reader.fieldnames or []), list(reader)
+
+
+def _write_perf_rows(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    import csv
+
+    merged_fields = list(fieldnames)
+    seen = set(merged_fields)
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                merged_fields.append(key)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=merged_fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+ORDINARY_MOE_COMPACT_FIELDS = [
+    "framework",
+    "version",
+    "device",
+    "op_name",
+    "kernel_source",
+    "moe_dtype",
+    "num_tokens",
+    "hidden_size",
+    "inter_size",
+    "topk",
+    "num_experts",
+    "moe_tp_size",
+    "moe_ep_size",
+    "distribution",
+    "phase",
+    "latency",
+]
+
+WIDEEP_MOE_COMPACT_FIELDS = [
+    "framework",
+    "version",
+    "device",
+    "op_name",
+    "kernel_source",
+    "moe_dtype",
+    "num_tokens",
+    "hidden_size",
+    "inter_size",
+    "topk",
+    "num_experts",
+    "moe_tp_size",
+    "moe_ep_size",
+    "distribution",
+    "gemm_path",
+    "kernel_regime",
+    "latency",
+]
+
+
+def _compact_fields_for_perf(filename: str) -> list[str]:
+    if filename == "moe_perf.txt":
+        return ORDINARY_MOE_COMPACT_FIELDS
+    if filename in {"wideep_context_moe_perf.txt", "wideep_generation_moe_perf.txt"}:
+        return WIDEEP_MOE_COMPACT_FIELDS
+    raise ValueError(f"Unsupported compact perf table: {filename}")
+
+
+def _write_compact_perf_rows(path: Path, rows: list[dict[str, str]]) -> None:
+    import csv
+
+    fieldnames = _compact_fields_for_perf(path.name)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows({field: row.get(field, "") for field in fieldnames} for row in rows)
+
+
+def _sync_run_tables_to_latency_source_root(run_dir: Path) -> Path:
+    source_root = _dsv3_latency_source_root(run_dir)
+    if source_root == run_dir:
+        _sync_materialized_tables_to_clean_latency_inputs(source_root)
+        return source_root
+
+    source_root.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "collection_summary_sglang.json",
+        "collector.log",
+        "collector_errors.log",
+        "moe_token_distribution_perf.txt",
+        "moe_perf.txt",
+        "wideep_context_moe_perf.txt",
+        "wideep_generation_moe_perf.txt",
+    ):
+        src = run_dir / name
+        if src.exists():
+            shutil.copy2(src, source_root / name)
+    for dirname in (
+        "raw_collector_source",
+        "recorded_materialized_source",
+        "ordinary_moe_materialized_source",
+        "aic_latency_source_bundle",
+    ):
+        src = run_dir / dirname
+        dst = source_root / dirname
+        if src.exists() and not dst.exists():
+            shutil.copytree(src, dst)
+    _sync_materialized_tables_to_clean_latency_inputs(source_root)
+    return source_root
+
+
+def _sync_materialized_tables_to_clean_latency_inputs(source_root: Path) -> None:
+    """Feed clean latency with full AIC materialized tables, not compact outputs."""
+
+    preferred_sources = {
+        "moe_perf.txt": source_root / "ordinary_moe_materialized_source" / "moe_perf.txt",
+        "wideep_context_moe_perf.txt": source_root
+        / "recorded_materialized_source"
+        / "wideep_context_moe_perf.txt",
+        "wideep_generation_moe_perf.txt": source_root
+        / "recorded_materialized_source"
+        / "wideep_generation_moe_perf.txt",
+    }
+    for filename, src in preferred_sources.items():
+        if src.exists():
+            shutil.copy2(src, source_root / filename)
+
+
+def _preserve_full_header_table(
+    *,
+    run_dir: Path,
+    filename: str,
+    fieldnames: list[str],
+    rows: list[dict[str, str]],
+) -> None:
+    if not _keep_dsv3_latency_sources():
+        return
+    full_dir = run_dir / "aic_latency_source_bundle" / "final_full_header"
+    full_dir.mkdir(parents=True, exist_ok=True)
+    _write_perf_rows(full_dir / filename, fieldnames, rows)
+
+
+def _wideep_table_key(row: dict[str, str]) -> tuple[str, str, str]:
+    return (
+        str(row.get("moe_ep_size", "")),
+        str(row.get("num_tokens", "")),
+        str(row.get("distribution", "")),
+    )
+
+
+def _install_recorded_latency_into_run_tables(
+    *,
+    run_dir: Path,
+    validation_source_dir: Path,
+) -> None:
+    """Make collected WideEP MoE tables simulation-facing.
+
+    Prefer materialized Recorded rows when a validation source exists: that is
+    the collector-owned source-selection step for context sparse/dense and
+    generation small/main families.  If materialized rows are unavailable, fall
+    back to applying the shared recorded latency policy to the current run rows.
+    Baseline distributions stay exactly as collected.
+    """
+
+    repo_root = _repo_root()
+    try:
+        from moe_hybrid_policy import apply_profile_free_hybrid_latency
+    except ModuleNotFoundError:
+        sys.path.insert(0, str(repo_root / "collector"))
+        from moe_hybrid_policy import apply_profile_free_hybrid_latency
+
+    recorded_distributions = {"recorded", "recorded_no_eplb", "recorded_eplb"}
+
+    for filename in ("wideep_context_moe_perf.txt", "wideep_generation_moe_perf.txt"):
+        run_path = run_dir / filename
+        if not run_path.exists():
+            continue
+
+        run_fields, run_rows = _read_perf_rows(run_path)
+        materialized_path = validation_source_dir / filename
+        materialized_by_key = {}
+        materialized_rows = []
+        if materialized_path.exists():
+            _, materialized_rows = _read_perf_rows(materialized_path)
+            materialized_by_key = {
+                _wideep_table_key(row): row
+                for row in materialized_rows
+                if row.get("distribution") in recorded_distributions
+            }
+        phase = "context" if filename.startswith("wideep_context") else "generation"
+        replaced = 0
+        if materialized_by_key:
+            materialized_ep_sizes = {key[0] for key in materialized_by_key}
+            output_rows = []
+            for row in run_rows:
+                if row.get("distribution") not in recorded_distributions:
+                    output_rows.append(row)
+                    continue
+                if str(row.get("moe_ep_size", "")) in materialized_ep_sizes:
+                    continue
+                merged = apply_profile_free_hybrid_latency(row, phase=phase)
+                if not merged.get("origin_latency"):
+                    merged["origin_latency"] = str(row.get("latency", ""))
+                merged["latency_policy_scope"] = "profile_free_hybrid_recorded"
+                output_rows.append(merged)
+            output_rows.extend(materialized_by_key[key] for key in sorted(materialized_by_key))
+            replaced = len(materialized_by_key)
+        else:
+            output_rows = []
+            for row in run_rows:
+                if row.get("distribution") not in recorded_distributions:
+                    output_rows.append(row)
+                    continue
+                merged = apply_profile_free_hybrid_latency(row, phase=phase)
+                if not merged.get("origin_latency"):
+                    merged["origin_latency"] = str(row.get("latency", ""))
+                merged["latency_policy_scope"] = "profile_free_hybrid_recorded"
+                output_rows.append(merged)
+                replaced += 1
+
+        if replaced:
+            _preserve_raw_collector_file(run_dir, run_path)
+            fields = list(run_fields)
+            for key in [
+                "origin_latency",
+                "latency_policy_scope",
+                "materialization_role",
+                "materialization_source_family",
+            ]:
+                if key not in fields:
+                    fields.append(key)
+            _preserve_full_header_table(
+                run_dir=run_dir,
+                filename=run_path.name,
+                fieldnames=fields,
+                rows=output_rows,
+            )
+            _write_compact_perf_rows(run_path, output_rows)
+            logger.info(
+                "Installed DeepSeek-V3 profile-free Recorded latency into %s "
+                "(replaced %d Recorded rows; materialized_rows=%d; compact table keeps latency as final value)",
+                run_path,
+                replaced,
+                len(materialized_by_key),
+            )
+
+
+def _recorded_materialization_inputs(run_dir: Path) -> dict[str, Path | None]:
+    return {
+        "context_sparse": _resolve_recorded_materialization_source_path(
+            env_names=(
+                "COLLECTOR_DSV3_RECORDED_CONTEXT_SPARSE",
+                "COLLECTOR_DSV3_EP8_CONTEXT_SPARSE",
+            ),
+            run_dir=run_dir,
+            phase="context",
+        ),
+        "context_dense_noeplb": _resolve_recorded_materialization_source_path(
+            env_names=(
+                "COLLECTOR_DSV3_RECORDED_CONTEXT_DENSE_NOEPLB",
+                "COLLECTOR_DSV3_EP8_CONTEXT_DENSE_NOEPLB",
+            ),
+            run_dir=run_dir,
+            phase="context",
+        ),
+        "context_dense_eplb": _resolve_recorded_materialization_source_path(
+            env_names=(
+                "COLLECTOR_DSV3_RECORDED_CONTEXT_DENSE_EPLB",
+                "COLLECTOR_DSV3_EP8_CONTEXT_DENSE_EPLB",
+            ),
+            run_dir=run_dir,
+            phase="context",
+        ),
+        "generation_small_noeplb": _resolve_recorded_materialization_source_path(
+            env_names=(
+                "COLLECTOR_DSV3_RECORDED_GENERATION_SMALL_NOEPLB",
+                "COLLECTOR_DSV3_EP8_GENERATION_SMALL_NOEPLB",
+            ),
+            run_dir=run_dir,
+            phase="generation",
+        ),
+        "generation_small_eplb": _resolve_recorded_materialization_source_path(
+            env_names=(
+                "COLLECTOR_DSV3_RECORDED_GENERATION_SMALL_EPLB",
+                "COLLECTOR_DSV3_EP8_GENERATION_SMALL_EPLB",
+            ),
+            run_dir=run_dir,
+            phase="generation",
+        ),
+        "generation_main_noeplb": _resolve_recorded_materialization_source_path(
+            env_names=(
+                "COLLECTOR_DSV3_RECORDED_GENERATION_MAIN_NOEPLB",
+                "COLLECTOR_DSV3_EP8_GENERATION_MAIN_NOEPLB",
+            ),
+            run_dir=run_dir,
+            phase="generation",
+        ),
+        "generation_main_eplb": _resolve_recorded_materialization_source_path(
+            env_names=(
+                "COLLECTOR_DSV3_RECORDED_GENERATION_MAIN_EPLB",
+                "COLLECTOR_DSV3_EP8_GENERATION_MAIN_EPLB",
+            ),
+            run_dir=run_dir,
+            phase="generation",
+        ),
+    }
+
+
+def _run_recorded_materialization_postprocess(args, ops: list[str] | None) -> None:
+    if not _is_deepseek_v3_ep8_flow(args, ops):
+        return
+    if not _bool_env_enabled("COLLECTOR_DSV3_RECORDED_MATERIALIZATION", True):
+        if logger is not None:
+            logger.info("DeepSeek-V3 Recorded materialization is disabled by COLLECTOR_DSV3_RECORDED_MATERIALIZATION")
+        return
+
+    run_dir = Path(os.environ.get("COLLECTOR_LOG_DIR", ".")).resolve()
+    required_local = [
+        run_dir / "wideep_context_moe_perf.txt",
+        run_dir / "wideep_generation_moe_perf.txt",
+    ]
+    missing_local = [path for path in required_local if not path.exists()]
+    if missing_local:
+        if logger is not None:
+            logger.warning(
+                "Skip DeepSeek-V3 Recorded materialization because current run is missing:\n  "
+                + "\n  ".join(str(path) for path in missing_local)
+            )
+        return
+
+    for path in required_local:
+        _preserve_raw_collector_file(run_dir, path)
+
+    inputs = _recorded_materialization_inputs(run_dir)
+    missing_inputs = [
+        name
+        for name, path in inputs.items()
+        if path is None or not path.exists()
+    ]
+    if missing_inputs:
+        if logger is not None:
+            logger.warning(
+                "Skip DeepSeek-V3 Recorded materialization because AIC source inputs are missing:\n  "
+                + "\n  ".join(missing_inputs)
+                + "\nCurrent-run WideEP tables are used by default; explicit COLLECTOR_DSV3_RECORDED_* source env vars may override them."
+            )
+        return
+
+    try:
+        _preserve_dsv3_latency_source_manifest(run_dir=run_dir, inputs=inputs)
+        for role, path in inputs.items():
+            _preserve_dsv3_latency_source_input(run_dir=run_dir, role=role, path=path)
+
+        from moe_recorded_materialization import materialize_recorded_wideep_tables_from_paths
+
+        with _dsv3_materialized_source_dir(run_dir, "recorded_materialized_source") as validation_source_dir:
+            materialize_recorded_wideep_tables_from_paths(
+                base_validation_source=run_dir,
+                context_sparse=inputs["context_sparse"],
+                context_dense_noeplb=inputs["context_dense_noeplb"],
+                context_dense_eplb=inputs["context_dense_eplb"],
+                generation_small_noeplb=inputs["generation_small_noeplb"],
+                generation_small_eplb=inputs["generation_small_eplb"],
+                generation_main_noeplb=inputs["generation_main_noeplb"],
+                generation_main_eplb=inputs["generation_main_eplb"],
+                output_dir=validation_source_dir,
+            )
+            _install_recorded_latency_into_run_tables(
+                run_dir=run_dir,
+                validation_source_dir=validation_source_dir,
+            )
+            if logger is not None:
+                if _keep_dsv3_materialized_sources():
+                    logger.info("DeepSeek-V3 Recorded materialized source saved: %s", validation_source_dir)
+                else:
+                    logger.info(
+                        "DeepSeek-V3 Recorded materialization installed into run tables "
+                        "(temporary source not saved; set COLLECTOR_DSV3_KEEP_LATENCY_SOURCES=true to keep it)"
+                    )
+    except Exception:
+        if logger is not None:
+            logger.exception("DeepSeek-V3 Recorded materialization failed")
+        return
+
+
+def _run_ordinary_moe_materialization_postprocess(args, ops: list[str] | None) -> None:
+    if not _is_deepseek_v3_ep8_flow(args, ops):
+        return
+    requested_ops = set(ops or [])
+    if "moe" not in requested_ops:
+        return
+    if not _bool_env_enabled("COLLECTOR_DSV3_ORDINARY_MOE_MATERIALIZATION", True):
+        if logger is not None:
+            logger.info(
+                "DeepSeek-V3 ordinary MoE materialization is disabled by "
+                "COLLECTOR_DSV3_ORDINARY_MOE_MATERIALIZATION"
+            )
+        return
+
+    run_dir = Path(os.environ.get("COLLECTOR_LOG_DIR", ".")).resolve()
+    moe_perf = run_dir / "moe_perf.txt"
+    replay_manifest = run_dir / "moe_token_distribution_replay" / "manifest.csv"
+    if not moe_perf.exists() or not replay_manifest.exists():
+        if logger is not None:
+            logger.warning(
+                "Skip DeepSeek-V3 ordinary MoE materialization because current "
+                "run is missing moe_perf.txt or rank-local replay manifest."
+            )
+        return
+
+    repo_root = _repo_root()
+    scripts = {
+        "shape": repo_root / "tools/moe_calibration/analyze_ordinary_moe_replay_shape.py",
+        "materialize": repo_root / "tools/moe_calibration/materialize_ordinary_moe_profile_free_source.py",
+    }
+
+    def _run_python(command: list[str], *, label: str) -> None:
+        if logger is not None:
+            logger.info("%s:\n  %s", label, " ".join(command))
+        result = subprocess.run(
+            command,
+            cwd=repo_root,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        if logger is not None and result.stdout.strip():
+            logger.info("%s stdout:\n%s", label, result.stdout.strip())
+        if logger is not None and result.stderr.strip():
+            logger.warning("%s stderr:\n%s", label, result.stderr.strip())
+
+    try:
+        with _dsv3_materialized_source_dir(run_dir, "ordinary_moe_materialized_source") as materialized_dir:
+            shape_csv = materialized_dir / "ordinary_moe_replay_shape.csv"
+            _run_python(
+                [
+                    sys.executable,
+                    str(scripts["shape"]),
+                    "--data-dir",
+                    str(run_dir),
+                    "--output",
+                    str(shape_csv),
+                ],
+                label="summarize DeepSeek-V3 ordinary MoE replay shape",
+            )
+            _run_python(
+                [
+                    sys.executable,
+                    str(scripts["materialize"]),
+                    "--data-dir",
+                    str(run_dir),
+                    "--shape-csv",
+                    str(shape_csv),
+                    "--generation-shape-csv",
+                    str(shape_csv),
+                    "--output-dir",
+                    str(materialized_dir),
+                    "--policy-version",
+                    os.environ.get("COLLECTOR_DSV3_ORDINARY_MOE_POLICY_VERSION", "v17"),
+                ],
+                label="materialize DeepSeek-V3 ordinary MoE profile-free source",
+            )
+            materialized_moe_perf = materialized_dir / "moe_perf.txt"
+            if not materialized_moe_perf.exists():
+                raise FileNotFoundError(materialized_moe_perf)
+            _preserve_raw_collector_file(run_dir, moe_perf)
+            materialized_fields, materialized_rows = _read_perf_rows(materialized_moe_perf)
+            _preserve_full_header_table(
+                run_dir=run_dir,
+                filename=moe_perf.name,
+                fieldnames=materialized_fields,
+                rows=materialized_rows,
+            )
+            _write_compact_perf_rows(moe_perf, materialized_rows)
+            if logger is not None:
+                if _keep_dsv3_materialized_sources():
+                    logger.info("DeepSeek-V3 ordinary MoE materialized source saved: %s", materialized_dir)
+                else:
+                    logger.info(
+                        "DeepSeek-V3 ordinary MoE materialization installed as compact moe_perf.txt "
+                        "(temporary source not saved; set COLLECTOR_DSV3_KEEP_LATENCY_SOURCES=true to keep it)"
+                    )
+    except subprocess.CalledProcessError as exc:
+        if logger is not None:
+            logger.warning(
+                "DeepSeek-V3 ordinary MoE materialization failed: %s\nstdout:\n%s\nstderr:\n%s",
+                exc,
+                exc.stdout,
+                exc.stderr,
+            )
+        return
+    except Exception:
+        if logger is not None:
+            logger.exception("DeepSeek-V3 ordinary MoE materialization failed")
+        return
+
+    if logger is not None:
+        logger.info(
+            "Installed DeepSeek-V3 ordinary MoE profile-free Recorded latency "
+            "into %s (compact table keeps latency as final value)",
+            moe_perf,
+        )
+
+
+def _run_clean_latency_postprocess(args, ops: list[str] | None) -> None:
+    """Install collector-native clean latency into final compact MoE tables."""
+
+    if not _is_deepseek_v3_ep8_flow(args, ops):
+        return
+    if getattr(args, "smoke", False):
+        if logger is not None:
+            logger.info(
+                "Skip DeepSeek-V3 clean latency in --smoke mode because sampled "
+                "WideEP sources are intentionally incomplete."
+            )
+        return
+    if not _dsv3_clean_latency_enabled():
+        if logger is not None:
+            logger.info("DeepSeek-V3 clean latency is disabled by COLLECTOR_DSV3_CLEAN_LATENCY")
+        return
+
+    run_dir = Path(os.environ.get("COLLECTOR_LOG_DIR", ".")).resolve()
+    source_root = _sync_run_tables_to_latency_source_root(run_dir)
+    required = [
+        source_root / "moe_perf.txt",
+        source_root / "wideep_context_moe_perf.txt",
+        source_root / "wideep_generation_moe_perf.txt",
+        source_root / "raw_collector_source" / "moe_perf.txt",
+        source_root / "aic_latency_source_bundle" / "recorded_materialization_inputs",
+    ]
+    missing = [path for path in required if not path.exists()]
+    if missing:
+        if logger is not None:
+            logger.warning(
+                "Skip DeepSeek-V3 clean latency because required AIC source files are missing:\n  "
+                + "\n  ".join(str(path) for path in missing)
+                + "\nClean latency uses collector-owned AIC sources; set COLLECTOR_DSV3_KEEP_LATENCY_SOURCES=1 only when you need to persist them."
+            )
+        return
+
+    repo_root = _repo_root()
+    try:
+        from moe_clean_latency import build_clean_latency_tables
+    except ModuleNotFoundError:
+        sys.path.insert(0, str(repo_root / "collector"))
+        from moe_clean_latency import build_clean_latency_tables
+
+    def _install_candidate_table(candidate_dir: Path, filename: str) -> None:
+        candidate_path = candidate_dir / filename
+        if not candidate_path.exists():
+            raise FileNotFoundError(candidate_path)
+        fields, rows = _read_perf_rows(candidate_path)
+        _preserve_full_header_table(
+            run_dir=run_dir,
+            filename=filename,
+            fieldnames=fields,
+            rows=rows,
+        )
+        _write_compact_perf_rows(run_dir / filename, rows)
+
+    try:
+        if _keep_dsv3_latency_sources():
+            candidate_dir = run_dir / "clean_latency_debug" / "candidate_full"
+            build_clean_latency_tables(
+                source_dir=source_root,
+                candidate_dir=candidate_dir,
+                write_origin_dir=True,
+            )
+            for filename in ("moe_perf.txt", "wideep_context_moe_perf.txt", "wideep_generation_moe_perf.txt"):
+                _install_candidate_table(candidate_dir, filename)
+            if logger is not None:
+                logger.info("DeepSeek-V3 clean latency candidate source saved: %s", candidate_dir)
+        else:
+            with tempfile.TemporaryDirectory(prefix="dsv3_clean_latency_") as tmp_dir:
+                candidate_dir = Path(tmp_dir) / "candidate"
+                build_clean_latency_tables(
+                    source_dir=source_root,
+                    candidate_dir=candidate_dir,
+                    write_origin_dir=False,
+                )
+                for filename in ("moe_perf.txt", "wideep_context_moe_perf.txt", "wideep_generation_moe_perf.txt"):
+                    _install_candidate_table(candidate_dir, filename)
+        if logger is not None:
+            logger.info(
+                "Installed DeepSeek-V3 clean latency into compact MoE tables "
+                "(latency column is the final recorded latency value)."
+            )
+    except Exception:
+        if logger is not None:
+            logger.exception("DeepSeek-V3 clean latency postprocess failed")
+        return
 
 
 def _wideep_registry_for_backend(backend: str) -> list:
@@ -1145,7 +2129,12 @@ def collect_ops(
                         recorded_cases = [
                             case
                             for case in cases
-                            if isinstance(case, (list, tuple)) and len(case) > 9 and case[9] == "recorded"
+                            if isinstance(case, (list, tuple))
+                            and len(case) > 9
+                            and (
+                                case[9] == "recorded"
+                                or "_rank_local_" in str(case[9])
+                            )
                         ]
                         if recorded_cases:
                             first_recorded = recorded_cases[0]
@@ -1217,8 +2206,25 @@ def collect_sglang(
     try:
         from importlib.metadata import version as get_version
 
-        version = get_version("sglang")
-        logger.info(f"SGLang version: {version}")
+        package_version = get_version("sglang")
+        version = package_version
+        if package_version in {"0.0.0", "0.0.0.dev0"}:
+            # Editable/source SGLang builds can carry placeholder package
+            # metadata even though their API is a released branch.  Reuse the
+            # same structural detector as the collectors so compatibility
+            # routing reflects the runtime API rather than stale wheel metadata.
+            from collector.sglang.version_compat import sglang_version_branch
+
+            branch = sglang_version_branch()
+            version = "0.5.12" if branch == "current" else "0.5.10"
+            logger.info(
+                "SGLang package version %s resolved to API version %s (%s branch)",
+                package_version,
+                version,
+                branch,
+            )
+        else:
+            logger.info(f"SGLang version: {version}")
     except Exception:
         logger.exception("SGLang is not installed")
         return
@@ -1648,12 +2654,28 @@ def main():
 
     _require_torch()
 
+    _maybe_apply_deepseek_v3_ep8_defaults(args, ops)
+
     # Determine number of processes (0 = sequential mode for profiling)
     if args.profile:
         num_processes = 0
         logger.info("Starting collection in sequential mode (profiling enabled)")
     else:
         num_processes = get_device_module().device_count()
+        if (
+            _is_deepseek_v3_ep8_flow(args, ops)
+            and _bool_env_enabled("COLLECTOR_DSV3_EP8_SINGLE_GPU_SIM", True)
+            and _bool_env_enabled("COLLECTOR_MOE_DISTRIBUTION_SINGLE_CARD_EP_SIM", False)
+            and not _bool_env_enabled("COLLECTOR_DSV3_SINGLE_CARD_CASE_PARALLEL", False)
+        ):
+            if num_processes != 1:
+                logger.info(
+                    "DeepSeek-V3 single-card EP simulation: overriding worker "
+                    "count %s -> 1 because COLLECTOR_DSV3_SINGLE_CARD_CASE_PARALLEL=false. "
+                    "Set it to true to parallelize independent cases across visible GPUs.",
+                    num_processes,
+                )
+            num_processes = 1
         logger.info(f"Starting collection with {num_processes} GPU processes")
 
     # Set environment variables for worker processes
@@ -1736,6 +2758,12 @@ def main():
                 model_path=case_plan.model_path if case_plan is not None else None,
                 case_plan=case_plan,
             )
+
+    run_dir = Path(os.environ.get("COLLECTOR_LOG_DIR", ".")).resolve()
+    with _dsv3_latency_workspace(args, ops, run_dir):
+        _run_recorded_materialization_postprocess(args, ops)
+        _run_ordinary_moe_materialization_postprocess(args, ops)
+        _run_clean_latency_postprocess(args, ops)
 
     if args.keep_csv:
         logger.info("Keeping collector CSV staging files because --keep-csv was passed")
