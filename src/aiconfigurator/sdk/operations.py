@@ -227,6 +227,34 @@ class GEMM(Operation):
         return self._weights * self._scale_factor
 
 
+class ContextKVBProjGEMM(GEMM):
+    """
+    DeepSeek MLA context kv_b_proj GEMM.
+
+    Unlike ordinary context GEMMs, kv_b_proj also runs on prefix-cache tokens in
+    SGLang's MLA prefill path: KV is cached in latent form, so cached prefix
+    tokens must be projected from latent KV before the MHA/FA prefill attention
+    can consume them. The backend passes `x` as fresh tokens, so this op expands
+    the GEMM m dimension to fresh + prefix tokens before using the normal GEMM
+    database lookup.
+    """
+
+    @staticmethod
+    def _prefix_tokens_from_kwargs(**kwargs) -> int:
+        prefix = kwargs.get("prefix") or 0
+        batch_size = kwargs.get("batch_size", 1)
+
+        if isinstance(prefix, (list, tuple)):
+            return int(sum(prefix))
+        return int(batch_size) * int(prefix)
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        corrected_kwargs = dict(kwargs)
+        fresh_tokens = int(corrected_kwargs.get("x") or 0)
+        corrected_kwargs["x"] = fresh_tokens + self._prefix_tokens_from_kwargs(**corrected_kwargs)
+        return super().query(database, **corrected_kwargs)
+
+
 class TrtLLMWideEPMoE(Operation):
     """
     TensorRT-LLM WideEP MoE operation with configurable EPLB modes.
