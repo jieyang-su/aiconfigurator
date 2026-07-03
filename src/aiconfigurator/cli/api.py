@@ -596,6 +596,11 @@ def _build_model_config(
     fmha_quant_mode: str | None = None,
     moe_quant_mode: str | None = None,
     comm_quant_mode: str | None = None,
+    workload_distribution: str | None = None,
+    enable_wideep: bool = False,
+    moe_backend: str | None = None,
+    enable_eplb: bool = False,
+    wideep_num_slots: int | None = None,
     nextn: int | None = None,
     nextn_accept_rates: list[float] | None = None,
 ):
@@ -620,6 +625,11 @@ def _build_model_config(
         fmha_quant_mode=FMHAQuantMode[fmha_quant_mode] if fmha_quant_mode else None,
         moe_quant_mode=MoEQuantMode[moe_quant_mode] if moe_quant_mode else None,
         comm_quant_mode=CommQuantMode[comm_quant_mode] if comm_quant_mode else None,
+        workload_distribution=workload_distribution or "power_law",
+        enable_wideep=enable_wideep,
+        moe_backend=moe_backend,
+        enable_eplb=enable_eplb,
+        wideep_num_slots=wideep_num_slots,
         nextn=nextn if nextn is not None else 0,
         nextn_accept_rates=nextn_accept_rates,
     )
@@ -647,6 +657,11 @@ def cli_estimate(
     fmha_quant_mode: str | None = None,
     moe_quant_mode: str | None = None,
     comm_quant_mode: str | None = None,
+    workload_distribution: str | None = None,
+    enable_wideep: bool = False,
+    moe_backend: str | None = None,
+    enable_eplb: bool = False,
+    wideep_num_slots: int | None = None,
     # Disagg-specific parameters (ignored when mode='agg')
     decode_system_name: str | None = None,
     prefill_tp_size: int | None = None,
@@ -716,6 +731,13 @@ def cli_estimate(
         fmha_quant_mode: FMHA quantization mode. Default is None (auto-inferred).
         moe_quant_mode: MoE quantization mode. Default is None (auto-inferred).
         comm_quant_mode: Communication quantization mode. Default is None (auto-inferred).
+        workload_distribution: MoE workload distribution. Defaults to ModelConfig's
+            project default (``power_law``). Use ``recorded`` to select the
+            recorded/materialized MoE rows when present.
+        enable_wideep: Enable WideEP/DeepEP modeling for SGLang estimate mode.
+        moe_backend: Explicit SGLang MoE backend (for example ``deepep_moe``).
+        enable_eplb: Enable EPLB modeling where the model path supports it.
+        wideep_num_slots: Optional EPLB slot count for WideEP.
         decode_system_name: System for disagg decode workers. Defaults to ``system_name``.
         prefill_tp_size: Prefill TP size (disagg). Defaults to ``tp_size``.
         prefill_pp_size: Prefill PP size (disagg). Defaults to ``pp_size``.
@@ -853,6 +875,11 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            workload_distribution=workload_distribution,
+            enable_wideep=enable_wideep,
+            moe_backend=moe_backend or ("deepep_moe" if backend_name == "sglang" and enable_wideep else None),
+            enable_eplb=enable_eplb,
+            wideep_num_slots=wideep_num_slots,
             nextn=nextn,
             nextn_accept_rates=nextn_accept_rates,
             stride=stride,
@@ -883,6 +910,11 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            workload_distribution=workload_distribution,
+            enable_wideep=enable_wideep,
+            moe_backend=moe_backend or ("deepep_moe" if backend_name == "sglang" and enable_wideep else None),
+            enable_eplb=enable_eplb,
+            wideep_num_slots=wideep_num_slots,
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
@@ -946,6 +978,11 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            workload_distribution=workload_distribution,
+            enable_wideep=enable_wideep,
+            moe_backend=moe_backend or ("deepep_moe" if backend_name == "sglang" and enable_wideep else None),
+            enable_eplb=enable_eplb,
+            wideep_num_slots=wideep_num_slots,
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
@@ -999,6 +1036,11 @@ def _run_agg_estimate(
     fmha_quant_mode,
     moe_quant_mode,
     comm_quant_mode,
+    workload_distribution,
+    enable_wideep,
+    moe_backend,
+    enable_eplb,
+    wideep_num_slots,
     load_database,
     get_backend,
     get_model,
@@ -1029,6 +1071,11 @@ def _run_agg_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        workload_distribution,
+        enable_wideep,
+        moe_backend,
+        enable_eplb,
+        wideep_num_slots,
         nextn,
         nextn_accept_rates,
     )
@@ -1136,6 +1183,11 @@ def _run_static_estimate(
     fmha_quant_mode,
     moe_quant_mode,
     comm_quant_mode,
+    workload_distribution,
+    enable_wideep,
+    moe_backend,
+    enable_eplb,
+    wideep_num_slots,
     nextn,
     nextn_accept_rates,
     stride,
@@ -1172,6 +1224,11 @@ def _run_static_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        workload_distribution,
+        enable_wideep,
+        moe_backend,
+        enable_eplb,
+        wideep_num_slots,
     )
     _apply_nextn(model_config, nextn, nextn_accept_rates)
 
@@ -1257,6 +1314,11 @@ def _run_disagg_estimate(
     fmha_quant_mode,
     moe_quant_mode,
     comm_quant_mode,
+    workload_distribution,
+    enable_wideep,
+    moe_backend,
+    enable_eplb,
+    wideep_num_slots,
     load_database,
     get_backend,
     get_model,
@@ -1297,6 +1359,11 @@ def _run_disagg_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        workload_distribution,
+        enable_wideep,
+        moe_backend,
+        enable_eplb,
+        wideep_num_slots,
         nextn,
         nextn_accept_rates,
     )
@@ -1311,6 +1378,11 @@ def _run_disagg_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        workload_distribution,
+        enable_wideep,
+        moe_backend,
+        enable_eplb,
+        wideep_num_slots,
         nextn,
         nextn_accept_rates,
     )

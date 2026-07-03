@@ -357,6 +357,16 @@ def _add_default_mode_arguments(parser):
         help="Communication quantization mode override for default-mode sweeps. Auto-inferred if omitted.",
     )
     parser.add_argument(
+        "--workload-distribution",
+        type=str,
+        default=None,
+        help=(
+            "MoE workload distribution for estimate mode. "
+            "Examples: power_law, balanced, recorded. "
+            "When omitted, ModelConfig defaults to power_law."
+        ),
+    )
+    parser.add_argument(
         "--enable-wideep",
         action="store_true",
         default=False,
@@ -684,6 +694,43 @@ def _add_estimate_mode_arguments(parser):
         type=str,
         default=None,
         help="Communication quantization mode. Auto-inferred (default: half) if omitted.",
+    )
+    parser.add_argument(
+        "--workload-distribution",
+        type=str,
+        default=None,
+        help=(
+            "MoE workload distribution. Examples: power_law, balanced, recorded, "
+            "recorded_no_eplb, recorded_eplb. When omitted, ModelConfig defaults to power_law."
+        ),
+    )
+    parser.add_argument(
+        "--enable-wideep",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable SGLang WideEP/DeepEP modeling for MoE estimate mode. "
+            "For SGLang this auto-selects moe_backend=deepep_moe unless --moe-backend is set."
+        ),
+    )
+    parser.add_argument(
+        "--moe-backend",
+        type=str,
+        choices=["deepep_moe", "megamoe"],
+        default=None,
+        help="Explicit SGLang MoE backend override for estimate mode.",
+    )
+    parser.add_argument(
+        "--enable-eplb",
+        action="store_true",
+        default=False,
+        help="Enable EPLB modeling for estimate mode.",
+    )
+    parser.add_argument(
+        "--wideep-num-slots",
+        type=int,
+        default=None,
+        help="Optional WideEP EPLB num_slots. Defaults to model num_experts when omitted.",
     )
     parser.add_argument(
         "--database-mode",
@@ -1917,6 +1964,11 @@ def _run_estimate_mode(args):
         fmha_quant_mode=args.fmha_quant_mode,
         moe_quant_mode=args.moe_quant_mode,
         comm_quant_mode=args.comm_quant_mode,
+        workload_distribution=args.workload_distribution,
+        enable_wideep=args.enable_wideep,
+        moe_backend=args.moe_backend,
+        enable_eplb=args.enable_eplb,
+        wideep_num_slots=args.wideep_num_slots,
         free_gpu_memory_fraction=args.free_gpu_memory_fraction,
         max_seq_len=args.max_seq_len,
         engine_step_backend=args.engine_step_backend,
