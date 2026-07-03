@@ -1,7 +1,7 @@
 这是一个非常关键且经典的疑问！直接给出结论：
 
 **在推理管线中，绝对不会去生成原始视频规格（121x720x1280）的随机噪声像素张量再做 VAE Encode。**
-真实的流程是：**直接在内存中初始化一个潜空间随机 Latent 张量**，然后直接送入 DiT 进行去噪。对 A14B T2V/I2V 来说典型 latent grid 是 `31x90x160`；对 TI2V-5B，SGLang `Wan2_2_TI2V_5B_Config.prepare_latent_shape()` 明确使用 `vae_stride=(4,16,16)`，典型 DiT 输入 grid 是 `31x44x80`。VAE 在纯文本生成视频（T2V）任务中，**只参与最后一步的 Decode（逆向解压回像素）**。 
+真实的流程是：**直接在内存中初始化一个潜空间随机 Latent 张量**，然后直接送入 DiT 进行去噪。对 A14B T2V/I2V 来说典型 latent grid 是 `31x90x160`；对 TI2V-5B，SGLang `Wan2_2_TI2V_5B_Config.prepare_latent_shape()` 明确使用 `vae_stride=(4,16,16)`，典型 DiT 输入 grid 是 `31x44x80`。VAE 在纯文本生成视频（T2V）任务中，**只参与最后一步的 Decode（逆向解压回像素）**。
 
 只有在**图生视频（I2V）**或**视频生视频（V2V）**中，VAE 的 Encode 功能才会被调用，用来把你的“参考图”或者“参考视频”压进潜空间作为 Condition 条件。
 
@@ -25,7 +25,7 @@ class LatentPreparationStage(PipelineStage):
             latents = randn_tensor(
                 shape, generator=generator, device=device, dtype=dtype
             )
-        
+
         batch.latents = latents
         return batch
 ```

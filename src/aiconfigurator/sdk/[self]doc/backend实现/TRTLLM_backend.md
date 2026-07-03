@@ -26,7 +26,7 @@
 
 ---
 
-## 3. `find_best_agg_result_under_constraints` 
+## 3. `find_best_agg_result_under_constraints`
 
 执行流程与 SGLang/vLLM 大同小异。最大的区别体现在 `run_agg` 中关于内存的 OOM 判断 `if summary.check_oom() or summary.check_kv_cache_oom()` 的触发壁垒极不相同由于预分配的特征，在 Batch 放大时它会极其早地触碰到 OOM 天花板然后退出。
 
@@ -44,7 +44,7 @@ TRT-LLM **完全摒弃了按需缩放模式**。在 `run_agg` 调用 `_get_memor
 ### 4.2 显存组成计算逻辑
 1.  **权重视图 (Weights)**: `weights /= pp_size` (张量并行 TP 不切分模型参数厚度而 PP 管道并行需要平摊模型载体大小)。
 2.  **活体激活空间 (Activations)** - **按最大能力留空而非动态加成**:
-    *   以 `min(70MB, max(2 * max_num_tokens * h * c_dict[tp_size]))` 保底限度来框定。 
+    *   以 `min(70MB, max(2 * max_num_tokens * h * c_dict[tp_size]))` 保底限度来框定。
     *   如果算到了 MoE 系列如 DeepSeek：在激活空间里还要叠加非常恐怖的 `moe_workspace` (用于专家路由下发)，大小跟 `num_tokens * h * num_experts * topk / moe_ep_size` 的张量位字节成正比。
     *   **MTP (NextN Token) 惩罚**: 对于能进行推测解码（Speculative Decoding）或包含投机头特性的， `activations = activations * (model.config.nextn + 1)` 激活内存池还要等比例翻倍。这一切都在生成前全额备好。
 3.  **KV Cache 算顶池 (Block reserved)**:

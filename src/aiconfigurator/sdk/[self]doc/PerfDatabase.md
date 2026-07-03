@@ -31,16 +31,16 @@ def __init__(self, system: str, backend: str, version: str, systems_root: str = 
     self.backend = backend
     self.version = version
     self.systems_root = systems_root
-    
+
     # Step 2: 从YAML系统配置文件加载硬件规格
     with open(os.path.join(systems_root, system + ".yaml")) as f:
         self.system_spec = yaml.load(f, Loader=yaml.SafeLoader)
     # 系统规格包含: gpu.mem_bw, gpu.bfloat16_tc_flops 等硬件参数
-    
+
     # Step 3: 初始化缓存与数据目录定位
     self._default_database_mode = common.DatabaseMode.SILICON
     self._extracted_metrics_cache = {}  # LRU缓存提取的指标数据
-    
+
     # Step 4: 根据系统规格定位性能数据文件目录
     data_dir = os.path.join(systems_root, self.system_spec["data_dir"], backend, version)
     # 路径格式: systems_root/[data_dir]/[backend]/[version]/[operator_perf_files]
@@ -75,7 +75,7 @@ def _load_op_data(op_filename_enum: PerfDataFilename) -> LoadedOpData | tuple[Lo
         PerfDataFilename.custom_allreduce: load_custom_allreduce_data,
         # ... 其他映射
     }
-    
+
     # 根据op_filename_enum查找对应的加载函数
     data_filepath = os.path.join(perf_data_dir, op_filename_enum.value)
     data_dict: Optional[dict] = func_map[op_filename_enum](data_filepath)
@@ -96,20 +96,20 @@ def load_gemm_data(gemm_file):
     if not os.path.exists(gemm_file):
         logger.debug(f"GEMM data file {gemm_file} not found.")
         return None
-    
+
     # Step 1: 创建高度嵌套的defaultdict结构，用来存储多维性能参数
     gemm_data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))
-    
+
     # Step 2: 打开CSV文件并逐行读取
     with open(gemm_file, encoding="utf-8") as f:
         reader = csv.DictReader(f)  # 使用字典读取器，自动识别列名
         rows = list(reader)
-    
+
     # Step 3: 检查后向兼容性（旧数据格式可能没有power列）
     has_power = len(rows) > 0 and "power" in rows[0]
     if not has_power:
         logger.debug(f"Legacy database format detected - power will default to 0.0")
-    
+
     # Step 4: 逐行解析CSV数据
     for row in rows:
         # 从CSV行提取字段并进行类型转换
@@ -120,23 +120,23 @@ def load_gemm_data(gemm_file):
             int(row["k"]),           # 内维度
             float(row["latency"]),   # 延迟（毫秒）
         )
-        
+
         # 读取功率数据（后向兼容）
         power = float(row.get("power", 0.0))
-        
+
         # 计算能量值 = 功率 × 延迟（瓦特·毫秒）
         energy = power * latency
-        
+
         # 转换字符串枚举到Python枚举对象
         quant_mode = common.GEMMQuantMode[quant_mode]
-        
+
         # Step 5: 存储到嵌套字典中，叶子节点是包含latency/power/energy的字典
         gemm_data[quant_mode][m][n][k] = {
             "latency": latency,
             "power": power,
             "energy": energy,
         }
-    
+
     return gemm_data
 ```
 
@@ -169,22 +169,22 @@ gemm_data = {
 ```python
 class LoadedOpData(UserDict):
     """Dictionary-like object that tracks source file information"""
-    
+
     def __init__(self, dict_data: Optional[dict], op_name_enum: PerfDataFilename, filepath: str):
         # 保存元数据而非仅是数据字典本身
         self.op_name_enum = op_name_enum      # 操作类型枚举
         self.filepath = filepath               # CSV文件的物理路径
         self.loaded = dict_data is not None   # 加载成功标志
-        
+
         super().__init__()
         if dict_data:
             super().update(dict_data)  # 将数据注入到字典中
-    
+
     def raise_if_not_loaded(self):
         """在任何访问前验证数据是否正确加载"""
         if self.loaded:
             return
-        
+
         # 生成诊断错误消息
         if not os.path.exists(self.filepath):
             raise PerfDataNotAvailableError(
@@ -194,12 +194,12 @@ class LoadedOpData(UserDict):
         raise PerfDataNotAvailableError(
             f"Unknown error loading {self.op_name_enum} data from {self.filepath}."
         )
-    
+
     # 重写关键方法，任何访问都先检查加载状态
     def __getitem__(self, key):
         self.raise_if_not_loaded()  # 防护机制
         return super().__getitem__(key)
-    
+
     def __contains__(self, key):
         self.raise_if_not_loaded()
         return super().__contains__(key)
@@ -241,16 +241,16 @@ def _load_dsv4_flash_split(loaded_list):
     first_loaded = next((x for x in loaded_list if x is not None), None)
     if first_loaded is None:
         return None
-    
+
     # 深度合并所有分割文件的数据
     for loaded in loaded_list:
         if loaded is None or not loaded.loaded:
             continue
         _deep_merge_dsv4_dicts(merged, loaded.data)
-    
+
     if not merged:
         return None
-    
+
     # 返回合并后的LoadedOpData
     return LoadedOpData(merged, first_loaded.op_name_enum, first_loaded.filepath)
 
@@ -311,53 +311,53 @@ def query_gemm(...) -> PerformanceResult:
         # 实际时间 = max(math_bound, mem_bound)
         sol_time = max(sol_math, sol_mem)
         return sol_time, sol_math, sol_mem
-    
+
     def get_empirical(m, n, k, quant_mode) -> float:
         """经验折算：使用scale_factor调整SOL估计"""
         sol_time = get_sol(m, n, k, quant_mode)[0]
         scale_factor = 0.8  # 80%的理论峰值
         return sol_time / scale_factor
-    
+
     # 根据database_mode分支处理
     if database_mode is None:
         database_mode = self._default_database_mode
-    
+
     # 路径1：纯SOL模式（仅理论计算）
     if database_mode == common.DatabaseMode.SOL:
         sol_time, _, _ = get_sol(m, n, k, quant_mode)
         return PerformanceResult(sol_time, energy=0.0)
-    
+
     # 路径2：EMPIRICAL模式（理论折算）
     elif database_mode == common.DatabaseMode.EMPIRICAL:
         return PerformanceResult(get_empirical(m, n, k, quant_mode), energy=0.0)
-    
+
     # 路径3：SILICON或HYBRID模式（数据库查询）
     else:
         def get_silicon():
             """核心：从性能数据库中查询GEMM性能"""
             # 第一步：验证数据是否成功加载
             self._gemm_data.raise_if_not_loaded()
-            
+
             # 获取规范化的量化模式（某些模式共享数据表）
             table_quant_mode = self._normalize_gemm_quant_mode_for_table(quant_mode)
-            
+
             # 验证表中是否存在该量化模式
             if table_quant_mode not in self._gemm_data:
                 raise PerfDataNotAvailableError(
                     f"GEMM perf data not available for quant_mode='{quant_mode.name}'. "
                     f"Supported: {sorted([k.name for k in self._gemm_data])}"
                 )
-            
+
             gemm_data = self._gemm_data[table_quant_mode]
-            
+
             # 查询策略1：精确匹配（数据库中恰好存在）
             if m in gemm_data and n in gemm_data[m] and k in gemm_data[m][n]:
                 result = gemm_data[m][n][k]  # {'latency': 2.145, 'power': 350.0, 'energy': 750.675}
                 return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
-            
+
             # 查询策略2：一维插值（M维度不存在，但有相邻的M值）
             m_values = sorted(
-                m_key for m_key in gemm_data 
+                m_key for m_key in gemm_data
                 if n in gemm_data[m_key] and k in gemm_data[m_key][n]
             )
             if len(m_values) >= 2:
@@ -372,12 +372,12 @@ def query_gemm(...) -> PerformanceResult:
                     m
                 )
                 return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
-            
+
             # 查询策略3：三维插值（上述两种都失败，使用立方样条或其他高阶插值）
             result = self._interp_3d(m, n, k, gemm_data, method="cubic")
             # result = {'latency': 2.156, 'power': 0.0, 'energy': 0.0}
             return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
-        
+
         # 调用统一的SILICON/HYBRID桥接器
         return self._query_silicon_or_hybrid(
             get_silicon=get_silicon,
@@ -403,14 +403,14 @@ def _query_silicon_or_hybrid(
     try:
         # 尝试使用SILICON模式（从数据库查询）
         return get_silicon()
-    
+
     except Exception as e:
         # HYBRID模式下，异常被捕获并自动降级
         if database_mode == common.DatabaseMode.HYBRID:
             logger.debug(f"{error_msg} Will try empirical mode.")
             # 从理论模型降级获取性能估计
             return PerformanceResult(get_empirical(), energy=0.0, source="empirical")
-        
+
         # SILICON模式下，异常被重新抛出（失败快速原则）
         raise
 ```
@@ -432,10 +432,10 @@ def _interp_1d(self, x_points: list, y_points: list, x_query: float) -> dict | f
     """
     x0, x1 = x_points
     y0, y1 = y_points
-    
+
     # 线性插值公式：y = y0 + (x - x0) / (x1 - x0) * (y1 - y0)
     alpha = (x_query - x0) / (x1 - x0)
-    
+
     if isinstance(y0, dict):
         # 对字典中的每个指标分别插值
         result = {}
@@ -458,14 +458,14 @@ def _interp_3d(self, x: int, y: int, z: int, data: dict, method: str = "cubic") 
     # 构造类似 points: [(x0,y0,z0), (x0,y0,z1), ...], values: [lat0, lat1, ...]
     points = []
     latencies = []
-    
+
     for x_key in data:
         for y_key in data[x_key]:
             for z_key in data[x_key][y_key]:
                 value = data[x_key][y_key][z_key]
                 points.append([x_key, y_key, z_key])
                 latencies.append(self._get_value(value, "latency"))
-    
+
     # Step 2: 使用scipy的插值函数
     if method == "cubic":
         # 构造cubic RBF插值器
@@ -484,13 +484,13 @@ def _interp_3d(self, x: int, y: int, z: int, data: dict, method: str = "cubic") 
             latencies,
             function='linear'
         )
-    
+
     # Step 3: 查询指定点的插值结果
     interpolated_latency = float(rbf(x, y, z))
-    
+
     # 对energy也进行同样的插值
     # ...
-    
+
     return {
         "latency": interpolated_latency,
         "power": 0.0,
@@ -510,7 +510,7 @@ GemmOp(m=4096, n=4096, k=4096, quant_mode=bfloat16).execute_time(db)
 [查询层 (perf_database.py)]
   ↓
 database.query_gemm(
-    m=4096, n=4096, k=4096, 
+    m=4096, n=4096, k=4096,
     quant_mode=GEMMQuantMode.bfloat16,
     database_mode=DatabaseMode.SILICON
 )
@@ -554,7 +554,7 @@ database.query_gemm(
 | 精确匹配 | 直接字典查表 | 一次O(1)查找 | 最快 |
 | 一维插值 | 邻界搜索 + 线性插值 | 需要排序+扫描 | 快 |
 | 三维插值 | RBF基函数拟合 | 涉及scipy计算 | 慢（但被LRU缓存补偿） |
-| 理论估计 | SOL/EMPIRICAL计算 | 无数据库依赖 | 快且鲁棒 | 
+| 理论估计 | SOL/EMPIRICAL计算 | 无数据库依赖 | 快且鲁棒 |
 
 ### 4. 完整端到端执行流程总结
 
@@ -595,26 +595,26 @@ model = get_model(
 class DeepSeekV4Model(BaseModel):
     def __init__(self, ..., db):
         self.db = db  # 保存数据库引用
-        
+
         # 根据配置构建Ops列表
         self.ops = self._build_ops()  # 包含数千个Ops对象
-        
+
     def _build_ops(self):
         """为模型的每一层、每个计算阶段构建对应的Ops"""
         ops_list = []
-        
+
         for layer_idx in range(num_layers):
             # 注意力模块Ops
             ctx_attn_ops = self._attention_ops(layer_idx, phase="context")
             # ctx_attn_ops 包含: [attention_pre_ops, qkv_gemm, attn_compute, attn_post_ops]
-            
+
             # FFN模块Ops
             ffn_ops = self._ffn_ops(layer_idx)
             # ffn_ops 包含: [up_gemm, gate_gemm, down_gemm, ...]
-            
+
             ops_list.extend(ctx_attn_ops)
             ops_list.extend(ffn_ops)
-        
+
         return ops_list
 ```
 
@@ -626,21 +626,21 @@ class InferenceSession:
     def __init__(self, model, db):
         self.model = model
         self.db = db
-    
+
     def mix_step(self, prefill_tokens, decode_tokens):
         """执行一次混合推理步骤"""
         total_time = 0
-        
+
         for layer_idx in range(self.model.num_layers):
             # 前缀填充阶段
             if prefill_tokens > 0:
                 prefill_attn_latency = self._execute_attn_ops(
-                    layer_idx, 
+                    layer_idx,
                     phase="context",
                     n_tokens=prefill_tokens
                 )
                 total_time += prefill_attn_latency
-            
+
             # 解码生成阶段
             if decode_tokens > 0:
                 decode_attn_latency = self._execute_attn_ops(
@@ -649,14 +649,14 @@ class InferenceSession:
                     n_tokens=decode_tokens
                 )
                 total_time += decode_attn_latency
-        
+
         return total_time
-    
+
     def _execute_attn_ops(self, layer_idx, phase, n_tokens):
         """执行注意力层Ops并查询性能数据"""
         layer_ops = self.model.ops[layer_idx][phase]["attention"]
         total_latency = 0
-        
+
         for op in layer_ops:
             # Ops.query_ideal()方法触发数据库查询
             op_latency_ms = op.query_ideal(self.db)
@@ -664,9 +664,9 @@ class InferenceSession:
             # - GemmOp(m=4096, n=32000, k=4096, ...)
             # - AttentionOp(seq_len=4096, num_heads=128, ...)
             # - CommOp(message_size=16MB, num_gpus=8, ...)
-            
+
             total_latency += op_latency_ms
-        
+
         return total_latency
 ```
 
@@ -688,7 +688,7 @@ class GemmOp(Op):
         self.n = n
         self.k = k
         self.quant_mode = quant_mode
-    
+
     def query_ideal(self, database: PerfDatabase, **kwargs) -> float:
         """
         执行流程：
@@ -713,7 +713,7 @@ class AttentionOp(Op):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.phase = phase  # "context" 或 "generation"
-    
+
     def query_ideal(self, database: PerfDatabase, **kwargs) -> float:
         if self.phase == "context":
             return database.query_context_attention(
@@ -812,7 +812,7 @@ def load_custom_op_data(custom_op_file):
     if not os.path.exists(custom_op_file):
         logger.debug(f"Custom op file {custom_op_file} not found.")
         return None
-    
+
     custom_op_data = defaultdict(lambda: defaultdict(...))
     with open(custom_op_file) as f:
         reader = csv.DictReader(f)
@@ -846,20 +846,20 @@ def query_custom_op(self, param1: int, param2: int, ...) -> PerformanceResult:
     def get_sol(param1, param2, ...):
         # 理论计算逻辑
         return sol_time
-    
+
     if self._default_database_mode == DatabaseMode.SOL:
         return PerformanceResult(get_sol(...), energy=0.0)
-    
+
     def get_silicon():
         self._custom_op_data.raise_if_not_loaded()
-        
+
         # 查表逻辑（精确匹配 → 一维插值 → 三维插值）
         if param1 in self._custom_op_data and ...:
             result = self._custom_op_data[param1][...]
             return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
-        
+
         # 插值逻辑...
-    
+
     return self._query_silicon_or_hybrid(
         get_silicon=get_silicon,
         get_empirical=lambda: get_sol(...),

@@ -8,18 +8,18 @@
 
 *   **专有的配置加载限制 (`DeepSeekV4Config`)**：
     由于引入 mHC（前后的汇聚/路由）和大量非统一压缩 Attention 块，框架强制检查 `self.extra_params` 必须解析为合法的 `DeepSeekV4Config` 类对象。
-    
+
 *   **压缩比例白名单判定 (`_SUPPORTED_COMPRESS_RATIOS`)**：
     ```python
     _SUPPORTED_COMPRESS_RATIOS: ClassVar[set[int]] = {0, 4, 128}
     ```
     强制约定压缩粒率只能是预定义的这几种模式：如 `0` 代表 SWA 层（不压缩或近似直接截断滑动窗口），`128` 等代表典型的高段 HCA (Heuristically Compressed Attention)。对于未知比率框架直接抛出非法异常，以防没有对应的算力测定数据库可用。
-    
+
 *   **拓扑并行断言 (Assert) 及多步预测补偿 (`_mtp_scale_factor`)**：
     这部分保留了 DeepSeek V3.2 同样的验证逻辑：确保整体的 `tp_size * attention_dp_size == moe_tp_size * moe_ep_size` 的通讯环闭合前提，并且运用投机期模型生成加速比测算单次 Decode Token 需要被放大或折叠的模型层厚 `_mtp_scale_factor`。
-    
+
 *   **Attention 块代理分发层 (`_attention_ops`)**：
-    这是一个特殊的内置闭包构造函数。在推演 Attention 时不只插入单一的 `ops`，而是通过对配置文件中携带的 `compress_ratios`（比如总共 60 层，有部分是 SWA，有部分是 128 压缩）按计数值（`Counter()`）统计，然后再把这些特殊的异构 Attention 模块**拼接为一个混合列表插入仿真图纸**中。这也是极其罕见的**按属性频率动态组合长算力 Ops 链**的设计。 
+    这是一个特殊的内置闭包构造函数。在推演 Attention 时不只插入单一的 `ops`，而是通过对配置文件中携带的 `compress_ratios`（比如总共 60 层，有部分是 SWA，有部分是 128 压缩）按计数值（`Counter()`）统计，然后再把这些特殊的异构 Attention 模块**拼接为一个混合列表插入仿真图纸**中。这也是极其罕见的**按属性频率动态组合长算力 Ops 链**的设计。
 
 ## 2. Ops 仿真图纸表 (Ops Table)
 

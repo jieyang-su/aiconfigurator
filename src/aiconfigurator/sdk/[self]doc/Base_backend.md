@@ -25,7 +25,7 @@
     *   **输入**：包含步长限制 `stride` 以及最终生成边界 `osl` 变量。
     *   **输出**：格式与 Context 阶段一致字典结果包。
     *   **逻辑**：生成段耗时并非匀速！其由于 KV Cache 的推移而增长。因此基类设计了步进（Stride）抽样计算机制：即不再一轮轮傻算到最后一颗 token，而是以 `stride` 为间隔点取样并乘以 `repeat_count` 加速推断以提高代码搜索率。
-*   **`_run_static_breakdown`**: 
+*   **`_run_static_breakdown`**:
     这是一个整合上述两个方法的内部中继枢纽。它根据上层传达的 `mode` (是 prefill 纯测还是全链路)，选择对应的 phase 并直接乘上误差抵消校准缩放常数 (`latency_correction_scale`)。
 
 ### 2.2 仿真指标核算收口 (Simulation Aggregation)
@@ -59,10 +59,10 @@ sequenceDiagram
     participant Model as BaseModel
     participant Op as Operation(算子层)
     participant DB as PerfDatabase
-    
+
     Session ->> Backend: run_static(runtime_config, mode)
     Backend ->> Backend: _run_static_breakdown()
-    
+
     rect rgb(240, 240, 255)
         Note over Backend, DB: 【Phase 1】 Context / Prefill 阶段
         Backend ->> Model: 获取模型特有 context_ops 列表
@@ -73,7 +73,7 @@ sequenceDiagram
             Op -->> Backend: 返回并累加至总字典
         end
     end
-    
+
     rect rgb(255, 245, 240)
         Note over Backend, DB: 【Phase 2】 Generation / Decode 阶段
         Backend ->> Model: 提取 generation_ops
@@ -84,7 +84,7 @@ sequenceDiagram
             end
         end
     end
-    
+
     Backend ->> Backend: (动态分包)_get_memory_usage() [由vLLM等子类按规范重写]
     Backend ->> Backend: 核算全维度指标：E2E吞吐、瓦特/性能转换率、TPOT 等等
     Backend -->> Session: 返回拼装好的完整 InferenceSummary

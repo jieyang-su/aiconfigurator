@@ -18,7 +18,7 @@
 ### 2.1 InferenceSession (同构/单集群测算)
 
 主要用于前后端阶段耦合在同一批显卡上执行的场景。核心函数均输出经过规范化的 `InferenceSummary` 数据类包装体。
-*   **`__init__(model, database, backend)`**: 
+*   **`__init__(model, database, backend)`**:
     *   **解析**：绑定模型结构（算子拓扑）、硬件数据库（微观时延）与推理后端（宏观调度通信）三大底层对象，界定本次仿真评估的唯一基准物理环境。
 *   **`run_static(runtime_config, mode, stride, latency_correction_scale)`**:
     *   **输入**：包含ISL/OSL等负载数据的 `runtime_config`，评估阶段 `mode` (如 `static_ctx`或`static_gen`)，外加步长参数及修正偏差常数。
@@ -36,7 +36,7 @@
 针对 Prefill（计算密集型，主要受限于算力）和 Decode（访存密集型，显存占用极大）进行两阶段解耦分离评测，以求提高系统流水线总利用率。
 *   **双引擎独立管理 (`__init__`)**: 初始化时按阶段持有对应的 `database` 和 `backend` 实例（共两套），以满足前后端存在机型代差（如节点算存比差异）的环境。
 *   **配置退场系数 (`set_rate_matching_degradation_factors`)**: 设置 `prefill_degradation_factor` 惩罚掉微小气泡引发的理想衰减，以 `decode_degradation_factor` 防止解码阶段未充分饱和带来的过高估计。
-*   **候选节点池构建 (`get_worker_candidates(..., parallel_config_list, b_list)`)**: 
+*   **候选节点池构建 (`get_worker_candidates(..., parallel_config_list, b_list)`)**:
     *   **输入**：模型参数、多维全空间并行枚举组合表（支持全新的如 `tp, pp, dp, moe_tp, moe_ep` 5D并行下发）以及批次步长范围 `b_list`。
     *   **输出**：所有经过验证不超时、不致爆显存（Non-OOM）的单阶段组合候选项（格式统一为 `pandas.DataFrame`）。
     *   **逻辑**：嵌套扫描解空间。逐个实例化出临时单点 `InferenceSession` 验证。由于 OOM 的特性递增，遇到超显存用量则安全 break 退出同支枚举循环。
@@ -62,15 +62,15 @@
 ```mermaid
 sequenceDiagram
     autonumber
-    
+
     actor User as 上层应用 / API
     participant Session as DisaggInferenceSession
     participant Backend as Prefill/Decode Backend
     participant Model as Prefill/Decode BaseModel
-    
+
     User ->> Session: 初始化 (绑定 Database, Backend)
     User ->> Session: 发起最优化求值<br>find_best_disagg_result_under_constraints()
-    
+
     rect rgb(240, 248, 255)
         Note over Session,Model: 阶段: 并发候选池推演
         Session ->> Session: get_worker_candidates()<br>生成 MoE(tp/ep) 并行度、批处理尺寸枚举
@@ -79,13 +79,13 @@ sequenceDiagram
         Backend ->> Backend: 结合硬件 DB 计算算力和微时延并叠加 Overhead
         Backend -->> Session: 回传带有时延与吞吐的 InferenceSummary
     end
-    
+
     rect rgb(255, 248, 240)
         Note over Session,Session: 阶段: 基于 SLA 的过滤及配平
         Session ->> Session: 基于 TTFT/TPOT 限度过滤冗余
         Session ->> Session: Rate Matching 查表匹配<br>核算 throughput_per_gpu 并选取前后端配比
     end
-    
+
     Session -->> User: 回传全局最优 InferenceSummary<br>(含 OOM提示, 最终架构配比等)
 ```
 
