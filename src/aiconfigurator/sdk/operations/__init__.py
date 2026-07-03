@@ -29,7 +29,7 @@ from aiconfigurator.sdk.operations.dsv4 import (
 )
 from aiconfigurator.sdk.operations.elementwise import ElementWise
 from aiconfigurator.sdk.operations.embedding import Embedding
-from aiconfigurator.sdk.operations.gemm import GEMM
+from aiconfigurator.sdk.operations.gemm import GEMM, ContextKVBProjGEMM
 from aiconfigurator.sdk.operations.mamba import GDNKernel, Mamba2, Mamba2Kernel
 from aiconfigurator.sdk.operations.mla import (
     ContextMLA,
@@ -50,6 +50,7 @@ from aiconfigurator.sdk.performance_result import PerformanceResult
 
 __all__ = [
     "GEMM",
+    "ContextKVBProjGEMM",
     "NCCL",
     "P2P",
     "ContextAttention",

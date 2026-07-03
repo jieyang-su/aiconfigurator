@@ -182,7 +182,7 @@ class DeepSeekModel(BaseModel):
                             1536,
                             gemm_quant_mode,
                         ),
-                        ops.GEMM(
+                        ops.ContextKVBProjGEMM(
                             "context_kv_b_proj_gemm",
                             self._num_layers,
                             32768 // tp_size,
@@ -648,7 +648,7 @@ class TrtllmWideEPDeepSeekModel(BaseModel):
                     1536,
                     gemm_quant_mode,
                 ),
-                ops.GEMM(
+                ops.ContextKVBProjGEMM(
                     "context_kv_b_proj_gemm",
                     self._num_layers,
                     32768 // tp_size,
