@@ -119,9 +119,11 @@ class DeepSeekModel(BaseModel):
         gemm_quant_mode = self.config.gemm_quant_mode
         moe_quant_mode = self.config.moe_quant_mode
 
-        # Old granular generation MLA path derived an mla_bmm_quant_mode here
-        # for MLABmm(pre/post). The ordinary DeepSeek generation path now uses
-        # module-level MLA data, so BMM precision is handled by the module query.
+        mla_bmm_quant_mode = (
+            common.GEMMQuantMode.fp8
+            if gemm_quant_mode != common.GEMMQuantMode.bfloat16
+            else common.GEMMQuantMode.bfloat16
+        )
 
         h = self._hidden_size  # 7168
         tp_size = self.config.tp_size
@@ -144,27 +146,12 @@ class DeepSeekModel(BaseModel):
             else self.config.workload_distribution
         )
 
-        self.context_ops.extend(
-            [
-                ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3),
-                ops.ElementWise("context_add_norm_1", self._num_layers, 2 * h, 2 * h, 0.8),
-                # qkv_a/downscale is outside SGLang's MLA module collector boundary.
-                # Keep it as a shared op so both module and granular paths count it once.
+        if self._backend_name == "sglang":
+            context_mla_ops = [
                 ops.GEMM("context_downscale_gemm", self._num_layers, 2112, h, gemm_quant_mode),
-                # Old behavior:
-                #   ops.FallbackOp(primary=ops.MLAModule(...), fallback=[context_downscale_gemm, ...])
-                # That made the path depend on perf-table availability and counted
-                # downscale only when falling back. The refreshed H100 comparison
-                # shows the semantic rule should be explicit: prefix=0 uses the
-                # module table; prefix>0 uses granular ops where prefix correction
-                # is applied at the attention-kernel level.
                 ops.PrefixConditionalOp(
                     "context_mla_block",
                     no_prefix_ops=[
-                        # The archived SGLang module data lives in
-                        # wideep_context_mla_perf.txt. Reuse the WideEP op
-                        # wrapper here instead of the legacy mla_*_module path,
-                        # whose txt files are not present in systems/data.
                         ops.WideEPContextMLA(
                             "context_mla_module",
                             self._num_layers,
@@ -189,16 +176,50 @@ class DeepSeekModel(BaseModel):
                             512,
                             gemm_quant_mode,
                         ),
-                        *(
-                            [
-                                ops.MLAConcatK(
-                                    "context_mla_concat_k",
-                                    self._num_layers,
-                                    128 // tp_size,
-                                )
-                            ]
-                            if self._backend_name == "sglang"
-                            else []
+                        ops.MLAConcatK(
+                            "context_mla_concat_k",
+                            self._num_layers,
+                            128 // tp_size,
+                        ),
+                        ops.ContextMLA(
+                            "context_attention",
+                            self._num_layers,
+                            128 // tp_size,
+                            kvcache_quant_mode,
+                            fmha_quant_mode,
+                        ),
+                        ops.GEMM("context_proj_gemm", self._num_layers, h, 128 * 128 // tp_size, gemm_quant_mode),
+                    ],
+                ),
+            ]
+        else:
+            context_mla_ops = [
+                ops.FallbackOp(
+                    "context_mla_block",
+                    primary=ops.MLAModule(
+                        "context_mla_module",
+                        self._num_layers,
+                        True,
+                        128 // tp_size,
+                        kvcache_quant_mode,
+                        fmha_quant_mode,
+                        gemm_quant_mode,
+                    ),
+                    fallback=[
+                        ops.GEMM("context_downscale_gemm", self._num_layers, 2112, h, gemm_quant_mode),
+                        ops.GEMM(
+                            "context_q_b_proj_gemm",
+                            self._num_layers,
+                            24576 // tp_size,
+                            1536,
+                            gemm_quant_mode,
+                        ),
+                        ops.GEMM(
+                            "context_kv_b_proj_gemm",
+                            self._num_layers,
+                            32768 // tp_size,
+                            512,
+                            gemm_quant_mode,
                         ),
                         ops.ContextAttention(
                             "context_attention",
@@ -219,7 +240,14 @@ class DeepSeekModel(BaseModel):
                         ),
                         ops.GEMM("context_proj_gemm", self._num_layers, h, 128 * 128 // tp_size, gemm_quant_mode),
                     ],
-                ),
+                )
+            ]
+
+        self.context_ops.extend(
+            [
+                ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3),
+                ops.ElementWise("context_add_norm_1", self._num_layers, 2 * h, 2 * h, 0.8),
+                *context_mla_ops,
                 ops.ElementWise("context_add_norm_2", self._num_layers, 2 * h, 2 * h, 0.8),
             ]
         )
@@ -346,6 +374,98 @@ class DeepSeekModel(BaseModel):
                     tp_size,
                 )
             )
+        if self._backend_name == "sglang":
+            generation_mla_ops = [
+                ops.GEMM(
+                    "generation_downscale_gemm",
+                    self._num_layers * self._mtp_scale_factor,
+                    2112,
+                    h,
+                    gemm_quant_mode,
+                ),
+                ops.WideEPGenerationMLA(
+                    "generation_mla_module",
+                    self._num_layers * self._mtp_scale_factor,
+                    tp_size,
+                    kvcache_quant_mode,
+                    mla_module_quant_mode,
+                    attn_backend,
+                ),
+            ]
+        else:
+            generation_mla_ops = [
+                ops.FallbackOp(
+                    "generation_mla_block",
+                    primary=ops.MLAModule(
+                        "generation_mla_module",
+                        self._num_layers * self._mtp_scale_factor,
+                        False,
+                        128 // tp_size,
+                        kvcache_quant_mode,
+                        fmha_quant_mode,
+                        gemm_quant_mode,
+                    ),
+                    fallback=[
+                        ops.GEMM(
+                            "generation_downscale_gemm",
+                            self._num_layers * self._mtp_scale_factor,
+                            2112,
+                            h,
+                            gemm_quant_mode,
+                        ),
+                        ops.GEMM(
+                            "generation_q_b_proj_gemm",
+                            self._num_layers * self._mtp_scale_factor,
+                            24576 // tp_size,
+                            1536,
+                            gemm_quant_mode,
+                        ),
+                        *(
+                            [
+                                ops.GenerationAttention(
+                                    "generation_attention",
+                                    self._num_layers * self._mtp_scale_factor,
+                                    self._num_heads // tp_size,
+                                    self._num_kv_heads // tp_size,
+                                    kvcache_quant_mode,
+                                    head_size=self._vllm_head_size,
+                                )
+                            ]
+                            if self._backend_name == "vllm"
+                            else [
+                                ops.MLABmm(
+                                    "generation_bmm_pre",
+                                    self._num_layers * self._mtp_scale_factor,
+                                    self._num_heads // tp_size,
+                                    mla_bmm_quant_mode,
+                                    if_pre=True,
+                                ),
+                                ops.GenerationMLA(
+                                    "generation_attention",
+                                    self._num_layers * self._mtp_scale_factor,
+                                    128 // tp_size,
+                                    kvcache_quant_mode,
+                                ),
+                                ops.MLABmm(
+                                    "generation_bmm_post",
+                                    self._num_layers * self._mtp_scale_factor,
+                                    self._num_heads // tp_size,
+                                    mla_bmm_quant_mode,
+                                    if_pre=False,
+                                ),
+                            ]
+                        ),
+                        ops.GEMM(
+                            "generation_proj_gemm",
+                            self._num_layers * self._mtp_scale_factor,
+                            h,
+                            h // tp_size,
+                            gemm_quant_mode,
+                        ),
+                    ],
+                )
+            ]
+
         #####generation part, only generation part is scaled by mtp_scale_factor
         self.generation_ops.extend(
             [
@@ -357,32 +477,7 @@ class DeepSeekModel(BaseModel):
                     2 * h,
                     0.8,
                 ),
-                # qkv_a/downscale is not part of the collected MLA module; model it
-                # once before the module op. Decode/generation always follows the
-                # module-level MLA path for ordinary DeepSeek SGLang comparisons.
-                ops.GEMM(
-                    "generation_downscale_gemm",
-                    self._num_layers * self._mtp_scale_factor,
-                    2112,
-                    h,
-                    gemm_quant_mode,
-                ),
-                # Old behavior:
-                #   ops.FallbackOp(primary=ops.MLAModule(...), fallback=[generation_downscale_gemm, ...])
-                # This mixed the module path with a data-availability fallback and
-                # could duplicate the qkv_a/downscale semantic when comparing with
-                # the collector boundary. Keep generation on the module path.
-                # The archived SGLang generation module data lives in
-                # wideep_generation_mla_perf.txt, so use the WideEP query
-                # wrapper rather than the absent legacy mla_*_module files.
-                ops.WideEPGenerationMLA(
-                    "generation_mla_module",
-                    self._num_layers * self._mtp_scale_factor,
-                    tp_size,
-                    kvcache_quant_mode,
-                    mla_module_quant_mode,
-                    attn_backend,
-                ),
+                *generation_mla_ops,
                 ops.ElementWise(
                     "generation_add_norm_2",
                     self._num_layers * self._mtp_scale_factor,
