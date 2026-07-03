@@ -369,8 +369,8 @@ class MLAConcatK(Operation):
         selected_kernel_source = kernel_source or cls._select_kernel_source(num_heads)
 
         def interp_1d_tokens(token_dict: dict, target_tokens: int):
-            left, right = database._nearest_1d_point_helper(target_tokens, sorted(token_dict.keys()), inner_only=False)
-            return database._interp_1d([left, right], [token_dict[left], token_dict[right]], target_tokens)
+            left, right = interpolation.nearest_1d_point_helper(target_tokens, sorted(token_dict.keys()), inner_only=False)
+            return interpolation.interp_1d([left, right], [token_dict[left], token_dict[right]], target_tokens)
 
         def get_silicon():
             if not data_wrapper.loaded:
@@ -381,10 +381,10 @@ class MLAConcatK(Operation):
                 result = interp_1d_tokens(source_dict[num_heads], num_tokens)
             else:
                 available_heads = sorted(source_dict.keys())
-                left_heads, right_heads = database._nearest_1d_point_helper(num_heads, available_heads, inner_only=False)
+                left_heads, right_heads = interpolation.nearest_1d_point_helper(num_heads, available_heads, inner_only=False)
                 left_result = interp_1d_tokens(source_dict[left_heads], num_tokens)
                 right_result = interp_1d_tokens(source_dict[right_heads], num_tokens)
-                result = database._interp_1d([left_heads, right_heads], [left_result, right_result], num_heads)
+                result = interpolation.interp_1d([left_heads, right_heads], [left_result, right_result], num_heads)
             if isinstance(result, dict):
                 return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
             return PerformanceResult(result, energy=0.0)
