@@ -19,6 +19,39 @@ def _recorded_distribution_name(distribution: str, *, enable_eplb: bool) -> str:
     return distribution
 
 
+def _count_deepseek_ffn_layers(num_layers: int, extra_params) -> tuple[int, int]:
+    """Return (dense_layers, moe_layers) using DeepSeek/SGLang layer rules."""
+    if not isinstance(extra_params, dict):
+        return 0, num_layers
+
+    first_k_dense_replace = int(extra_params.get("first_k_dense_replace") or 0)
+    first_k_dense_replace = max(0, min(first_k_dense_replace, num_layers))
+    moe_layer_freq = extra_params.get("moe_layer_freq", 1)
+
+    if isinstance(moe_layer_freq, (list, tuple)):
+        moe_layers = 0
+        for layer_id in range(num_layers):
+            if (
+                layer_id >= first_k_dense_replace
+                and layer_id < len(moe_layer_freq)
+                and int(moe_layer_freq[layer_id])
+            ):
+                moe_layers += 1
+    else:
+        moe_layer_freq = int(moe_layer_freq or 0)
+        if moe_layer_freq <= 0:
+            moe_layers = 0
+        else:
+            moe_layers = sum(
+                1
+                for layer_id in range(num_layers)
+                if layer_id >= first_k_dense_replace and layer_id % moe_layer_freq == 0
+            )
+
+    dense_layers = num_layers - moe_layers
+    return dense_layers, moe_layers
+
+
 @register_model("DEEPSEEK", "KIMIK25")
 class DeepSeekModel(BaseModel):
     """
@@ -99,6 +132,17 @@ class DeepSeekModel(BaseModel):
         self._topk = topk
         self._num_experts = num_experts
         self._moe_inter_size = moe_inter_size
+        self._num_dense_layers, self._num_moe_layers = _count_deepseek_ffn_layers(
+            self._num_layers,
+            self.extra_params,
+        )
+        if self._num_dense_layers:
+            logger.info(
+                "DeepSeek FFN layer mix for %s: dense_layers=%s, moe_layers=%s",
+                self.model_path,
+                self._num_dense_layers,
+                self._num_moe_layers,
+            )
 
         # used to scale the tpot to reflect mtp effect:
         # 1. mtp will reduce the overall time by expected_tokens_per_step
@@ -252,102 +296,130 @@ class DeepSeekModel(BaseModel):
             ]
         )
 
-        # Context shared moe: gate+up fused into one GEMM (matches TRT-LLM GatedMLP).
-        # Context phase runs sequentially (no CUDA Graph), so no OverlapOp here
-        # unlike the generation phase which overlaps shared/routed on parallel streams.
-        self.context_ops.extend(
-            [
-                ops.GEMM(
-                    "context_shared_gate_up_gemm",
-                    self._num_layers,
-                    2 * self._moe_inter_size // tp_size,
-                    h,
-                    gemm_quant_mode,
-                ),
-                ops.ElementWise(
-                    "context_shared_act_gate",
-                    self._num_layers,
-                    2 * self._moe_inter_size // tp_size,
-                    self._moe_inter_size // tp_size,
-                    0.8,
-                ),
-                ops.GEMM(
-                    "context_shared_ffn2_gemm",
-                    self._num_layers,
-                    h,
-                    self._moe_inter_size // tp_size,
-                    gemm_quant_mode,
-                ),
-            ]
-        )
+        if self._num_dense_layers:
+            self.context_ops.extend(
+                [
+                    ops.GEMM(
+                        "context_dense_gate_up_gemm",
+                        self._num_dense_layers,
+                        2 * self._inter_size // tp_size,
+                        h,
+                        gemm_quant_mode,
+                    ),
+                    ops.ElementWise(
+                        "context_dense_act_gate",
+                        self._num_dense_layers,
+                        2 * self._inter_size // tp_size,
+                        self._inter_size // tp_size,
+                        0.8,
+                    ),
+                    ops.GEMM(
+                        "context_dense_ffn2_gemm",
+                        self._num_dense_layers,
+                        h,
+                        self._inter_size // tp_size,
+                        gemm_quant_mode,
+                    ),
+                ]
+            )
 
-        # router gemm, num_experts is large enough, cannot be ignored anymore.
-        self.context_ops.extend(
-            [
-                ops.GEMM(
-                    "context_router_gemm",
-                    self._num_layers,
-                    self._num_experts,
-                    h,
-                    common.GEMMQuantMode.bfloat16,
-                )
-            ]
-        )
+        if self._num_moe_layers:
+            # Context shared moe: gate+up fused into one GEMM (matches TRT-LLM GatedMLP).
+            # Context phase runs sequentially (no CUDA Graph), so no OverlapOp here
+            # unlike the generation phase which overlaps shared/routed on parallel streams.
+            self.context_ops.extend(
+                [
+                    ops.GEMM(
+                        "context_shared_gate_up_gemm",
+                        self._num_moe_layers,
+                        2 * self._moe_inter_size // tp_size,
+                        h,
+                        gemm_quant_mode,
+                    ),
+                    ops.ElementWise(
+                        "context_shared_act_gate",
+                        self._num_moe_layers,
+                        2 * self._moe_inter_size // tp_size,
+                        self._moe_inter_size // tp_size,
+                        0.8,
+                    ),
+                    ops.GEMM(
+                        "context_shared_ffn2_gemm",
+                        self._num_moe_layers,
+                        h,
+                        self._moe_inter_size // tp_size,
+                        gemm_quant_mode,
+                    ),
+                ]
+            )
 
-        # dispatch tokens to experts, pre-dispatch
-        self.context_ops.extend(
-            [
-                ops.MoEDispatch(
-                    "context_moe_pre_dispatch",
-                    self._num_layers,
-                    h,
-                    self._topk,
-                    self._num_experts,
-                    moe_tp_size,
-                    moe_ep_size,
-                    attention_dp_size,
-                    True,
-                    quant_mode=moe_quant_mode,
-                )
-            ]
-        )
+            # router gemm, num_experts is large enough, cannot be ignored anymore.
+            self.context_ops.extend(
+                [
+                    ops.GEMM(
+                        "context_router_gemm",
+                        self._num_moe_layers,
+                        self._num_experts,
+                        h,
+                        common.GEMMQuantMode.bfloat16,
+                    )
+                ]
+            )
 
-        # moe part
-        self.context_ops.extend(
-            [
-                ops.MoE(
-                    "context_moe",
-                    self._num_layers,
-                    h,
-                    self._moe_inter_size,
-                    self._topk,
-                    self._num_experts,
-                    moe_tp_size,
-                    moe_ep_size,
-                    moe_quant_mode,
-                    workload_distribution,
-                    attention_dp_size,
-                )
-            ]
-        )
+            # dispatch tokens to experts, pre-dispatch
+            self.context_ops.extend(
+                [
+                    ops.MoEDispatch(
+                        "context_moe_pre_dispatch",
+                        self._num_moe_layers,
+                        h,
+                        self._topk,
+                        self._num_experts,
+                        moe_tp_size,
+                        moe_ep_size,
+                        attention_dp_size,
+                        True,
+                        quant_mode=moe_quant_mode,
+                    )
+                ]
+            )
 
-        # dispatch tokens to experts, post-dispatch
-        self.context_ops.extend(
-            [
-                ops.MoEDispatch(
-                    "context_moe_post_dispatch",
-                    self._num_layers,
-                    h,
-                    self._topk,
-                    self._num_experts,
-                    moe_tp_size,
-                    moe_ep_size,
-                    attention_dp_size,
-                    False,
-                    quant_mode=moe_quant_mode,
-                )
-            ]
-        )
+            # moe part
+            self.context_ops.extend(
+                [
+                    ops.MoE(
+                        "context_moe",
+                        self._num_moe_layers,
+                        h,
+                        self._moe_inter_size,
+                        self._topk,
+                        self._num_experts,
+                        moe_tp_size,
+                        moe_ep_size,
+                        moe_quant_mode,
+                        workload_distribution,
+                        attention_dp_size,
+                    )
+                ]
+            )
+
+            # dispatch tokens to experts, post-dispatch
+            self.context_ops.extend(
+                [
+                    ops.MoEDispatch(
+                        "context_moe_post_dispatch",
+                        self._num_moe_layers,
+                        h,
+                        self._topk,
+                        self._num_experts,
+                        moe_tp_size,
+                        moe_ep_size,
+                        attention_dp_size,
+                        False,
+                        quant_mode=moe_quant_mode,
+                    )
+                ]
+            )
 
         self.context_ops.extend(
             [
@@ -488,86 +560,114 @@ class DeepSeekModel(BaseModel):
             ]
         )
 
-        # Generation MoE: shared experts and routed experts run in parallel
-        # on different CUDA streams (via maybe_execute_in_parallel) when CUDA
-        # Graph is enabled. Model with OverlapOp: latency = max(shared, routed).
+        if self._num_dense_layers:
+            self.generation_ops.extend(
+                [
+                    ops.GEMM(
+                        "generation_dense_gate_up_gemm",
+                        self._num_dense_layers * self._mtp_scale_factor,
+                        2 * self._inter_size // tp_size,
+                        h,
+                        gemm_quant_mode,
+                    ),
+                    ops.ElementWise(
+                        "generation_dense_act_gate",
+                        self._num_dense_layers * self._mtp_scale_factor,
+                        2 * self._inter_size // tp_size,
+                        self._inter_size // tp_size,
+                        0.8,
+                    ),
+                    ops.GEMM(
+                        "generation_dense_ffn2_gemm",
+                        self._num_dense_layers * self._mtp_scale_factor,
+                        h,
+                        self._inter_size // tp_size,
+                        gemm_quant_mode,
+                    ),
+                ]
+            )
 
-        # group_b: shared expert path (aux CUDA stream)
-        gen_shared_ops = [
-            ops.GEMM(
-                "generation_shared_gate_up_gemm",
-                self._num_layers * self._mtp_scale_factor,
-                2 * self._moe_inter_size // tp_size,
-                h,
-                gemm_quant_mode,
-            ),
-            ops.ElementWise(
-                "generation_shared_act_gate",
-                self._num_layers * self._mtp_scale_factor,
-                2 * self._moe_inter_size // tp_size,
-                self._moe_inter_size // tp_size,
-                0.8,
-            ),
-            ops.GEMM(
-                "generation_shared_ffn2_gemm",
-                self._num_layers * self._mtp_scale_factor,
-                h,
-                self._moe_inter_size // tp_size,
-                gemm_quant_mode,
-            ),
-        ]
+        if self._num_moe_layers:
+            # Generation MoE: shared experts and routed experts run in parallel
+            # on different CUDA streams (via maybe_execute_in_parallel) when CUDA
+            # Graph is enabled. Model with OverlapOp: latency = max(shared, routed).
 
-        # group_a: routed expert path (main CUDA stream)
-        gen_routed_ops = [
-            ops.GEMM(
-                "generation_router_gemm",
-                self._num_layers * self._mtp_scale_factor,
-                self._num_experts,
-                h,
-                common.GEMMQuantMode.bfloat16,
-            ),
-            ops.MoEDispatch(
-                "generation_moe_pre_dispatch",
-                self._num_layers * self._mtp_scale_factor,
-                h,
-                self._topk,
-                self._num_experts,
-                moe_tp_size,
-                moe_ep_size,
-                attention_dp_size,
-                True,
-                quant_mode=moe_quant_mode,
-            ),
-            ops.MoE(
-                "generation_moe",
-                self._num_layers * self._mtp_scale_factor,
-                h,
-                self._moe_inter_size,
-                self._topk,
-                self._num_experts,
-                moe_tp_size,
-                moe_ep_size,
-                moe_quant_mode,
-                workload_distribution,
-                attention_dp_size,
-            ),
-            ops.MoEDispatch(
-                "generation_moe_post_dispatch",
-                self._num_layers * self._mtp_scale_factor,
-                h,
-                self._topk,
-                self._num_experts,
-                moe_tp_size,
-                moe_ep_size,
-                attention_dp_size,
-                False,
-                quant_mode=moe_quant_mode,
-            ),
-        ]
+            # group_b: shared expert path (aux CUDA stream)
+            gen_shared_ops = [
+                ops.GEMM(
+                    "generation_shared_gate_up_gemm",
+                    self._num_moe_layers * self._mtp_scale_factor,
+                    2 * self._moe_inter_size // tp_size,
+                    h,
+                    gemm_quant_mode,
+                ),
+                ops.ElementWise(
+                    "generation_shared_act_gate",
+                    self._num_moe_layers * self._mtp_scale_factor,
+                    2 * self._moe_inter_size // tp_size,
+                    self._moe_inter_size // tp_size,
+                    0.8,
+                ),
+                ops.GEMM(
+                    "generation_shared_ffn2_gemm",
+                    self._num_moe_layers * self._mtp_scale_factor,
+                    h,
+                    self._moe_inter_size // tp_size,
+                    gemm_quant_mode,
+                ),
+            ]
 
-        self.generation_ops.append(
-            ops.OverlapOp("generation_moe_overlap", group_a=gen_routed_ops, group_b=gen_shared_ops)
-        )
+            # group_a: routed expert path (main CUDA stream)
+            gen_routed_ops = [
+                ops.GEMM(
+                    "generation_router_gemm",
+                    self._num_moe_layers * self._mtp_scale_factor,
+                    self._num_experts,
+                    h,
+                    common.GEMMQuantMode.bfloat16,
+                ),
+                ops.MoEDispatch(
+                    "generation_moe_pre_dispatch",
+                    self._num_moe_layers * self._mtp_scale_factor,
+                    h,
+                    self._topk,
+                    self._num_experts,
+                    moe_tp_size,
+                    moe_ep_size,
+                    attention_dp_size,
+                    True,
+                    quant_mode=moe_quant_mode,
+                ),
+                ops.MoE(
+                    "generation_moe",
+                    self._num_moe_layers * self._mtp_scale_factor,
+                    h,
+                    self._moe_inter_size,
+                    self._topk,
+                    self._num_experts,
+                    moe_tp_size,
+                    moe_ep_size,
+                    moe_quant_mode,
+                    workload_distribution,
+                    attention_dp_size,
+                ),
+                ops.MoEDispatch(
+                    "generation_moe_post_dispatch",
+                    self._num_moe_layers * self._mtp_scale_factor,
+                    h,
+                    self._topk,
+                    self._num_experts,
+                    moe_tp_size,
+                    moe_ep_size,
+                    attention_dp_size,
+                    False,
+                    quant_mode=moe_quant_mode,
+                ),
+            ]
+
+            self.generation_ops.append(
+                ops.OverlapOp("generation_moe_overlap", group_a=gen_routed_ops, group_b=gen_shared_ops)
+            )
 
         self.generation_ops.extend(
             [

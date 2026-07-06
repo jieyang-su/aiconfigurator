@@ -698,6 +698,71 @@ class TestDeepSeekMLAModulePath:
         assert generation_mla._fmha_quant_mode == common.FMHAQuantMode.fp8_block
 
 
+class TestDeepSeekFFNLayerMix:
+    """Regression coverage for cropped DeepSeek dense/MoE FFN layer counts."""
+
+    @staticmethod
+    def _cropped_deepseek_info():
+        return {
+            "architecture": "DeepSeekForCausalLM",
+            "layers": 6,
+            "n": 128,
+            "n_kv": 128,
+            "d": 128,
+            "hidden_size": 7168,
+            "inter_size": 18432,
+            "vocab": 129280,
+            "context": 163840,
+            "topk": 8,
+            "num_experts": 256,
+            "moe_inter_size": 2048,
+            "extra_params": {
+                "v_head_dim": 128,
+                "kv_lora_rank": 512,
+                "qk_rope_head_dim": 64,
+                "first_k_dense_replace": 3,
+                "moe_layer_freq": 1,
+            },
+            "raw_config": {},
+        }
+
+    @staticmethod
+    def _op_by_name(ops_list, name):
+        matches = [op for op in ops_list if op._name == name]
+        assert len(matches) == 1
+        return matches[0]
+
+    @patch("aiconfigurator.sdk.models._get_model_info")
+    def test_cropped_deepseek_splits_dense_and_moe_ffn_layers(self, mock_get_info):
+        mock_get_info.return_value = self._cropped_deepseek_info()
+        model_config = config.ModelConfig(
+            tp_size=1,
+            pp_size=1,
+            moe_tp_size=1,
+            moe_ep_size=1,
+            attention_dp_size=1,
+            moe_backend=None,
+        )
+
+        model = get_model("local/DeepSeek-V3-layers6", model_config, backend_name="sglang")
+
+        assert model._num_layers == 6
+        assert model._num_dense_layers == 3
+        assert model._num_moe_layers == 3
+        assert self._op_by_name(model.context_ops, "context_dense_gate_up_gemm")._scale_factor == 3
+        assert self._op_by_name(model.context_ops, "context_moe")._scale_factor == 3
+        assert self._op_by_name(model.generation_ops, "generation_dense_gate_up_gemm")._scale_factor == pytest.approx(
+            3 * model._mtp_scale_factor
+        )
+
+        moe_overlap = self._op_by_name(model.generation_ops, "generation_moe_overlap")
+        generation_moe = self._op_by_name(moe_overlap._group_a, "generation_moe")
+        assert generation_moe._scale_factor == pytest.approx(3 * model._mtp_scale_factor)
+
+        generation_mla = self._op_by_name(model.generation_ops, "generation_mla_module")
+        assert generation_mla._scale_factor == pytest.approx(6 * model._mtp_scale_factor)
+
+
 class TestKVCacheElementsPerToken:
     """Regression tests for ``BaseModel.get_kvcache_elements_per_token``.
 
