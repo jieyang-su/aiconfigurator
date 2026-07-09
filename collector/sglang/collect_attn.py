@@ -9,7 +9,7 @@ shape intent should live in YAML; this file owns SGLang backend construction,
 KV-cache setup, SM-specific skips, and perf logging for the SGLang runtime.
 """
 
-__compat__ = "sglang>=0.5.10rc0"
+__compat__ = "sglang>=0.5.9"
 
 import math
 import os

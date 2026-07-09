@@ -943,56 +943,30 @@ def _run_ordinary_moe_materialization_postprocess(args, ops: list[str] | None) -
         return
 
     repo_root = _repo_root()
-    scripts = {
-        "shape": repo_root / "tools/moe_calibration/analyze_ordinary_moe_replay_shape.py",
-        "materialize": repo_root / "tools/moe_calibration/materialize_ordinary_moe_profile_free_source.py",
-    }
-
-    def _run_python(command: list[str], *, label: str) -> None:
-        if logger is not None:
-            logger.info("%s:\n  %s", label, " ".join(command))
-        result = subprocess.run(
-            command,
-            cwd=repo_root,
-            text=True,
-            capture_output=True,
-            check=True,
+    try:
+        from sglang.dsv3_ordinary_moe_materialization import (
+            materialize_ordinary_moe_profile_free_source,
+            summarize_ordinary_moe_replay_shape,
         )
-        if logger is not None and result.stdout.strip():
-            logger.info("%s stdout:\n%s", label, result.stdout.strip())
-        if logger is not None and result.stderr.strip():
-            logger.warning("%s stderr:\n%s", label, result.stderr.strip())
+    except ModuleNotFoundError:
+        sys.path.insert(0, str(repo_root / "collector"))
+        from sglang.dsv3_ordinary_moe_materialization import (
+            materialize_ordinary_moe_profile_free_source,
+            summarize_ordinary_moe_replay_shape,
+        )
 
     try:
         with _dsv3_materialized_source_dir(run_dir, "ordinary_moe_materialized_source") as materialized_dir:
             shape_csv = materialized_dir / "ordinary_moe_replay_shape.csv"
-            _run_python(
-                [
-                    sys.executable,
-                    str(scripts["shape"]),
-                    "--data-dir",
-                    str(run_dir),
-                    "--output",
-                    str(shape_csv),
-                ],
-                label="summarize DeepSeek-V3 ordinary MoE replay shape",
+            summarize_ordinary_moe_replay_shape(
+                data_dir=run_dir,
+                output=shape_csv,
             )
-            _run_python(
-                [
-                    sys.executable,
-                    str(scripts["materialize"]),
-                    "--data-dir",
-                    str(run_dir),
-                    "--shape-csv",
-                    str(shape_csv),
-                    "--generation-shape-csv",
-                    str(shape_csv),
-                    "--output-dir",
-                    str(materialized_dir),
-                    "--policy-version",
-                    os.environ.get("COLLECTOR_DSV3_ORDINARY_MOE_POLICY_VERSION", "v17"),
-                ],
-                label="materialize DeepSeek-V3 ordinary MoE profile-free source",
+            materialize_ordinary_moe_profile_free_source(
+                data_dir=run_dir,
+                shape_csv=shape_csv,
+                generation_shape_csv=shape_csv,
+                output_dir=materialized_dir,
             )
             materialized_moe_perf = materialized_dir / "moe_perf.txt"
             if not materialized_moe_perf.exists():

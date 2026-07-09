@@ -9,7 +9,7 @@ available. The module owns SGLang-specific kernel selection, quantization
 helpers, SM filters, and perf logging.
 """
 
-__compat__ = "sglang>=0.5.10rc0"
+__compat__ = "sglang>=0.5.9"
 
 import os
 import random
