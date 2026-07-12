@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Clean-latency source selection for DeepSeek-V3 MoE collector outputs.
+"""Build an offline clean-latency MoE candidate and ShareGPT comparison report.
 
-This module is collector-side logic: it reads only AIC collector outputs and
-AIC latency source bundles, then writes final MoE latency tables whose
-``latency`` column is the clean critical-path latency.  Server/profile truth is
-not an input here.
+This tool is intentionally offline: it reads AIC collector outputs and AIC
+latency source bundles, writes a sibling candidate directory, and uses profile
+truth only in the final comparison report.
 """
 
 from __future__ import annotations
@@ -47,35 +46,6 @@ WIDEEP_SOURCE_FILES = (
     "generation_main_noeplb.txt",
     "generation_main_eplb.txt",
 )
-
-
-def build_clean_latency_tables(
-    *,
-    source_dir: Path,
-    candidate_dir: Path,
-    write_origin_dir: bool = False,
-) -> None:
-    """Build clean-latency MoE tables from AIC-only collector sources."""
-
-    source_dir = source_dir.resolve()
-    candidate_dir = candidate_dir.resolve()
-    _truth_guard(source_dir, role="source_dir")
-    _truth_guard(candidate_dir, role="candidate_dir")
-    input_manifest = _validate_inputs(source_dir)
-    _copy_source_skeleton(source_dir, candidate_dir)
-    _materialize_ordinary(source_dir, candidate_dir)
-    _materialize_wideep(source_dir, candidate_dir, "context")
-    _materialize_wideep(source_dir, candidate_dir, "generation")
-    origin_dir = candidate_dir.with_name(candidate_dir.name + "_origin_latency")
-    if write_origin_dir:
-        _write_origin_dir(candidate_dir, origin_dir)
-    _write_candidate_manifest(
-        candidate_dir,
-        source_dir=source_dir,
-        origin_dir=origin_dir,
-        report_dir=candidate_dir,
-        input_manifest=input_manifest,
-    )
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -134,6 +104,19 @@ def _copy_source_skeleton(source_dir: Path, candidate_dir: Path) -> None:
         src = source_dir / dirname
         if src.exists():
             shutil.copytree(src, candidate_dir / dirname)
+
+
+def _materialized_table_source(source_dir: Path, filename: str) -> Path:
+    preferred = {
+        "moe_perf.txt": source_dir / "ordinary_moe_materialized_source" / "moe_perf.txt",
+        "wideep_context_moe_perf.txt": source_dir
+        / "recorded_materialized_source"
+        / "wideep_context_moe_perf.txt",
+        "wideep_generation_moe_perf.txt": source_dir
+        / "recorded_materialized_source"
+        / "wideep_generation_moe_perf.txt",
+    }
+    return preferred.get(filename, source_dir / filename) if preferred.get(filename, source_dir / filename).exists() else source_dir / filename
 
 
 def _validate_inputs(source_dir: Path) -> dict[str, object]:
@@ -199,7 +182,7 @@ def _write_candidate_manifest(
 ) -> None:
     row_counts = {}
     for filename in ("moe_perf.txt", "wideep_context_moe_perf.txt", "wideep_generation_moe_perf.txt"):
-        source_rows = _read_csv(source_dir / filename)
+        source_rows = _read_csv(_materialized_table_source(source_dir, filename))
         candidate_rows = _read_csv(candidate_dir / filename)
         missing_clean = sum(1 for row in candidate_rows if row.get("aic_critical_path_latency", "") == "")
         row_counts[filename] = {
@@ -258,20 +241,6 @@ def _load_wideep_sources(source_dir: Path, phase: str) -> dict[tuple[str, str, s
                 continue
             sources.setdefault(_wideep_source_key(row), row)
     return sources
-
-
-def _materialized_table_source(source_dir: Path, filename: str) -> Path:
-    preferred = {
-        "moe_perf.txt": source_dir / "ordinary_moe_materialized_source" / "moe_perf.txt",
-        "wideep_context_moe_perf.txt": source_dir
-        / "recorded_materialized_source"
-        / "wideep_context_moe_perf.txt",
-        "wideep_generation_moe_perf.txt": source_dir
-        / "recorded_materialized_source"
-        / "wideep_generation_moe_perf.txt",
-    }
-    candidate = preferred.get(filename, source_dir / filename)
-    return candidate if candidate.exists() else source_dir / filename
 
 
 def _first(*values: float | None) -> float | None:
@@ -722,10 +691,6 @@ def _apply_wideep_generation_local_envelope(rows: list[dict[str, object]]) -> No
                         "wideep_generation_left_endpoint_sqrt_low_guard",
                     )
 
-                # The first decode point can also be high relative to the
-                # next AIC point after graph-captured launch overhead is
-                # amortized.  Tighten only against the same-curve sqrt
-                # continuation, so this stays source-only and profile-free.
                 current_first = _row_latency(by_token[first_token])
                 if current_first is not None and current_first > endpoint_estimate * 1.02:
                     tightened = current_first * 0.20 + endpoint_estimate * 0.80
@@ -784,10 +749,6 @@ def _apply_wideep_generation_capacity_envelope(
         if latency is None:
             continue
         if "capacity_256" in regime and 32 <= token <= 288:
-            # Low-latency masked capacity-256 decode has a fixed overhead that
-            # is visible in the same AIC curve around the mid tokens but can be
-            # underrepresented by the selected recorded source.  Use a smooth
-            # log-token envelope instead of EP/eplb/token-specific anchors.
             x = (_log2_token(token) - _log2_token(96)) / 1.55
             bump = 1.0 + 0.115 * math.exp(-(x * x))
             _set_clean_latency(
@@ -1304,3 +1265,283 @@ def _write_origin_dir(candidate_dir: Path, origin_dir: Path) -> None:
                 row["latency"] = origin
             out.append(row)
         _write_csv(origin_dir / filename, out, fieldnames)
+
+
+def _run(cmd: list[str]) -> None:
+    subprocess.run(cmd, check=True)
+
+
+def _compare_all(repo: Path, data_dir: Path, profile_root: Path, out_dir: Path) -> None:
+    ordinary = repo / "tools" / "moe_calibration" / "compare_ordinary_moe_csv.py"
+    wideep = repo / "tools" / "moe_calibration" / "compare_wideep_moe_ep8_csv.py"
+    for mode in ("ordinary_context", "ordinary_generation"):
+        for ep in (1, 2, 4, 8):
+            profile_dir = profile_root / mode / f"ep{ep}"
+            if not profile_dir.exists():
+                continue
+            if (profile_dir / "parsed_latest_20260701").exists():
+                profile_dir = profile_dir / "parsed_latest_20260701"
+            eplb = ["off"] if ep == 1 else ["off", "on"]
+            target = out_dir / mode / f"ep{ep}"
+            _run(
+                [
+                    sys.executable,
+                    str(ordinary),
+                    "--data-dir",
+                    str(data_dir),
+                    "--profile-dir",
+                    str(profile_dir),
+                    "--output-detail",
+                    str(target / "detail.csv"),
+                    "--output-summary",
+                    str(target / "summary.csv"),
+                    "--eps",
+                    str(ep),
+                    "--truth-aggregation",
+                    "median",
+                    "--distributions",
+                    "recorded",
+                    "--eplb",
+                    *eplb,
+                ]
+            )
+    for mode in ("wideep_context", "wideep_generation"):
+        for ep in (2, 4, 8):
+            profile_dir = profile_root / mode / f"ep{ep}"
+            if not profile_dir.exists():
+                continue
+            if (profile_dir / "parsed_latest_20260701").exists():
+                profile_dir = profile_dir / "parsed_latest_20260701"
+            target = out_dir / mode / f"ep{ep}"
+            _run(
+                [
+                    sys.executable,
+                    str(wideep),
+                    "--data-dir",
+                    str(data_dir),
+                    "--profile-dir",
+                    str(profile_dir),
+                    "--output-detail",
+                    str(target / "detail.csv"),
+                    "--output-summary",
+                    str(target / "summary.csv"),
+                    "--moe-ep-size",
+                    str(ep),
+                    "--truth-aggregation",
+                    "median",
+                ]
+            )
+
+
+def _iter_detail_rows(root: Path, version: str) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for detail in sorted(root.glob("*/*/detail.csv")):
+        mode = detail.parent.parent.name
+        ep = int(detail.parent.name.removeprefix("ep"))
+        for row in _read_csv(detail):
+            requested = row.get("requested_distribution", "")
+            if mode.startswith("ordinary") and requested != "recorded":
+                continue
+            if mode.startswith("wideep") and not requested.startswith("recorded"):
+                continue
+            rows.append({**row, "mode": mode, "ep": ep, "version": version})
+    return rows
+
+
+def _summarize_report(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    groups: dict[tuple[str, str, str], list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        groups[(str(row["version"]), str(row["mode"]), str(row["eplb"]))].append(row)
+    out = []
+    for (version, mode, eplb), group in sorted(groups.items()):
+        abs_pct = [float(r["abs_error_pct"]) for r in group]
+        abs_us = [float(r["abs_error_us"]) for r in group]
+        out.append(
+            {
+                "version": version,
+                "mode": mode,
+                "eplb": eplb,
+                "samples": len(group),
+                "mape_pct": sum(abs_pct) / len(abs_pct),
+                "max_abs_error_pct": max(abs_pct),
+                "mae_us": sum(abs_us) / len(abs_us),
+                "max_abs_error_us": max(abs_us),
+                "bad_gt10": sum(1 for value in abs_pct if value > 10.0),
+            }
+        )
+    return out
+
+
+def _candidate_meta(candidate_dir: Path) -> dict[tuple[str, int, str, str, int, str], dict[str, str]]:
+    meta = {}
+    files = {
+        "ordinary_context": "moe_perf.txt",
+        "ordinary_generation": "moe_perf.txt",
+        "wideep_context": "wideep_context_moe_perf.txt",
+        "wideep_generation": "wideep_generation_moe_perf.txt",
+    }
+    for mode, filename in files.items():
+        if not (candidate_dir / filename).exists():
+            continue
+        for row in _read_csv(candidate_dir / filename):
+            phase = "context" if mode.endswith("context") else "generation"
+            if filename == "moe_perf.txt" and row.get("phase") != phase:
+                continue
+            if not row.get("distribution", "").startswith("recorded"):
+                continue
+            eplb = "on" if row["distribution"].endswith("eplb") and not row["distribution"].endswith("no_eplb") else "off"
+            key = (mode, int(float(row["moe_ep_size"])), eplb, row["distribution"], int(float(row["num_tokens"])), phase)
+            meta[key] = row
+            meta[(mode, int(float(row["moe_ep_size"])), eplb, "recorded", int(float(row["num_tokens"])), phase)] = row
+    return meta
+
+
+def _write_combined_report(report_dir: Path, candidate_dir: Path) -> None:
+    all_rows = []
+    for version in ("origin", "clean", "current_policy"):
+        all_rows.extend(_iter_detail_rows(report_dir / "_compare" / version, version))
+    summary = _summarize_report(all_rows)
+    _write_csv(
+        report_dir / "summary.csv",
+        summary,
+        [
+            "version",
+            "mode",
+            "eplb",
+            "samples",
+            "mape_pct",
+            "max_abs_error_pct",
+            "mae_us",
+            "max_abs_error_us",
+            "bad_gt10",
+        ],
+    )
+
+    by_key: dict[tuple[str, int, str, str, int, str], dict[str, dict[str, object]]] = defaultdict(dict)
+    for row in all_rows:
+        phase = str(row["phase"])
+        requested = str(row["requested_distribution"])
+        key = (
+            str(row["mode"]),
+            int(row["ep"]),
+            str(row["eplb"]),
+            requested,
+            int(float(row["num_tokens"])),
+            phase,
+        )
+        by_key[key][str(row["version"])] = row
+    meta = _candidate_meta(candidate_dir)
+    detail = []
+    for key, versions in sorted(by_key.items()):
+        mode, ep, eplb, distribution, token, phase = key
+        clean_row = versions.get("clean", {})
+        server_us = clean_row.get("server_us") or next(iter(versions.values())).get("server_us", "")
+        candidate_key = key
+        candidate_row = meta.get(candidate_key, {})
+        out = {
+            "mode": mode,
+            "ep": ep,
+            "eplb": eplb,
+            "phase": phase,
+            "num_tokens": token,
+            "requested_distribution": distribution,
+            "point_kind": clean_row.get("point_kind", ""),
+            "server_us": server_us,
+            "aic_latency_source": candidate_row.get("aic_latency_source", ""),
+            "aic_latency_policy": candidate_row.get("aic_latency_policy", ""),
+        }
+        for version in ("origin", "clean", "current_policy"):
+            row = versions.get(version, {})
+            prefix = "policy" if version == "current_policy" else version
+            out[f"{prefix}_us"] = row.get("aic_us", "")
+            out[f"{prefix}_error_pct"] = row.get("error_pct", "")
+            out[f"{prefix}_abs_error_pct"] = row.get("abs_error_pct", "")
+            out[f"{prefix}_source"] = row.get("aic_source", "")
+        if out["clean_abs_error_pct"] != "" and out["policy_abs_error_pct"] != "":
+            out["clean_minus_policy_abs_pct"] = float(out["clean_abs_error_pct"]) - float(out["policy_abs_error_pct"])
+        else:
+            out["clean_minus_policy_abs_pct"] = ""
+        detail.append(out)
+    fields = [
+        "mode",
+        "ep",
+        "eplb",
+        "phase",
+        "num_tokens",
+        "requested_distribution",
+        "point_kind",
+        "server_us",
+        "origin_us",
+        "origin_error_pct",
+        "origin_abs_error_pct",
+        "clean_us",
+        "clean_error_pct",
+        "clean_abs_error_pct",
+        "policy_us",
+        "policy_error_pct",
+        "policy_abs_error_pct",
+        "clean_minus_policy_abs_pct",
+        "aic_latency_source",
+        "aic_latency_policy",
+        "origin_source",
+        "clean_source",
+        "policy_source",
+    ]
+    _write_csv(report_dir / "detail_origin_clean_policy.csv", detail, fields)
+    ranked = [row for row in detail if row["clean_minus_policy_abs_pct"] != ""]
+    better = sorted(ranked, key=lambda row: float(row["clean_minus_policy_abs_pct"]))[:50]
+    worse = sorted(ranked, key=lambda row: float(row["clean_minus_policy_abs_pct"]), reverse=True)[:50]
+    _write_csv(report_dir / "clean_better_than_policy_top.csv", better, fields)
+    _write_csv(report_dir / "clean_worse_than_policy_top.csv", worse, fields)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-dir", type=Path, required=True)
+    parser.add_argument("--candidate-dir", type=Path, required=True)
+    parser.add_argument("--profile-root", type=Path, required=True)
+    parser.add_argument("--report-dir", type=Path, required=True)
+    args = parser.parse_args()
+
+    repo = Path(__file__).resolve().parents[2]
+    source_dir = args.source_dir.resolve()
+    candidate_dir = args.candidate_dir.resolve()
+    profile_root = args.profile_root.resolve()
+    report_dir = args.report_dir.resolve()
+    origin_dir = candidate_dir.with_name(candidate_dir.name + "_origin_latency")
+
+    _truth_guard(source_dir, role="--source-dir")
+    _truth_guard(candidate_dir, role="--candidate-dir")
+    input_manifest = _validate_inputs(source_dir)
+
+    _copy_source_skeleton(source_dir, candidate_dir)
+    _materialize_ordinary(source_dir, candidate_dir)
+    _materialize_wideep(source_dir, candidate_dir, "context")
+    _materialize_wideep(source_dir, candidate_dir, "generation")
+    _write_origin_dir(candidate_dir, origin_dir)
+    _write_candidate_manifest(
+        candidate_dir,
+        source_dir=source_dir,
+        origin_dir=origin_dir,
+        report_dir=report_dir,
+        input_manifest=input_manifest,
+    )
+
+    compare_root = report_dir / "_compare"
+    if compare_root.exists():
+        shutil.rmtree(compare_root)
+    for version, data_dir in (
+        ("origin", origin_dir),
+        ("clean", candidate_dir),
+        ("current_policy", source_dir),
+    ):
+        _compare_all(repo, data_dir, profile_root, compare_root / version)
+    _write_combined_report(report_dir, candidate_dir)
+
+    print(f"candidate_dir={candidate_dir}")
+    print(f"origin_latency_dir={origin_dir}")
+    print(f"report_dir={report_dir}")
+
+
+if __name__ == "__main__":
+    main()
