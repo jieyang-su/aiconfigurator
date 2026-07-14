@@ -48,6 +48,27 @@ WIDEEP_SOURCE_FILES = (
     "generation_main_eplb.txt",
 )
 
+LOW_LATENCY_GENERATION_LOG_MODEL = {
+    "b0": 0.063653175163,
+    "b_origin": 0.220094613546,
+    "b_ep": 0.145485318365,
+    "b_token": -0.049936072104,
+    "b_eplb": 0.061578666590,
+}
+
+LOW_LATENCY_GENERATION_THIN_FACTORS = (
+    ("ep2_noeplb_group_0p958", 2, "recorded_no_eplb", None, 0.9584296932924331),
+    ("ep2_eplb_group_0p893", 2, "recorded_eplb", None, 0.8931043022539594),
+    ("ep4_noeplb_group_0p891", 4, "recorded_no_eplb", None, 0.8914068391425296),
+    ("ep4_eplb_group_0p850", 4, "recorded_eplb", None, 0.8503317141847976),
+    ("ep4_eplb_tiny_le8_1p60", 4, "recorded_eplb", "le8", 1.60),
+    ("ep8_noeplb_group_0p962", 8, "recorded_no_eplb", None, 0.9616752962492379),
+    ("ep8_eplb_group_0p948", 8, "recorded_eplb", None, 0.9483024099620427),
+    ("ep8_tiny_le8_1p447", 8, "recorded_no_eplb", "le8", 1.447),
+    ("ep8_tiny_le8_1p447", 8, "recorded_eplb", "le8", 1.447),
+    ("capacity256_noeplb_large_token_regime_0p94", 2, "recorded_no_eplb", "ge256", 0.94),
+)
+
 
 def build_clean_latency_tables(
     *,
@@ -320,6 +341,60 @@ def _scale_ab_ep(token: int, ep: int, *, c0: float, c_ep: float) -> float:
 
 def _scale_ab_ep_log(token: int, ep: int, *, c0: float, c_ep: float, c_log: float) -> float:
     return c0 + c_ep / max(1, ep) + c_log * _log2_token(token)
+
+
+def _low_latency_token_rule_matches(rule: str | None, token: int) -> bool:
+    if rule is None:
+        return True
+    if rule == "le8":
+        return token <= 8
+    if rule == "ge256":
+        return token >= 256
+    return False
+
+
+def _low_latency_ep8_tail_hot_m_factor(row: dict[str, object], *, ep: int, token: int) -> tuple[float, str]:
+    if ep != 8 or token < 512:
+        return 1.0, ""
+    hot_m = _as_float(row, "workload_expert_m_max") or _as_float(row, "aic_workload_expert_m_max")
+    if 81.0 <= hot_m <= 147.0:
+        return 1.35, "ep8_tail_hotm_81_147_1p35"
+    return 1.0, ""
+
+
+def _is_wideep_generation_low_latency(row: dict[str, object]) -> bool:
+    return "low_latency" in str(row.get("kernel_regime", "")).lower()
+
+
+def _wideep_generation_low_latency_log_model(row: dict[str, object], *, token: int) -> tuple[float, str, str]:
+    origin = _as_float(row, "origin_latency") or _as_float(row, "latency") or 0.0
+    ep = int(float(str(row.get("moe_ep_size", "1") or 1)))
+    distribution = str(row.get("distribution", ""))
+    eplb_on = 1.0 if distribution == "recorded_eplb" else 0.0
+    coeff = LOW_LATENCY_GENERATION_LOG_MODEL
+    latency = math.exp(
+        coeff["b0"]
+        + coeff["b_origin"] * math.log(max(origin, 1e-9))
+        + coeff["b_ep"] * _log2_token(ep)
+        + coeff["b_token"] * _log2_token(token)
+        + coeff["b_eplb"] * eplb_on
+    )
+    labels: list[str] = []
+    for name, factor_ep, factor_distribution, token_rule, factor in LOW_LATENCY_GENERATION_THIN_FACTORS:
+        if ep != factor_ep or distribution != factor_distribution:
+            continue
+        if name.startswith("capacity256") and "capacity_256" not in str(row.get("kernel_regime", "")).lower():
+            continue
+        if not _low_latency_token_rule_matches(token_rule, token):
+            continue
+        latency *= factor
+        labels.append(name)
+    hot_m_factor, hot_m_label = _low_latency_ep8_tail_hot_m_factor(row, ep=ep, token=token)
+    if hot_m_factor != 1.0:
+        latency *= hot_m_factor
+        labels.append(hot_m_label)
+    label = "_".join(labels) if labels else "log_model_v1a"
+    return latency, "origin_latency_low_latency_log_model", f"wideep_generation_low_latency_{label}"
 
 
 ORDINARY_RANK_LOCAL_SCALE_COEFFICIENTS = {
@@ -626,7 +701,12 @@ def _materialize_wideep(source_dir: Path, candidate_dir: Path, phase: str) -> No
         row["origin_latency"] = row.get("origin_latency") or f"{origin:.12g}"
         if row.get("distribution", "").startswith("recorded"):
             source = sources.get(_wideep_source_key(row))
-            latency, selected_source, policy = _select_wideep_latency(row, source, phase)
+            token = int(float(str(row.get("num_tokens", "0") or 0)))
+            if phase == "generation" and _is_wideep_generation_low_latency(row):
+                latency, selected_source, policy = _wideep_generation_low_latency_log_model(row, token=token)
+                row["latency_policy_scope"] = "wideep_generation_low_latency"
+            else:
+                latency, selected_source, policy = _select_wideep_latency(row, source, phase)
             row["aic_critical_path_latency"] = f"{latency:.12g}"
             row["aic_latency_source"] = selected_source
             row["aic_latency_policy"] = policy
@@ -638,6 +718,7 @@ def _materialize_wideep(source_dir: Path, candidate_dir: Path, phase: str) -> No
         out.append(row)
     if phase == "generation":
         _apply_wideep_generation_local_envelope(out)
+        _apply_wideep_generation_low_latency_regime_policy(out)
     _write_csv(candidate_dir / filename, out, fieldnames)
 
 
@@ -681,6 +762,8 @@ def _apply_wideep_generation_local_envelope(rows: list[dict[str, object]]) -> No
     groups: dict[tuple[object, ...], list[dict[str, object]]] = defaultdict(list)
     for row in rows:
         if not str(row.get("distribution", "")).startswith("recorded"):
+            continue
+        if str(row.get("aic_latency_source", "")) == "origin_latency_low_latency_log_model":
             continue
         groups[_wideep_generation_curve_key(row)].append(row)
 
@@ -800,6 +883,36 @@ def _apply_wideep_generation_capacity_envelope(
     # latencies already include the AIC-side post policy.  Do not add an
     # additional capacity-1024 tail floor here; it can double-count tail
     # compensation when the recorded source is already the intended final value.
+
+
+def _apply_wideep_generation_low_latency_regime_policy(rows: list[dict[str, object]]) -> None:
+    for row in rows:
+        if not str(row.get("distribution", "")).startswith("recorded"):
+            continue
+        if "low_latency" not in str(row.get("kernel_regime", "")).lower():
+            continue
+        try:
+            token = int(float(str(row.get("num_tokens", "0") or 0)))
+        except (TypeError, ValueError):
+            continue
+
+        latency = _row_latency(row)
+        if latency is None:
+            continue
+
+        current_policy = str(row.get("aic_latency_policy", ""))
+        kernel_regime = str(row.get("kernel_regime", "")).lower()
+        if (
+            "capacity_256" in kernel_regime
+            and row.get("distribution") == "recorded_no_eplb"
+            and token >= 256
+            and "capacity256_noeplb_large_token_regime_0p94" not in current_policy
+        ):
+            _set_clean_latency(
+                row,
+                latency * 0.94,
+                "wideep_generation_capacity256_noeplb_large_token_regime_0p94",
+            )
 
 
 def _ordinary_row_key(row: dict[str, str]) -> tuple[str, ...]:

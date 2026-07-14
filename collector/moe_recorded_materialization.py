@@ -9,7 +9,10 @@ truth is not an input here; truth remains a compare/report concern.
 from __future__ import annotations
 
 import csv
+import json
+import math
 from pathlib import Path
+from statistics import median, pstdev
 
 from moe_hybrid_policy import apply_profile_free_hybrid_latency
 
@@ -42,6 +45,30 @@ WIDEEP_MOE_OUTPUT_FIELDS = [
     "materialization_role",
     "materialization_source_family",
 ]
+WIDEEP_MOE_DIAGNOSTIC_FIELDS = [
+    "aic_rank_rawmax_over_mean",
+    "aic_rank_p90_over_mean",
+    "aic_sync_tail_over_mean",
+    "aic_workload_rank_imbalance",
+    "aic_workload_rank_assignments_max",
+    "aic_workload_expert_m_max",
+    "aic_ep8_lowlat_tail_risk_hint",
+    "aic_rank_steady_mean_min",
+    "aic_rank_steady_mean_median",
+    "aic_rank_steady_mean_max",
+    "aic_rank_steady_mean_std",
+    "aic_rank_steady_mean_cv",
+    "aic_rank_steady_p90_min",
+    "aic_rank_steady_p90_median",
+    "aic_rank_steady_p90_max",
+    "aic_rank_steady_p90_std",
+    "aic_rank_steady_p90_cv",
+    "aic_rank_envelope_ms",
+    "aic_rank_envelope_over_mean",
+    "aic_rank_bimodal_gap_ms",
+    "aic_rank_bimodal_gap_over_mean",
+    "aic_stage_replay_p90_over_mean",
+]
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -72,9 +99,154 @@ def _fields_with_origin_latency(rows: list[dict[str, str]]) -> list[str]:
             "latency_policy_scope",
             "materialization_role",
             "materialization_source_family",
+            *WIDEEP_MOE_DIAGNOSTIC_FIELDS,
         }
     )
-    return [field for field in WIDEEP_MOE_OUTPUT_FIELDS if field in available or field == "origin_latency"]
+    output_fields = [*WIDEEP_MOE_OUTPUT_FIELDS, *WIDEEP_MOE_DIAGNOSTIC_FIELDS]
+    return [field for field in output_fields if field in available or field == "origin_latency"]
+
+
+def _as_float(row: dict[str, str], key: str) -> float:
+    value = row.get(key, "")
+    if value in ("", None):
+        return 0.0
+    try:
+        parsed = float(value)
+    except ValueError:
+        return 0.0
+    if not math.isfinite(parsed):
+        return 0.0
+    return parsed
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    if denominator <= 0.0:
+        return 0.0
+    return numerator / denominator
+
+
+def _format_diag(value: float) -> str:
+    if not math.isfinite(value):
+        return "0"
+    return f"{value:.12g}"
+
+
+def _json_numeric_values(row: dict[str, str], key: str) -> list[float]:
+    value = row.get(key, "")
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    if isinstance(parsed, dict):
+        iterable = parsed.values()
+    elif isinstance(parsed, list):
+        iterable = parsed
+    else:
+        return []
+    values: list[float] = []
+    for item in iterable:
+        try:
+            number = float(item)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            values.append(number)
+    return values
+
+
+def _json_numeric_value(row: dict[str, str], key: str, item_key: str) -> float:
+    value = row.get(key, "")
+    if not value:
+        return 0.0
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not isinstance(parsed, dict):
+        return 0.0
+    try:
+        number = float(parsed.get(item_key, 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return number
+
+
+def _add_vector_stats(output: dict[str, str], prefix: str, values: list[float]) -> None:
+    if not values:
+        for suffix in ("min", "median", "max", "std", "cv"):
+            output[f"{prefix}_{suffix}"] = "0"
+        return
+    mean = sum(values) / len(values)
+    std = pstdev(values) if len(values) > 1 else 0.0
+    output[f"{prefix}_min"] = _format_diag(min(values))
+    output[f"{prefix}_median"] = _format_diag(median(values))
+    output[f"{prefix}_max"] = _format_diag(max(values))
+    output[f"{prefix}_std"] = _format_diag(std)
+    output[f"{prefix}_cv"] = _format_diag(_ratio(std, mean))
+
+
+def _largest_adjacent_gap(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    ordered = sorted(values)
+    return max(right - left for left, right in zip(ordered, ordered[1:]))
+
+
+def _add_wideep_diagnostics(output: dict[str, str], source: dict[str, str], *, phase: str) -> None:
+    rank_mean = _as_float(source, "rank_mean_latency")
+    rank_raw_max = _as_float(source, "latency_raw_max") or _as_float(source, "latency_max")
+    rank_p90 = _as_float(source, "rank_p90_latency")
+    sync_tail = _as_float(source, "rank_sync_tail_mean")
+    workload_imbalance = _as_float(source, "workload_rank_imbalance_max_over_mean")
+    workload_rank_max = _as_float(source, "workload_rank_assignments_max")
+    workload_expert_m_max = _as_float(source, "workload_expert_m_max")
+
+    output["aic_rank_rawmax_over_mean"] = _format_diag(_ratio(rank_raw_max, rank_mean))
+    output["aic_rank_p90_over_mean"] = _format_diag(_ratio(rank_p90, rank_mean))
+    output["aic_sync_tail_over_mean"] = _format_diag(_ratio(sync_tail, rank_mean))
+    output["aic_workload_rank_imbalance"] = _format_diag(workload_imbalance)
+    output["aic_workload_rank_assignments_max"] = _format_diag(workload_rank_max)
+    output["aic_workload_expert_m_max"] = _format_diag(workload_expert_m_max)
+
+    ep_size = int(float(source.get("moe_ep_size", "0") or 0))
+    token = int(float(source.get("num_tokens", "0") or 0))
+    kernel_regime = str(source.get("kernel_regime", "")).lower()
+    risk_hint = 0.0
+    if phase == "generation" and ep_size >= 8 and "low_latency" in kernel_regime:
+        risk_hint = max(
+            0.0,
+            _ratio(rank_raw_max, rank_mean) - 1.0,
+            _ratio(rank_p90, rank_mean) - 1.0,
+            _ratio(sync_tail, rank_mean),
+            workload_imbalance - 1.0,
+        )
+        if token >= 512:
+            risk_hint *= 1.10
+    output["aic_ep8_lowlat_tail_risk_hint"] = _format_diag(risk_hint)
+
+    steady_mean_values = _json_numeric_values(source, "rank_steady_mean_ms_json")
+    steady_p90_values = _json_numeric_values(source, "rank_steady_p90_ms_json")
+    _add_vector_stats(output, "aic_rank_steady_mean", steady_mean_values)
+    _add_vector_stats(output, "aic_rank_steady_p90", steady_p90_values)
+
+    rank_envelope = max(steady_mean_values) - min(steady_mean_values) if steady_mean_values else 0.0
+    rank_vector_mean = sum(steady_mean_values) / len(steady_mean_values) if steady_mean_values else 0.0
+    bimodal_gap = _largest_adjacent_gap(steady_mean_values)
+    output["aic_rank_envelope_ms"] = _format_diag(rank_envelope)
+    output["aic_rank_envelope_over_mean"] = _format_diag(_ratio(rank_envelope, rank_vector_mean))
+    output["aic_rank_bimodal_gap_ms"] = _format_diag(bimodal_gap)
+    output["aic_rank_bimodal_gap_over_mean"] = _format_diag(_ratio(bimodal_gap, rank_vector_mean))
+
+    stage_mean = _json_numeric_value(source, "stage_mean_ms_json", "cuda_graph_replay")
+    if stage_mean <= 0.0:
+        stage_mean = _as_float(source, "stage_kernel_sum_mean")
+    stage_p90_values = _json_numeric_values(source, "stage_p90_ms_json")
+    replay_p90 = max(stage_p90_values) if stage_p90_values else 0.0
+    output["aic_stage_replay_p90_over_mean"] = _format_diag(_ratio(replay_p90, stage_mean))
 
 
 ShapeKey = tuple[str, str]
@@ -124,6 +296,7 @@ def _materialized_row(row: dict[str, str], *, phase: str, role: str) -> dict[str
     output["latency_policy_scope"] = "profile_free_hybrid_recorded"
     output["materialization_role"] = role
     output["materialization_source_family"] = "collector_recorded_materialization"
+    _add_wideep_diagnostics(output, row, phase=phase)
     return output
 
 

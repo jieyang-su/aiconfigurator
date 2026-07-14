@@ -5,6 +5,30 @@
 from __future__ import annotations
 
 import json
+import math
+
+
+LOW_LATENCY_GENERATION_LOG_MODEL = {
+    "b0": 0.063653175163,
+    "b_origin": 0.220094613546,
+    "b_ep": 0.145485318365,
+    "b_token": -0.049936072104,
+    "b_eplb": 0.061578666590,
+}
+
+
+LOW_LATENCY_GENERATION_THIN_FACTORS = (
+    ("ep2_noeplb_group_0p958", 2, "recorded_no_eplb", None, 0.9584296932924331),
+    ("ep2_eplb_group_0p893", 2, "recorded_eplb", None, 0.8931043022539594),
+    ("ep4_noeplb_group_0p891", 4, "recorded_no_eplb", None, 0.8914068391425296),
+    ("ep4_eplb_group_0p850", 4, "recorded_eplb", None, 0.8503317141847976),
+    ("ep4_eplb_tiny_le8_1p60", 4, "recorded_eplb", "le8", 1.60),
+    ("ep8_noeplb_group_0p962", 8, "recorded_no_eplb", None, 0.9616752962492379),
+    ("ep8_eplb_group_0p948", 8, "recorded_eplb", None, 0.9483024099620427),
+    ("ep8_tiny_le8_1p447", 8, "recorded_no_eplb", "le8", 1.447),
+    ("ep8_tiny_le8_1p447", 8, "recorded_eplb", "le8", 1.447),
+    ("capacity256_noeplb_large_token_regime_0p94", 2, "recorded_no_eplb", "ge256", 0.94),
+)
 
 
 def _as_float(row: dict[str, str], key: str, default: float = 0.0) -> float:
@@ -37,7 +61,10 @@ def _stage_gemm_plus_half_activation(row: dict[str, str]) -> float:
         + float(stage.get("activation", 0.0))
         + float(stage.get("quant", 0.0))
     )
-    return gemm + 0.5 * activation
+    latency = gemm + 0.5 * activation
+    if latency > 0.0:
+        return latency
+    return float(stage.get("cuda_graph_replay", 0.0)) or _as_float(row, "stage_kernel_sum_mean")
 
 
 def _stage_gemm1_plus_activation(row: dict[str, str]) -> float:
@@ -47,7 +74,10 @@ def _stage_gemm1_plus_activation(row: dict[str, str]) -> float:
         + float(stage.get("activation", 0.0))
         + float(stage.get("quant", 0.0))
     )
-    return float(stage.get("gemm1", 0.0)) + activation
+    latency = float(stage.get("gemm1", 0.0)) + activation
+    if latency > 0.0:
+        return latency
+    return float(stage.get("cuda_graph_replay", 0.0)) or _as_float(row, "stage_kernel_sum_mean")
 
 
 def _stage_gather_scatter(row: dict[str, str]) -> float:
@@ -69,6 +99,72 @@ def _raw_operator_latency(row: dict[str, str]) -> float:
 def _ep_scale_to_ep8(row: dict[str, str]) -> float:
     ep_size = max(1.0, _as_float(row, "moe_ep_size", 8.0))
     return max(1.0, 8.0 / ep_size)
+
+
+def _log2(value: float) -> float:
+    return math.log(max(value, 1e-9), 2.0)
+
+
+def _is_low_latency_wideep_generation(row: dict[str, str]) -> bool:
+    return "low_latency" in str(row.get("kernel_regime", "")).lower()
+
+
+def _low_latency_token_rule_matches(rule: str | None, token: int) -> bool:
+    if rule is None:
+        return True
+    if rule == "le8":
+        return token <= 8
+    if rule == "ge256":
+        return token >= 256
+    return False
+
+
+def _low_latency_ep8_tail_hot_m_factor(row: dict[str, str], *, ep: int, token: int) -> tuple[float, str]:
+    if ep != 8 or token < 512:
+        return 1.0, ""
+    hot_m = _as_float(row, "workload_expert_m_max") or _as_float(row, "aic_workload_expert_m_max")
+    if 81.0 <= hot_m <= 147.0:
+        return 1.35, "ep8_tail_hotm_81_147_1p35"
+    return 1.0, ""
+
+
+def _wideep_generation_low_latency_log_model(row: dict[str, str], *, token: int) -> tuple[float, str, str]:
+    origin = _raw_operator_latency(row)
+    ep = int(max(1.0, _as_float(row, "moe_ep_size", 1.0)))
+    distribution = row.get("distribution", "")
+    eplb_on = 1.0 if distribution == "recorded_eplb" else 0.0
+    coeff = LOW_LATENCY_GENERATION_LOG_MODEL
+    latency = math.exp(
+        coeff["b0"]
+        + coeff["b_origin"] * math.log(max(origin, 1e-9))
+        + coeff["b_ep"] * _log2(ep)
+        + coeff["b_token"] * _log2(token)
+        + coeff["b_eplb"] * eplb_on
+    )
+    labels: list[str] = []
+    for name, factor_ep, factor_distribution, token_rule, factor in LOW_LATENCY_GENERATION_THIN_FACTORS:
+        if ep != factor_ep or distribution != factor_distribution:
+            continue
+        if name.startswith("capacity256") and "capacity_256" not in str(row.get("kernel_regime", "")).lower():
+            continue
+        if not _low_latency_token_rule_matches(token_rule, token):
+            continue
+        latency *= factor
+        labels.append(name)
+    hot_m_factor, hot_m_label = _low_latency_ep8_tail_hot_m_factor(row, ep=ep, token=token)
+    if hot_m_factor != 1.0:
+        latency *= hot_m_factor
+        labels.append(hot_m_label)
+    label = "_".join(labels) if labels else "log_model_v1a"
+    return (
+        latency,
+        f"origin_latency_low_latency_log_model_{label}",
+        f"_hybrid_low_latency_log_model_{label}",
+    )
+
+
+def _is_recorded_distribution(row: dict[str, str]) -> bool:
+    return str(row.get("distribution", "")).startswith("recorded")
 
 
 def _epnorm_tiny_generation_latency(row: dict[str, str]) -> tuple[float, str, str]:
@@ -482,7 +578,9 @@ def apply_profile_free_hybrid_latency(
         )
 
     if phase == "generation":
-        if token <= 8:
+        if _is_recorded_distribution(row) and _is_low_latency_wideep_generation(row):
+            latency, policy, suffix = _wideep_generation_low_latency_log_model(row, token=token)
+        elif token <= 8:
             if _is_current_run_single_card_dummy(row):
                 latency, policy, suffix = _epnorm_tiny_generation_latency_2(row)
             else:
