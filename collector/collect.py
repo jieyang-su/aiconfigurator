@@ -1029,13 +1029,18 @@ def _run_clean_latency_postprocess(args, ops: list[str] | None) -> None:
 
     run_dir = Path(os.environ.get("COLLECTOR_LOG_DIR", ".")).resolve()
     source_root = _sync_run_tables_to_latency_source_root(run_dir)
-    required = [
-        source_root / "moe_perf.txt",
+    wideep_required = [
         source_root / "wideep_context_moe_perf.txt",
         source_root / "wideep_generation_moe_perf.txt",
-        source_root / "raw_collector_source" / "moe_perf.txt",
         source_root / "aic_latency_source_bundle" / "recorded_materialization_inputs",
     ]
+    ordinary_required = [
+        source_root / "moe_perf.txt",
+        source_root / "raw_collector_source" / "moe_perf.txt",
+    ]
+    required = list(wideep_required)
+    if any(path.exists() for path in ordinary_required):
+        required.extend(ordinary_required)
     missing = [path for path in required if not path.exists()]
     if missing:
         if logger is not None:
@@ -1045,6 +1050,13 @@ def _run_clean_latency_postprocess(args, ops: list[str] | None) -> None:
                 + "\nClean latency uses collector-owned AIC sources; set COLLECTOR_DSV3_KEEP_LATENCY_SOURCES=1 only when you need to persist them."
             )
         return
+    install_filenames = ["wideep_context_moe_perf.txt", "wideep_generation_moe_perf.txt"]
+    if all(path.exists() for path in ordinary_required):
+        install_filenames.insert(0, "moe_perf.txt")
+    elif logger is not None:
+        logger.info(
+            "DeepSeek-V3 clean latency will install WideEP tables only; ordinary MoE source files are absent."
+        )
 
     repo_root = _repo_root()
     try:
@@ -1074,7 +1086,7 @@ def _run_clean_latency_postprocess(args, ops: list[str] | None) -> None:
                 candidate_dir=candidate_dir,
                 write_origin_dir=True,
             )
-            for filename in ("moe_perf.txt", "wideep_context_moe_perf.txt", "wideep_generation_moe_perf.txt"):
+            for filename in install_filenames:
                 _install_candidate_table(candidate_dir, filename)
             if logger is not None:
                 logger.info("DeepSeek-V3 clean latency candidate source saved: %s", candidate_dir)
@@ -1086,7 +1098,7 @@ def _run_clean_latency_postprocess(args, ops: list[str] | None) -> None:
                     candidate_dir=candidate_dir,
                     write_origin_dir=False,
                 )
-                for filename in ("moe_perf.txt", "wideep_context_moe_perf.txt", "wideep_generation_moe_perf.txt"):
+                for filename in install_filenames:
                     _install_candidate_table(candidate_dir, filename)
         if logger is not None:
             logger.info(
