@@ -30,6 +30,48 @@ LOW_LATENCY_GENERATION_THIN_FACTORS = (
     ("capacity256_noeplb_large_token_regime_0p94", 2, "recorded_no_eplb", "ge256", 0.94),
 )
 
+LOW_LATENCY_GENERATION_COMPUTE_BASE_EP_EPLB_FACTORS = {
+    (2, "recorded_no_eplb"): 0.54914997,
+    (2, "recorded_eplb"): 0.54740777,
+    (4, "recorded_no_eplb"): 0.55647242,
+    (4, "recorded_eplb"): 0.52933749,
+    (8, "recorded_no_eplb"): 0.50473986,
+    (8, "recorded_eplb"): 0.49642687,
+}
+
+LOW_LATENCY_GENERATION_COMPUTE_BASE_BUCKET_FACTORS = {
+    (2, "recorded_no_eplb", "tiny_le8"): 1.08030477,
+    (2, "recorded_no_eplb", "small_32_128"): 1.00889209,
+    (2, "recorded_no_eplb", "mid_288"): 0.92637553,
+    (2, "recorded_no_eplb", "tail_512"): 0.96257104,
+    (2, "recorded_no_eplb", "tail_ge896"): 0.94650536,
+    (2, "recorded_eplb", "tiny_le8"): 1.10261787,
+    (2, "recorded_eplb", "small_32_128"): 1.00245747,
+    (2, "recorded_eplb", "mid_288"): 0.87714784,
+    (2, "recorded_eplb", "tail_512"): 0.91910714,
+    (2, "recorded_eplb", "tail_ge896"): 0.89602126,
+    (4, "recorded_no_eplb", "tiny_le8"): 1.05171731,
+    (4, "recorded_no_eplb", "small_32_128"): 1.00403637,
+    (4, "recorded_no_eplb", "mid_288"): 0.95857697,
+    (4, "recorded_no_eplb", "tail_512"): 0.95160842,
+    (4, "recorded_no_eplb", "tail_ge896"): 0.97103160,
+    (4, "recorded_eplb", "tiny_le8"): 0.65689858,
+    (4, "recorded_eplb", "small_32_128"): 1.02504589,
+    (4, "recorded_eplb", "mid_288"): 0.96271816,
+    (4, "recorded_eplb", "tail_512"): 1.00000000,
+    (4, "recorded_eplb", "tail_ge896"): 0.98563725,
+    (8, "recorded_no_eplb", "tiny_le8"): 0.76643696,
+    (8, "recorded_no_eplb", "small_32_128"): 1.00384786,
+    (8, "recorded_no_eplb", "mid_288"): 1.02756812,
+    (8, "recorded_no_eplb", "tail_512"): 0.78918738,
+    (8, "recorded_no_eplb", "tail_ge896"): 0.90347896,
+    (8, "recorded_eplb", "tiny_le8"): 0.69083140,
+    (8, "recorded_eplb", "small_32_128"): 1.00963352,
+    (8, "recorded_eplb", "mid_288"): 1.01562234,
+    (8, "recorded_eplb", "tail_512"): 1.07064198,
+    (8, "recorded_eplb", "tail_ge896"): 0.76804270,
+}
+
 
 def _as_float(row: dict[str, str], key: str, default: float = 0.0) -> float:
     value = row.get(key, "")
@@ -128,6 +170,18 @@ def _low_latency_ep8_tail_hot_m_factor(row: dict[str, str], *, ep: int, token: i
     return 1.0, ""
 
 
+def _low_latency_compute_base_bucket(token: int) -> str:
+    if token <= 8:
+        return "tiny_le8"
+    if token <= 128:
+        return "small_32_128"
+    if token <= 288:
+        return "mid_288"
+    if token <= 512:
+        return "tail_512"
+    return "tail_ge896"
+
+
 def _wideep_generation_low_latency_log_model(row: dict[str, str], *, token: int) -> tuple[float, str, str]:
     origin = _raw_operator_latency(row)
     ep = int(max(1.0, _as_float(row, "moe_ep_size", 1.0)))
@@ -155,6 +209,12 @@ def _wideep_generation_low_latency_log_model(row: dict[str, str], *, token: int)
     if hot_m_factor != 1.0:
         latency *= hot_m_factor
         labels.append(hot_m_label)
+    base_factor = LOW_LATENCY_GENERATION_COMPUTE_BASE_EP_EPLB_FACTORS.get((ep, distribution))
+    if base_factor is not None:
+        bucket = _low_latency_compute_base_bucket(token)
+        bucket_factor = LOW_LATENCY_GENERATION_COMPUTE_BASE_BUCKET_FACTORS.get((ep, distribution, bucket), 1.0)
+        latency *= base_factor * bucket_factor
+        labels.append(f"compute_base_{bucket}")
     label = "_".join(labels) if labels else "log_model_v1a"
     return (
         latency,

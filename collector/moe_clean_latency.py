@@ -69,6 +69,69 @@ LOW_LATENCY_GENERATION_THIN_FACTORS = (
     ("capacity256_noeplb_large_token_regime_0p94", 2, "recorded_no_eplb", "ge256", 0.94),
 )
 
+LOW_LATENCY_GENERATION_COMPUTE_BASE_EP_EPLB_FACTORS = {
+    (2, "recorded_no_eplb"): 0.54914997,
+    (2, "recorded_eplb"): 0.54740777,
+    (4, "recorded_no_eplb"): 0.55647242,
+    (4, "recorded_eplb"): 0.52933749,
+    (8, "recorded_no_eplb"): 0.50473986,
+    (8, "recorded_eplb"): 0.49642687,
+}
+
+LOW_LATENCY_GENERATION_COMPUTE_BASE_BUCKET_FACTORS = {
+    (2, "recorded_no_eplb", "tiny_le8"): 1.08030477,
+    (2, "recorded_no_eplb", "small_32_128"): 1.00889209,
+    (2, "recorded_no_eplb", "mid_288"): 0.92637553,
+    (2, "recorded_no_eplb", "tail_512"): 0.96257104,
+    (2, "recorded_no_eplb", "tail_ge896"): 0.94650536,
+    (2, "recorded_eplb", "tiny_le8"): 1.10261787,
+    (2, "recorded_eplb", "small_32_128"): 1.00245747,
+    (2, "recorded_eplb", "mid_288"): 0.87714784,
+    (2, "recorded_eplb", "tail_512"): 0.91910714,
+    (2, "recorded_eplb", "tail_ge896"): 0.89602126,
+    (4, "recorded_no_eplb", "tiny_le8"): 1.05171731,
+    (4, "recorded_no_eplb", "small_32_128"): 1.00403637,
+    (4, "recorded_no_eplb", "mid_288"): 0.95857697,
+    (4, "recorded_no_eplb", "tail_512"): 0.95160842,
+    (4, "recorded_no_eplb", "tail_ge896"): 0.97103160,
+    (4, "recorded_eplb", "tiny_le8"): 0.65689858,
+    (4, "recorded_eplb", "small_32_128"): 1.02504589,
+    (4, "recorded_eplb", "mid_288"): 0.96271816,
+    (4, "recorded_eplb", "tail_512"): 1.00000000,
+    (4, "recorded_eplb", "tail_ge896"): 0.98563725,
+    (8, "recorded_no_eplb", "tiny_le8"): 0.76643696,
+    (8, "recorded_no_eplb", "small_32_128"): 1.00384786,
+    (8, "recorded_no_eplb", "mid_288"): 1.02756812,
+    (8, "recorded_no_eplb", "tail_512"): 0.78918738,
+    (8, "recorded_no_eplb", "tail_ge896"): 0.90347896,
+    (8, "recorded_eplb", "tiny_le8"): 0.69083140,
+    (8, "recorded_eplb", "small_32_128"): 1.00963352,
+    (8, "recorded_eplb", "mid_288"): 1.01562234,
+    (8, "recorded_eplb", "tail_512"): 1.07064198,
+    (8, "recorded_eplb", "tail_ge896"): 0.76804270,
+}
+
+WIDEEP_CONTEXT_TINY_TOKEN_FACTORS = {
+    (2, "recorded_no_eplb", 8): 1.04067857,
+    (2, "recorded_no_eplb", 32): 1.09147694,
+    (2, "recorded_no_eplb", 128): 0.89219947,
+    (2, "recorded_eplb", 8): 1.04159091,
+    (2, "recorded_eplb", 32): 0.92262130,
+    (2, "recorded_eplb", 128): 0.91049165,
+    (4, "recorded_no_eplb", 8): 0.86636782,
+    (4, "recorded_no_eplb", 32): 1.29797536,
+    (4, "recorded_no_eplb", 128): 1.00107418,
+    (4, "recorded_eplb", 8): 0.86964535,
+    (4, "recorded_eplb", 32): 1.30040855,
+    (4, "recorded_eplb", 128): 1.00415076,
+    (8, "recorded_no_eplb", 8): 0.99641931,
+    (8, "recorded_no_eplb", 32): 1.06869111,
+    (8, "recorded_no_eplb", 128): 0.91443550,
+    (8, "recorded_eplb", 8): 0.95068466,
+    (8, "recorded_eplb", 32): 1.08332001,
+    (8, "recorded_eplb", 128): 0.90042436,
+}
+
 
 def build_clean_latency_tables(
     *,
@@ -402,8 +465,34 @@ def _low_latency_ep8_tail_hot_m_factor(row: dict[str, object], *, ep: int, token
     return 1.0, ""
 
 
+def _low_latency_compute_base_bucket(token: int) -> str:
+    if token <= 8:
+        return "tiny_le8"
+    if token <= 128:
+        return "small_32_128"
+    if token <= 288:
+        return "mid_288"
+    if token <= 512:
+        return "tail_512"
+    return "tail_ge896"
+
+
 def _is_wideep_generation_low_latency(row: dict[str, object]) -> bool:
     return "low_latency" in str(row.get("kernel_regime", "")).lower()
+
+
+def _apply_wideep_context_tiny_token_factor(
+    row: dict[str, str],
+    *,
+    token: int,
+    ep: int,
+    selected: float,
+    policy: str,
+) -> tuple[float, str]:
+    factor = WIDEEP_CONTEXT_TINY_TOKEN_FACTORS.get((ep, row.get("distribution", ""), token))
+    if factor is None:
+        return selected, policy
+    return selected * factor, f"{policy}+wideep_context_tiny_token_scale"
 
 
 def _wideep_generation_low_latency_log_model(row: dict[str, object], *, token: int) -> tuple[float, str, str]:
@@ -433,8 +522,14 @@ def _wideep_generation_low_latency_log_model(row: dict[str, object], *, token: i
     if hot_m_factor != 1.0:
         latency *= hot_m_factor
         labels.append(hot_m_label)
+    base_factor = LOW_LATENCY_GENERATION_COMPUTE_BASE_EP_EPLB_FACTORS.get((ep, distribution))
+    if base_factor is not None:
+        bucket = _low_latency_compute_base_bucket(token)
+        bucket_factor = LOW_LATENCY_GENERATION_COMPUTE_BASE_BUCKET_FACTORS.get((ep, distribution, bucket), 1.0)
+        latency *= base_factor * bucket_factor
+        labels.append(f"compute_base_{bucket}")
     label = "_".join(labels) if labels else "log_model_v1a"
-    return latency, "origin_latency_low_latency_log_model", f"wideep_generation_low_latency_{label}"
+    return latency, f"origin_latency_low_latency_log_model_{label}", f"wideep_generation_low_latency_{label}"
 
 
 ORDINARY_RANK_LOCAL_SCALE_COEFFICIENTS = {
@@ -685,6 +780,13 @@ def _select_wideep_latency(row: dict[str, str], source: dict[str, str] | None, p
                 if selected < floor:
                     selected = floor
                     policy += "+wideep_context_ep4_tiny_sync_envelope_floor"
+            selected, policy = _apply_wideep_context_tiny_token_factor(
+                row,
+                token=token,
+                ep=ep,
+                selected=selected,
+                policy=policy,
+            )
             return (
                 selected,
                 "origin_latency_ep_continuous_scale",
@@ -727,6 +829,13 @@ def _select_wideep_latency(row: dict[str, str], source: dict[str, str] | None, p
             # cross-validation envelope with this small global uplift.
             selected *= 1.10
             policy += "+wideep_context_high_ep_tail_uplift_1p10"
+        selected, policy = _apply_wideep_context_tiny_token_factor(
+            row,
+            token=token,
+            ep=ep,
+            selected=selected,
+            policy=policy,
+        )
         return selected, "rank_mean_latency_ep_log_scale", policy
 
     direct_source_latency = _as_float(source, "latency")
@@ -893,7 +1002,7 @@ def _apply_wideep_generation_local_envelope(rows: list[dict[str, object]]) -> No
     for row in rows:
         if not str(row.get("distribution", "")).startswith("recorded"):
             continue
-        if str(row.get("aic_latency_source", "")) == "origin_latency_low_latency_log_model":
+        if str(row.get("aic_latency_source", "")).startswith("origin_latency_low_latency_log_model"):
             continue
         groups[_wideep_generation_curve_key(row)].append(row)
 
