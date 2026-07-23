@@ -98,12 +98,28 @@ def _normalize_ordinary_moe_distribution_for_load(distribution: str, phase: str 
     return distribution
 
 
-def _select_moe_distribution(distribution_map: dict, *candidates: str) -> str:
+def _moe_selection_error(message: str):
+    from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
+
+    return PerfDataNotAvailableError(message)
+
+
+def _select_moe_distribution(
+    distribution_map: dict,
+    *candidates: str,
+    strict: bool = False,
+) -> str:
     """Pick the first available distribution with explicit, visible fallback."""
 
     for candidate in candidates:
         if candidate and candidate in distribution_map:
             return candidate
+    available = sorted(str(key) for key in distribution_map.keys())
+    if strict:
+        raise _moe_selection_error(
+            "Strict MoE workload distribution selection failed; "
+            f"candidates={candidates}, available={available}"
+        )
     for fallback in ("power_law_1.01", "power_law_1.2", "balanced", "uniform"):
         if fallback in distribution_map:
             logger.warning(
@@ -114,7 +130,6 @@ def _select_moe_distribution(distribution_map: dict, *candidates: str) -> str:
                 sorted(str(key) for key in distribution_map.keys()),
             )
             return fallback
-    available = sorted(str(key) for key in distribution_map.keys())
     raise KeyError(f"No compatible MoE workload distribution found; candidates={candidates}, available={available}")
 
 
@@ -141,10 +156,11 @@ def _select_moe_leaf(
     inter_size: int,
     moe_tp_size: int,
     moe_ep_size: int,
+    strict: bool = False,
 ) -> tuple[str, dict]:
-    used_distribution = _select_moe_distribution(distribution_map, *candidates)
+    used_distribution = _select_moe_distribution(distribution_map, *candidates, strict=strict)
     try:
-        return used_distribution, _moe_distribution_leaf(
+        leaf = _moe_distribution_leaf(
             distribution_map,
             used_distribution,
             topk=topk,
@@ -154,8 +170,18 @@ def _select_moe_leaf(
             moe_tp_size=moe_tp_size,
             moe_ep_size=moe_ep_size,
         )
+        if leaf:
+            return used_distribution, leaf
     except KeyError:
         pass
+
+    if strict:
+        raise _moe_selection_error(
+            "Strict MoE shape selection failed for "
+            f"distribution='{used_distribution}', shape="
+            f"(topk={topk}, num_experts={num_experts}, hidden_size={hidden_size}, "
+            f"inter_size={inter_size}, moe_tp_size={moe_tp_size}, moe_ep_size={moe_ep_size})"
+        )
 
     for fallback in ("power_law_1.01", "power_law_1.2", "balanced", "uniform"):
         if fallback == used_distribution or fallback not in distribution_map:
@@ -172,6 +198,8 @@ def _select_moe_leaf(
                 moe_ep_size=moe_ep_size,
             )
         except KeyError:
+            continue
+        if not leaf:
             continue
         logger.warning(
             "Falling back MoE workload distribution to '%s' because distribution '%s' lacks shape "
@@ -313,6 +341,7 @@ class MoE(Operation):
         attention_dp_size: int,
         is_context: bool = True,
         is_gated: bool = True,
+        strict_workload_distribution: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(name, scale_factor)
@@ -327,6 +356,7 @@ class MoE(Operation):
         self._workload_distribution = workload_distribution
         self._is_context = is_context
         self._is_gated = is_gated
+        self._strict_workload_distribution = strict_workload_distribution
         self._moe_backend = kwargs.get("moe_backend")
         self._enable_eplb = kwargs.get("enable_eplb", False)
         # 3 GEMMs for gated (gate, up, down), 2 GEMMs for non-gated (up, down)
@@ -448,6 +478,7 @@ class MoE(Operation):
         database_mode: common.DatabaseMode | None = None,
         is_gated: bool = True,
         enable_eplb: bool = False,
+        strict_workload_distribution: bool = False,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Verbatim port of legacy ``PerfDatabase.query_moe`` body."""
         from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
@@ -1018,22 +1049,36 @@ class MoE(Operation):
 
                     moe_data.raise_if_not_loaded()
 
+                    distribution_candidates = (
+                        (query_workload_distribution,)
+                        if strict_workload_distribution
+                        else (query_workload_distribution, workload_distribution)
+                    )
                     used_workload_distribution, moe_dict = _select_moe_leaf(
                         moe_data[quant_mode],
-                        query_workload_distribution,
-                        workload_distribution,
+                        *distribution_candidates,
                         topk=topk,
                         num_experts=num_experts,
                         hidden_size=hidden_size,
                         inter_size=inter_size,
                         moe_tp_size=moe_tp_size,
                         moe_ep_size=moe_ep_size,
+                        strict=strict_workload_distribution,
                     )
                     token_points = _require_moe_token_points(
                         moe_dict,
                         num_tokens_corrected,
                         used_workload_distribution,
                     )
+                    if strict_workload_distribution and not (
+                        token_points[0] <= num_tokens_corrected <= token_points[-1]
+                    ):
+                        raise PerfDataNotAvailableError(
+                            "Strict MoE token coverage failed; "
+                            f"num_tokens={num_tokens_corrected} is outside collected range "
+                            f"[{token_points[0]}, {token_points[-1]}] for "
+                            f"workload_distribution='{used_workload_distribution}'"
+                        )
                     if num_tokens_corrected > token_points[-1]:
                         overflow_policy = _sglang_wideep_moe_overflow_policy()
                         if (
@@ -1131,6 +1176,7 @@ class MoE(Operation):
                             used_workload_distribution = _select_moe_distribution(
                                 database._moe_low_latency_data[quant_mode],
                                 workload_distribution,
+                                strict=strict_workload_distribution,
                             )
                             moe_dict = database._moe_low_latency_data[quant_mode][used_workload_distribution][topk][
                                 num_experts
@@ -1151,6 +1197,7 @@ class MoE(Operation):
                             used_workload_distribution = _select_moe_distribution(
                                 database._moe_data[quant_mode],
                                 workload_distribution,
+                                strict=strict_workload_distribution,
                             )
                             moe_dict = database._moe_data[quant_mode][used_workload_distribution][topk][num_experts][
                                 hidden_size
@@ -1159,6 +1206,7 @@ class MoE(Operation):
                         used_workload_distribution = _select_moe_distribution(
                             database._moe_data[quant_mode],
                             workload_distribution,
+                            strict=strict_workload_distribution,
                         )
                         moe_dict = database._moe_data[quant_mode][used_workload_distribution][topk][num_experts][
                             hidden_size
@@ -1199,6 +1247,7 @@ class MoE(Operation):
                     used_workload_distribution = _select_moe_distribution(
                         database._moe_data[quant_mode],
                         workload_distribution,
+                        strict=strict_workload_distribution,
                     )
                     moe_dict = database._moe_data[quant_mode][used_workload_distribution][topk][num_experts][
                         hidden_size
@@ -1233,6 +1282,11 @@ class MoE(Operation):
                 else:
                     raise NotImplementedError(f"backend {database.backend} not supported for moe")
 
+            query_database_mode = (
+                common.DatabaseMode.SILICON
+                if strict_workload_distribution and database_mode == common.DatabaseMode.HYBRID
+                else database_mode
+            )
             return database._query_silicon_or_hybrid(
                 get_silicon=get_silicon,
                 get_empirical=lambda: get_empirical(
@@ -1246,7 +1300,7 @@ class MoE(Operation):
                     quant_mode,
                     workload_distribution,
                 ),
-                database_mode=database_mode,
+                database_mode=query_database_mode,
                 error_msg=(
                     f"Failed to query moe data for {num_tokens=}, {hidden_size=}, {inter_size=}, {topk=}, "
                     f"{num_experts=}, {moe_tp_size=}, {moe_ep_size=}, {quant_mode=}, {workload_distribution=}"
@@ -1278,6 +1332,7 @@ class MoE(Operation):
             moe_backend=self._moe_backend,
             is_gated=self._is_gated,
             enable_eplb=self._enable_eplb,
+            strict_workload_distribution=self._strict_workload_distribution,
         )
 
         return PerformanceResult(

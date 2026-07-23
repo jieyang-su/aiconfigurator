@@ -673,29 +673,50 @@ class TestHFModelSupport:
 
 
 class TestDeepSeekMLAModulePath:
-    """Regression coverage for ordinary DeepSeek MLA module table selection."""
+    """Regression coverage for ordinary DeepSeek MLA and TP collective paths."""
 
-    def test_sglang_deepseek_reuses_wideep_mla_tables_for_module_path(self):
+    def test_sglang_deepseek_uses_granular_context_mla_and_wideep_decode_table(self):
         model_config = config.ModelConfig(
-            tp_size=1,
+            tp_size=4,
             pp_size=1,
             moe_tp_size=1,
-            moe_ep_size=1,
+            moe_ep_size=4,
             attention_dp_size=1,
             overwrite_num_layers=1,
             moe_backend=None,
             attention_backend="flashinfer",
+            kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
+            mla_module_kvcache_quant_mode=common.KVCacheQuantMode.fp8,
         )
         model = get_model("deepseek-ai/DeepSeek-V3", model_config, backend_name="sglang")
 
         context_route = next(op for op in model.context_ops if op._name == "context_mla_block")
         assert isinstance(context_route, operations.PrefixConditionalOp)
-        assert isinstance(context_route._no_prefix_ops[0], operations.WideEPContextMLA)
-        assert context_route._no_prefix_ops[0]._fmha_quant_mode == common.FMHAQuantMode.fp8_block
+        assert [type(op) for op in context_route._no_prefix_ops] == [
+            operations.GEMM,
+            operations.ContextKVBProjGEMM,
+            operations.MLAConcatK,
+            operations.ContextMLA,
+            operations.GEMM,
+        ]
+        assert context_route._no_prefix_ops is context_route._prefix_ops
+
+        context_norms = [
+            op
+            for op in model.context_ops
+            if op._name
+            in {
+                "context_allreduce_residual_rmsnorm_1",
+                "context_allreduce_residual_rmsnorm_2",
+            }
+        ]
+        assert len(context_norms) == 2
+        assert all(isinstance(op, operations.FusedAllReduceResidualRMSNorm) for op in context_norms)
 
         generation_mla = next(op for op in model.generation_ops if op._name == "generation_mla_module")
         assert isinstance(generation_mla, operations.WideEPGenerationMLA)
         assert generation_mla._fmha_quant_mode == common.FMHAQuantMode.fp8_block
+        assert generation_mla._kvcache_quant_mode == common.KVCacheQuantMode.fp8
 
 
 class TestDeepSeekFFNLayerMix:

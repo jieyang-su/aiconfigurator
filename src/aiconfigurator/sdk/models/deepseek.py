@@ -179,6 +179,7 @@ class DeepSeekModel(BaseModel):
         kvcache_quant_mode = self.config.kvcache_quant_mode
         fmha_quant_mode = self.config.fmha_quant_mode
         attn_backend = self.config.attention_backend
+        mla_module_kvcache_quant_mode = self.config.mla_module_kvcache_quant_mode or kvcache_quant_mode
         # wideep_*_mla_perf.txt is the only archived module-level SGLang MLA
         # data family for DeepSeek, and its historical mla_dtype key is fp8_block.
         # Keep granular prefix attention on fmha_quant_mode, but force module
@@ -190,50 +191,68 @@ class DeepSeekModel(BaseModel):
             else self.config.workload_distribution
         )
 
+        def _residual_norm(phase: str, index: int, scale_factor: float, execution_mode: str):
+            if self._backend_name == "sglang" and tp_size > 1:
+                return ops.FusedAllReduceResidualRMSNorm(
+                    f"{phase}_allreduce_residual_rmsnorm_{index}",
+                    scale_factor,
+                    h,
+                    tp_size,
+                    execution_mode,
+                )
+            return ops.ElementWise(
+                f"{phase}_add_norm_{index}",
+                scale_factor,
+                2 * h,
+                2 * h,
+                0.8,
+            )
+
         if self._backend_name == "sglang":
+            context_mla_granular_ops = [
+                ops.GEMM(
+                    "context_q_b_proj_gemm",
+                    self._num_layers,
+                    24576 // tp_size,
+                    1536,
+                    gemm_quant_mode,
+                ),
+                ops.ContextKVBProjGEMM(
+                    "context_kv_b_proj_gemm",
+                    self._num_layers,
+                    32768 // tp_size,
+                    512,
+                    gemm_quant_mode,
+                ),
+                ops.MLAConcatK(
+                    "context_mla_concat_k",
+                    self._num_layers,
+                    128 // tp_size,
+                ),
+                ops.ContextMLA(
+                    "context_attention",
+                    self._num_layers,
+                    128 // tp_size,
+                    kvcache_quant_mode,
+                    fmha_quant_mode,
+                ),
+                ops.GEMM(
+                    "context_proj_gemm",
+                    self._num_layers,
+                    h,
+                    128 * 128 // tp_size,
+                    gemm_quant_mode,
+                ),
+            ]
             context_mla_ops = [
                 ops.GEMM("context_downscale_gemm", self._num_layers, 2112, h, gemm_quant_mode),
                 ops.PrefixConditionalOp(
                     "context_mla_block",
-                    no_prefix_ops=[
-                        ops.WideEPContextMLA(
-                            "context_mla_module",
-                            self._num_layers,
-                            tp_size,
-                            kvcache_quant_mode,
-                            mla_module_quant_mode,
-                            attn_backend,
-                        )
-                    ],
-                    prefix_ops=[
-                        ops.GEMM(
-                            "context_q_b_proj_gemm",
-                            self._num_layers,
-                            24576 // tp_size,
-                            1536,
-                            gemm_quant_mode,
-                        ),
-                        ops.ContextKVBProjGEMM(
-                            "context_kv_b_proj_gemm",
-                            self._num_layers,
-                            32768 // tp_size,
-                            512,
-                            gemm_quant_mode,
-                        ),
-                        ops.MLAConcatK(
-                            "context_mla_concat_k",
-                            self._num_layers,
-                            128 // tp_size,
-                        ),
-                        ops.ContextMLA(
-                            "context_attention",
-                            self._num_layers,
-                            128 // tp_size,
-                            kvcache_quant_mode,
-                            fmha_quant_mode,
-                        ),
-                        ops.GEMM("context_proj_gemm", self._num_layers, h, 128 * 128 // tp_size, gemm_quant_mode),
-                    ],
+                    # Ordinary TP SGLang uses granular MLA kernels for fresh
+                    # and prefix-hit prefill. WideEP module data has a different
+                    # collector boundary and overestimates this path.
+                    no_prefix_ops=context_mla_granular_ops,
+                    prefix_ops=context_mla_granular_ops,
                 ),
             ]
         else:
@@ -290,9 +309,9 @@ class DeepSeekModel(BaseModel):
         self.context_ops.extend(
             [
                 ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3),
-                ops.ElementWise("context_add_norm_1", self._num_layers, 2 * h, 2 * h, 0.8),
+                _residual_norm("context", 1, self._num_layers, "eager"),
                 *context_mla_ops,
-                ops.ElementWise("context_add_norm_2", self._num_layers, 2 * h, 2 * h, 0.8),
+                _residual_norm("context", 2, self._num_layers, "eager"),
             ]
         )
 
@@ -399,6 +418,8 @@ class DeepSeekModel(BaseModel):
                         moe_quant_mode,
                         workload_distribution,
                         attention_dp_size,
+                        is_context=True,
+                        strict_workload_distribution=self.config.strict_workload_distribution,
                     )
                 ]
             )
@@ -459,7 +480,7 @@ class DeepSeekModel(BaseModel):
                     "generation_mla_module",
                     self._num_layers * self._mtp_scale_factor,
                     tp_size,
-                    kvcache_quant_mode,
+                    mla_module_kvcache_quant_mode,
                     mla_module_quant_mode,
                     attn_backend,
                 ),
@@ -542,20 +563,18 @@ class DeepSeekModel(BaseModel):
         self.generation_ops.extend(
             [
                 ops.Embedding("generation_embedding", 1 * self._mtp_scale_factor, self._vocab_size, h, 0.3),
-                ops.ElementWise(
-                    "generation_add_norm_1",
+                _residual_norm(
+                    "generation",
+                    1,
                     self._num_layers * self._mtp_scale_factor,
-                    2 * h,
-                    2 * h,
-                    0.8,
+                    "graph",
                 ),
                 *generation_mla_ops,
-                ops.ElementWise(
-                    "generation_add_norm_2",
+                _residual_norm(
+                    "generation",
+                    2,
                     self._num_layers * self._mtp_scale_factor,
-                    2 * h,
-                    2 * h,
-                    0.8,
+                    "graph",
                 ),
             ]
         )
@@ -650,6 +669,8 @@ class DeepSeekModel(BaseModel):
                     moe_quant_mode,
                     workload_distribution,
                     attention_dp_size,
+                    is_context=False,
+                    strict_workload_distribution=self.config.strict_workload_distribution,
                 ),
                 ops.MoEDispatch(
                     "generation_moe_post_dispatch",
@@ -1385,6 +1406,7 @@ class WideEPDeepSeekModel(BaseModel):
                     is_context=True,
                     moe_backend=moe_backend,
                     enable_eplb=self.config.enable_eplb,
+                    strict_workload_distribution=self.config.strict_workload_distribution,
                 )
             ]
         )
@@ -1497,6 +1519,7 @@ class WideEPDeepSeekModel(BaseModel):
                     is_context=False,
                     moe_backend=moe_backend,
                     enable_eplb=False,
+                    strict_workload_distribution=self.config.strict_workload_distribution,
                 )
             ]
         )

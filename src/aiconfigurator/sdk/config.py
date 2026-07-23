@@ -24,6 +24,9 @@ class ModelConfig:
     moe_ep_size: int = None
     attention_dp_size: int = 1
     workload_distribution: str = "power_law"
+    # Require exact MoE distribution/shape coverage instead of falling back to
+    # another workload distribution or an empirical HYBRID estimate.
+    strict_workload_distribution: bool = False
     # quantization options
     nextn: int = 0  # at most mtp5
     nextn_accept_rates: list = None
@@ -32,6 +35,10 @@ class ModelConfig:
     sms: int = 20
     moe_backend: str = None  # SGLang MoE backend: deepep_moe, megamoe, or None
     attention_backend: str = "flashinfer"  # 'flashinfer' or 'fa3', for sglang wideep only
+    # Optional database-key override for legacy SGLang MLA module tables.
+    # Keep this separate from kvcache_quant_mode: the latter describes the
+    # granular runtime path, while module tables may use a compatibility key.
+    mla_module_kvcache_quant_mode: common.KVCacheQuantMode | None = None
     enable_wideep: bool = False
     enable_eplb: bool = False  # Expert Parallel Load Balancing
     wideep_num_slots: int = None  # EPLB num_slots, defaults to num_experts if None
@@ -165,6 +172,10 @@ class RuntimeConfig:
     isl: int = None
     osl: int = None
     prefix: int = 0  # prefix len of isl
+    # Exact number of unique KV tokens resident on one attention rank. Static
+    # serving integrations can provide this for shared radix-cache prefixes;
+    # leaving it unset preserves the historical batch_size * seq_len estimate.
+    kv_cache_num_tokens: int | None = None
     ttft: float = None
     tpot: Union[float, list] = None
     request_latency: float = None  # it works together with ttft. 1. <= req_lat 2. <= req_lat and <= ttft

@@ -809,6 +809,7 @@ from aiconfigurator.sdk.operations.attention import (  # noqa: F401
 )
 from aiconfigurator.sdk.operations.communication import (  # noqa: F401
     load_custom_allreduce_data,
+    load_flashinfer_fused_allreduce_data,
     load_nccl_data,
 )
 from aiconfigurator.sdk.operations.dsa import (  # noqa: F401
@@ -1671,6 +1672,11 @@ class PerfDatabase:
                     result,
                     roofline_scale=dsv4_operator_roofline_scale,
                 )
+            if float(result) < 0:
+                raise PerfDataNotAvailableError(
+                    f"Silicon database returned negative latency {float(result)} ms; "
+                    "treating this result as a database miss"
+                )
             return result
 
         except Exception as e:
@@ -2147,6 +2153,29 @@ class PerfDatabase:
         return CustomAllReduce._query_custom_allreduce_table(self, quant_mode, tp_size, size, database_mode)
 
     @functools.lru_cache(maxsize=32768)
+    def query_flashinfer_fused_allreduce(
+        self,
+        quant_mode: common.CommQuantMode,
+        tp_size: int,
+        token_num: int,
+        hidden_size: int,
+        pattern: str = "auto",
+        execution_mode: str = "eager",
+    ) -> PerformanceResult:
+        """Delegate FlashInfer fused all-reduce + residual RMSNorm queries."""
+        from aiconfigurator.sdk.operations.communication import FusedAllReduceResidualRMSNorm
+
+        return FusedAllReduceResidualRMSNorm._query_flashinfer_fused_allreduce_table(
+            self,
+            quant_mode,
+            tp_size,
+            token_num,
+            hidden_size,
+            pattern,
+            execution_mode,
+        )
+
+    @functools.lru_cache(maxsize=32768)
     def query_nccl(
         self,
         dtype: common.CommQuantMode,
@@ -2178,6 +2207,7 @@ class PerfDatabase:
         database_mode: common.DatabaseMode | None = None,
         is_gated: bool = True,
         enable_eplb: bool = False,
+        strict_workload_distribution: bool = False,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Delegates to ``MoE``; see ``operations.moe.MoE._query_moe_table``."""
         from aiconfigurator.sdk.operations.moe import MoE
@@ -2198,6 +2228,7 @@ class PerfDatabase:
             database_mode=database_mode,
             is_gated=is_gated,
             enable_eplb=enable_eplb,
+            strict_workload_distribution=strict_workload_distribution,
         )
 
     @functools.lru_cache(maxsize=32768)

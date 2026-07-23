@@ -1493,6 +1493,14 @@ class TaskRunner:
         logger.debug("Task %s: Setting up model config", task_config.task_name)
         task_workload_distribution = _config_get(task_config, "workload_distribution", "power_law")
         worker_workload_distribution = _config_get(task_config.worker_config, "workload_distribution", None)
+        task_strict_workload_distribution = bool(
+            _config_get(task_config, "strict_workload_distribution", False)
+        )
+        worker_strict_workload_distribution = _config_get_or(
+            task_config.worker_config,
+            "strict_workload_distribution",
+            task_strict_workload_distribution,
+        )
         model_config = config.ModelConfig(
             gemm_quant_mode=task_config.worker_config.gemm_quant_mode,
             kvcache_quant_mode=task_config.worker_config.kvcache_quant_mode,
@@ -1500,6 +1508,7 @@ class TaskRunner:
             moe_quant_mode=task_config.worker_config.moe_quant_mode,
             comm_quant_mode=task_config.worker_config.comm_quant_mode,
             workload_distribution=worker_workload_distribution or task_workload_distribution,
+            strict_workload_distribution=bool(worker_strict_workload_distribution),
             nextn=task_config.nextn,
             nextn_accept_rates=task_config.nextn_accept_rates,
             moe_backend=task_config.moe_backend,  # sglang wideep only
@@ -1586,12 +1595,29 @@ class TaskRunner:
         prefill_moe_backend = _config_get_or(_pwc, "moe_backend", task_config.moe_backend)
         prefill_attention_backend = _config_get_or(_pwc, "attention_backend", task_config.attention_backend)
         task_workload_distribution = _config_get(task_config, "workload_distribution", "power_law")
+        task_strict_workload_distribution = bool(
+            _config_get(task_config, "strict_workload_distribution", False)
+        )
         prefill_workload_distribution = _config_get_or(_pwc, "workload_distribution", task_workload_distribution)
+        prefill_strict_workload_distribution = bool(
+            _config_get_or(
+                _pwc,
+                "strict_workload_distribution",
+                task_strict_workload_distribution,
+            )
+        )
         decode_enable_wideep = _config_get_or(_dwc, "enable_wideep", task_config.enable_wideep)
         decode_enable_eplb = _config_get_or(_dwc, "enable_eplb", getattr(task_config, "enable_eplb", False))
         decode_moe_backend = _config_get_or(_dwc, "moe_backend", task_config.moe_backend)
         decode_attention_backend = _config_get_or(_dwc, "attention_backend", task_config.attention_backend)
         decode_workload_distribution = _config_get_or(_dwc, "workload_distribution", task_workload_distribution)
+        decode_strict_workload_distribution = bool(
+            _config_get_or(
+                _dwc,
+                "strict_workload_distribution",
+                task_strict_workload_distribution,
+            )
+        )
 
         logger.debug("Task %s: Setting up prefill database", task_config.task_name)
         try:
@@ -1619,6 +1645,7 @@ class TaskRunner:
             moe_quant_mode=task_config.prefill_worker_config.moe_quant_mode,
             comm_quant_mode=task_config.prefill_worker_config.comm_quant_mode,
             workload_distribution=prefill_workload_distribution,
+            strict_workload_distribution=prefill_strict_workload_distribution,
             nextn=task_config.nextn,
             nextn_accept_rates=task_config.nextn_accept_rates,
             moe_backend=prefill_moe_backend,
@@ -1683,6 +1710,7 @@ class TaskRunner:
             moe_quant_mode=task_config.decode_worker_config.moe_quant_mode,
             comm_quant_mode=task_config.decode_worker_config.comm_quant_mode,
             workload_distribution=decode_workload_distribution,
+            strict_workload_distribution=decode_strict_workload_distribution,
             nextn=task_config.nextn,
             nextn_accept_rates=task_config.nextn_accept_rates,
             moe_backend=decode_moe_backend,

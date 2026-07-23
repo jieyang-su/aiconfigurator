@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from aiconfigurator.cli import CLIResult, cli_exp, cli_generate
+from aiconfigurator.cli import CLIResult, cli_default, cli_exp, cli_generate
 
 pytestmark = pytest.mark.unit
 
@@ -106,6 +106,32 @@ class TestCLIEstimateUnit:
         assert result == "prefill-version-estimate"
         assert ("h200_sxm", "trtllm", "prefill-version", True) in database_calls
         assert ("h100_pcie", "trtllm", "estimate", True) in database_calls
+
+
+class TestCLIDefaultUnit:
+    @patch("aiconfigurator.cli.api._execute_task_configs_internal")
+    @patch("aiconfigurator.cli.api.build_default_task_configs")
+    def test_recorded_strict_mode_is_forwarded(self, mock_build, mock_execute):
+        mock_build.return_value = {"agg": MagicMock(name="TaskConfig")}
+        mock_execute.return_value = (
+            "agg",
+            {"agg": pd.DataFrame()},
+            {"agg": pd.DataFrame()},
+            {"agg": 1.0},
+            {"agg": {"ttft": 0.0, "tpot": 0.0, "request_latency": 0.0}},
+        )
+
+        cli_default(
+            model_path="deepseek-ai/DeepSeek-V3",
+            total_gpus=4,
+            system="h100_pcie",
+            backend="sglang",
+            workload_distribution="recorded",
+            strict_workload_distribution=True,
+        )
+
+        assert mock_build.call_args.kwargs["workload_distribution"] == "recorded"
+        assert mock_build.call_args.kwargs["strict_workload_distribution"] is True
 
 
 class TestCLIExpUnit:

@@ -312,6 +312,24 @@ class TestBuildDefaultTaskConfigs:
         assert mock_task_config.call_count == 2
 
     @patch("aiconfigurator.cli.main.TaskConfig")
+    def test_recorded_strict_mode_is_added_to_default_task_yaml(self, mock_task_config):
+        mock_task_config.return_value = MagicMock(name="MockTaskConfig")
+
+        build_default_task_configs(
+            model_path="Qwen/Qwen3-32B",
+            total_gpus=1,
+            system="h100_pcie",
+            backend="sglang",
+            database_mode="HYBRID",
+            workload_distribution="recorded",
+            strict_workload_distribution=True,
+        )
+
+        yaml_config = mock_task_config.call_args.kwargs["yaml_config"]
+        assert yaml_config["config"]["workload_distribution"] == "recorded"
+        assert yaml_config["config"]["strict_workload_distribution"] is True
+
+    @patch("aiconfigurator.cli.main.TaskConfig")
     @patch("aiconfigurator.cli.main.perf_database.get_supported_databases")
     def test_auto_megamoe_sweeps_only_sglang(self, mock_supported_databases, mock_task_config):
         """The SGLang-only MegaMoE override must not be passed to TRT-LLM or vLLM."""

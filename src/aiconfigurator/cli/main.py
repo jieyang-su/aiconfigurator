@@ -367,6 +367,15 @@ def _add_default_mode_arguments(parser):
         ),
     )
     parser.add_argument(
+        "--strict-workload-distribution",
+        action="store_true",
+        default=False,
+        help=(
+            "Require exact MoE workload-distribution and shape coverage; "
+            "do not use distribution or HYBRID empirical fallbacks."
+        ),
+    )
+    parser.add_argument(
         "--enable-wideep",
         action="store_true",
         default=False,
@@ -702,6 +711,15 @@ def _add_estimate_mode_arguments(parser):
         help=(
             "MoE workload distribution. Examples: power_law, balanced, recorded, "
             "recorded_no_eplb, recorded_eplb. When omitted, ModelConfig defaults to power_law."
+        ),
+    )
+    parser.add_argument(
+        "--strict-workload-distribution",
+        action="store_true",
+        default=False,
+        help=(
+            "Require exact MoE workload-distribution and shape coverage; "
+            "do not use distribution or HYBRID empirical fallbacks."
         ),
     )
     parser.add_argument(
@@ -1077,6 +1095,8 @@ def build_default_task_configs(
     fmha_quant_mode: str | None = None,
     moe_quant_mode: str | None = None,
     comm_quant_mode: str | None = None,
+    workload_distribution: str | None = None,
+    strict_workload_distribution: bool = False,
     enable_wideep: bool = False,
     moe_backend: str | None = None,
     engine_step_backend: str | None = None,
@@ -1106,6 +1126,9 @@ def build_default_task_configs(
         fmha_quant_mode: Optional FMHA quantization mode override.
         moe_quant_mode: Optional MoE quantization mode override.
         comm_quant_mode: Optional communication quantization mode override.
+        workload_distribution: Optional MoE workload-distribution override.
+        strict_workload_distribution: Disable MoE distribution/shape and
+            HYBRID empirical fallbacks.
         enable_wideep: Whether to enable Wide Expert Parallelism (WideEP) for MoE models.
         moe_backend: Explicit SGLang MoE backend override.
         engine_step_backend: Experimental static latency backend ("python" or "rust").
@@ -1245,6 +1268,10 @@ def build_default_task_configs(
     if nextn > 0:
         yaml_patch_config["nextn"] = nextn
         yaml_patch_config["nextn_accept_rates"] = nextn_accept_rates
+    if workload_distribution is not None:
+        yaml_patch_config["workload_distribution"] = workload_distribution
+    if strict_workload_distribution:
+        yaml_patch_config["strict_workload_distribution"] = True
 
     quant_override = {
         key: value
@@ -1965,6 +1992,7 @@ def _run_estimate_mode(args):
         moe_quant_mode=args.moe_quant_mode,
         comm_quant_mode=args.comm_quant_mode,
         workload_distribution=args.workload_distribution,
+        strict_workload_distribution=args.strict_workload_distribution,
         enable_wideep=args.enable_wideep,
         moe_backend=args.moe_backend,
         enable_eplb=args.enable_eplb,
@@ -2171,6 +2199,8 @@ def main(args):
             fmha_quant_mode=args.fmha_quant_mode,
             moe_quant_mode=args.moe_quant_mode,
             comm_quant_mode=args.comm_quant_mode,
+            workload_distribution=args.workload_distribution,
+            strict_workload_distribution=args.strict_workload_distribution,
             engine_step_backend=args.engine_step_backend,
             enable_wideep=getattr(args, "enable_wideep", False),
             moe_backend=getattr(args, "moe_backend", None),

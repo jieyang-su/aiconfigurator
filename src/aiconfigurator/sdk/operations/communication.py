@@ -348,6 +348,155 @@ class CustomAllReduce(Operation):
         return self._weights * self._scale_factor
 
 
+class FusedAllReduceResidualRMSNorm(Operation):
+    """SGLang TP all-reduce fused with residual addition and RMSNorm.
+
+    FlashInfer executes the collective and residual/RMSNorm epilogue as one
+    operation. When the fused table is unavailable, retain the historical
+    estimate by overlapping custom all-reduce with the elementwise epilogue.
+    """
+
+    _data_cache: ClassVar[dict] = {}
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        h: int,
+        tp_size: int,
+        execution_mode: str = "eager",
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._h = h
+        self._tp_size = tp_size
+        self._execution_mode = execution_mode
+        self._weights = 0.0
+
+    @classmethod
+    def _cache_key(cls, database: PerfDatabase) -> tuple:
+        return _cache_key(database)
+
+    @classmethod
+    def load_data(cls, database: PerfDatabase) -> None:
+        """Load FlashInfer fused all-reduce + residual RMSNorm measurements."""
+        from aiconfigurator.sdk.perf_database import LoadedOpData, PerfDataFilename
+
+        key = cls._cache_key(database)
+        if key not in cls._data_cache:
+            system_data_root = os.path.join(database.systems_root, database.system_spec["data_dir"])
+            data_dir = os.path.join(system_data_root, database.backend, database.version)
+            primary_path = os.path.join(data_dir, PerfDataFilename.flashinfer_fused_allreduce.value)
+            sources = database._build_op_sources(
+                PerfDataFilename.flashinfer_fused_allreduce,
+                primary_path,
+                system_data_root,
+            )
+            cls._data_cache[key] = LoadedOpData(
+                load_flashinfer_fused_allreduce_data(sources),
+                PerfDataFilename.flashinfer_fused_allreduce,
+                primary_path,
+            )
+            cls._record_load()
+
+        if "_flashinfer_fused_allreduce_data" not in database.__dict__:
+            database._flashinfer_fused_allreduce_data = cls._data_cache[key]
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        cls._data_cache.clear()
+
+    @classmethod
+    def _query_flashinfer_fused_allreduce_table(
+        cls,
+        database: PerfDatabase,
+        quant_mode: common.CommQuantMode,
+        tp_size: int,
+        token_num: int,
+        hidden_size: int,
+        pattern: str = "auto",
+        execution_mode: str = "eager",
+    ) -> PerformanceResult:
+        """Query synchronized FlashInfer fused collective measurements."""
+        from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
+
+        cls.load_data(database)
+        data_wrapper = database._flashinfer_fused_allreduce_data
+        data_wrapper.raise_if_not_loaded()
+        by_tp = data_wrapper.get(quant_mode, {}).get(tp_size, {})
+        by_hidden = by_tp.get(hidden_size, {})
+        token_data = by_hidden.get(pattern, {}).get(execution_mode, {})
+        if not token_data:
+            raise PerfDataNotAvailableError(
+                "No FlashInfer fused allreduce data for "
+                f"quant_mode={quant_mode.value.name}, tp_size={tp_size}, "
+                f"hidden_size={hidden_size}, pattern={pattern}, "
+                f"execution_mode={execution_mode}"
+            )
+
+        token_points = sorted(token_data)
+        if token_num < token_points[0] or token_num > token_points[-1]:
+            raise PerfDataNotAvailableError(
+                f"FlashInfer fused allreduce token_num={token_num} is outside collected "
+                f"range [{token_points[0]}, {token_points[-1]}] for tp_size={tp_size}"
+            )
+        left, right = interpolation.nearest_1d_point_helper(token_num, token_points, inner_only=False)
+        result = interpolation.interp_1d(
+            [left, right],
+            [token_data[left], token_data[right]],
+            token_num,
+        )
+        if isinstance(result, dict):
+            return database._interp_pr(result["latency"], energy=result.get("energy", 0.0))
+        return database._interp_pr(result)
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
+
+        x = kwargs.get("x")
+        # Residual add + RMSNorm reads two hidden vectors and writes one.
+        norm_result = database.query_mem_op(x * self._h * 2 * 3)
+        if self._tp_size == 1:
+            return PerformanceResult(
+                float(norm_result) * self._scale_factor,
+                energy=norm_result.energy * self._scale_factor,
+                source=getattr(norm_result, "source", "silicon"),
+            )
+
+        try:
+            fused_result = database.query_flashinfer_fused_allreduce(
+                common.CommQuantMode.half,
+                self._tp_size,
+                x,
+                self._h,
+                pattern="auto",
+                execution_mode=self._execution_mode,
+            )
+            return PerformanceResult(
+                float(fused_result) * self._scale_factor,
+                energy=fused_result.energy * self._scale_factor,
+                source=getattr(fused_result, "source", "silicon"),
+            )
+        except PerfDataNotAvailableError:
+            pass
+
+        comm_result = database.query_custom_allreduce(
+            common.CommQuantMode.half,
+            self._tp_size,
+            x * self._h,
+        )
+        comm_source = getattr(comm_result, "source", "silicon")
+        norm_source = getattr(norm_result, "source", "silicon")
+        source = comm_source if comm_source == norm_source else "mixed"
+        return PerformanceResult(
+            max(float(comm_result), float(norm_result)) * self._scale_factor,
+            energy=(comm_result.energy + norm_result.energy) * self._scale_factor,
+            source=source,
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights
+
+
 class NCCL(Operation):
     """
     NCCL collective communication operation with power tracking.
@@ -755,6 +904,49 @@ def load_custom_allreduce_data(custom_allreduce_file):
             }
 
     return custom_allreduce_data
+
+
+def load_flashinfer_fused_allreduce_data(data_file):
+    """Load FlashInfer fused all-reduce + residual RMSNorm measurements."""
+    rows = _read_filtered_rows(data_file)
+    if rows is None:
+        logger.debug(f"FlashInfer fused allreduce data file {data_file} not found.")
+        return None
+
+    data = defaultdict(
+        lambda: defaultdict(
+            lambda: defaultdict(
+                lambda: defaultdict(lambda: defaultdict(lambda: defaultdict()))
+            )
+        )
+    )
+    for row in rows:
+        quant_mode = common.CommQuantMode.half
+        tp_size = int(row["num_gpus"])
+        hidden_size = int(row["hidden_size"])
+        pattern = str(row["pattern"])
+        execution_mode = str(row["execution_mode"])
+        token_num = int(row["token_num"])
+        latency = float(row["latency"])
+        power = float(row.get("power") or 0.0)
+        bucket = data[quant_mode][tp_size][hidden_size][pattern][execution_mode]
+        if token_num in bucket:
+            logger.debug(
+                "value conflict in FlashInfer fused allreduce data: %s %s %s %s %s %s",
+                quant_mode,
+                tp_size,
+                hidden_size,
+                pattern,
+                execution_mode,
+                token_num,
+            )
+            continue
+        bucket[token_num] = {
+            "latency": latency,
+            "power": power,
+            "energy": power * latency,
+        }
+    return data
 
 
 def load_nccl_data(nccl_file):

@@ -1338,6 +1338,7 @@ class TestTaskrunnerDisaggMixedWideepModelConfig:
                 "mode": "patch",
                 "config": {
                     "workload_distribution": "balanced",
+                    "strict_workload_distribution": True,
                     "prefill_worker_config": {
                         "num_gpu_per_worker": [1],
                         "tp_list": [1],
@@ -1355,6 +1356,8 @@ class TestTaskrunnerDisaggMixedWideepModelConfig:
 
         assert captured["prefill_model_config"].workload_distribution == "balanced"
         assert captured["decode_model_config"].workload_distribution == "balanced"
+        assert captured["prefill_model_config"].strict_workload_distribution is True
+        assert captured["decode_model_config"].strict_workload_distribution is True
 
 
 class TestRateMatchingFactorsForwarding:

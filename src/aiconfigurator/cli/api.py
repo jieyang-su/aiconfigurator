@@ -155,6 +155,8 @@ def cli_default(
     generator_config: str | None = None,
     generator_dynamo_version: str | None = None,
     engine_step_backend: str | None = None,
+    workload_distribution: str | None = None,
+    strict_workload_distribution: bool = False,
 ) -> CLIResult:
     """
     Run the default CLI mode: compare aggregated vs disaggregated serving.
@@ -197,6 +199,9 @@ def cli_default(
         generator_config: Path to a unified generator YAML config file.
         generator_dynamo_version: Override Dynamo version used by the generator.
         engine_step_backend: Experimental static latency backend ("python" or "rust").
+        workload_distribution: Optional MoE workload-distribution override.
+        strict_workload_distribution: Require the selected MoE distribution,
+            shape, and token range without HYBRID empirical fallback.
 
     Returns:
         CLIResult with chosen experiment, best configs, pareto fronts, and throughputs.
@@ -251,6 +256,8 @@ def cli_default(
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         max_seq_len=max_seq_len,
         engine_step_backend=engine_step_backend,
+        workload_distribution=workload_distribution,
+        strict_workload_distribution=strict_workload_distribution,
     )
 
     result = _execute_and_wrap_result(task_configs, mode="default", top_n=top_n, strict_sla=strict_sla)
@@ -603,6 +610,7 @@ def _build_model_config(
     wideep_num_slots: int | None = None,
     nextn: int | None = None,
     nextn_accept_rates: list[float] | None = None,
+    strict_workload_distribution: bool = False,
 ):
     """Build a ModelConfig with optional quant mode overrides."""
     from aiconfigurator.sdk.common import (
@@ -626,6 +634,7 @@ def _build_model_config(
         moe_quant_mode=MoEQuantMode[moe_quant_mode] if moe_quant_mode else None,
         comm_quant_mode=CommQuantMode[comm_quant_mode] if comm_quant_mode else None,
         workload_distribution=workload_distribution or "power_law",
+        strict_workload_distribution=strict_workload_distribution,
         enable_wideep=enable_wideep,
         moe_backend=moe_backend,
         enable_eplb=enable_eplb,
@@ -658,6 +667,7 @@ def cli_estimate(
     moe_quant_mode: str | None = None,
     comm_quant_mode: str | None = None,
     workload_distribution: str | None = None,
+    strict_workload_distribution: bool = False,
     enable_wideep: bool = False,
     moe_backend: str | None = None,
     enable_eplb: bool = False,
@@ -734,6 +744,8 @@ def cli_estimate(
         workload_distribution: MoE workload distribution. Defaults to ModelConfig's
             project default (``power_law``). Use ``recorded`` to select the
             recorded/materialized MoE rows when present.
+        strict_workload_distribution: Require the requested MoE distribution and
+            shape to exist, and disable HYBRID empirical fallback for MoE misses.
         enable_wideep: Enable WideEP/DeepEP modeling for SGLang estimate mode.
         moe_backend: Explicit SGLang MoE backend (for example ``deepep_moe``).
         enable_eplb: Enable EPLB modeling where the model path supports it.
@@ -876,6 +888,7 @@ def cli_estimate(
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
             workload_distribution=workload_distribution,
+            strict_workload_distribution=strict_workload_distribution,
             enable_wideep=enable_wideep,
             moe_backend=moe_backend or ("deepep_moe" if backend_name == "sglang" and enable_wideep else None),
             enable_eplb=enable_eplb,
@@ -911,6 +924,7 @@ def cli_estimate(
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
             workload_distribution=workload_distribution,
+            strict_workload_distribution=strict_workload_distribution,
             enable_wideep=enable_wideep,
             moe_backend=moe_backend or ("deepep_moe" if backend_name == "sglang" and enable_wideep else None),
             enable_eplb=enable_eplb,
@@ -979,6 +993,7 @@ def cli_estimate(
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
             workload_distribution=workload_distribution,
+            strict_workload_distribution=strict_workload_distribution,
             enable_wideep=enable_wideep,
             moe_backend=moe_backend or ("deepep_moe" if backend_name == "sglang" and enable_wideep else None),
             enable_eplb=enable_eplb,
@@ -1037,6 +1052,7 @@ def _run_agg_estimate(
     moe_quant_mode,
     comm_quant_mode,
     workload_distribution,
+    strict_workload_distribution,
     enable_wideep,
     moe_backend,
     enable_eplb,
@@ -1078,6 +1094,7 @@ def _run_agg_estimate(
         wideep_num_slots,
         nextn,
         nextn_accept_rates,
+        strict_workload_distribution=strict_workload_distribution,
     )
     _apply_nextn(model_config, nextn, nextn_accept_rates)
     runtime_config = RuntimeConfig(
@@ -1184,6 +1201,7 @@ def _run_static_estimate(
     moe_quant_mode,
     comm_quant_mode,
     workload_distribution,
+    strict_workload_distribution,
     enable_wideep,
     moe_backend,
     enable_eplb,
@@ -1229,6 +1247,7 @@ def _run_static_estimate(
         moe_backend,
         enable_eplb,
         wideep_num_slots,
+        strict_workload_distribution=strict_workload_distribution,
     )
     _apply_nextn(model_config, nextn, nextn_accept_rates)
 
@@ -1315,6 +1334,7 @@ def _run_disagg_estimate(
     moe_quant_mode,
     comm_quant_mode,
     workload_distribution,
+    strict_workload_distribution,
     enable_wideep,
     moe_backend,
     enable_eplb,
@@ -1366,6 +1386,7 @@ def _run_disagg_estimate(
         wideep_num_slots,
         nextn,
         nextn_accept_rates,
+        strict_workload_distribution=strict_workload_distribution,
     )
     decode_model_config = _build_model_config(
         decode_tp_size,
@@ -1385,6 +1406,7 @@ def _run_disagg_estimate(
         wideep_num_slots,
         nextn,
         nextn_accept_rates,
+        strict_workload_distribution=strict_workload_distribution,
     )
     # Apply common nextn/MTP overrides to *both* prefill and decode worker
     # configs so a single ``--nextn N`` reaches each side of the disagg pair.

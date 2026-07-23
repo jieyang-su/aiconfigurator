@@ -166,6 +166,39 @@ class TestCLIArgumentParsing:
 
         assert args.engine_step_backend == "rust"
 
+    @pytest.mark.parametrize("mode", ["default", "estimate"])
+    def test_strict_workload_distribution_flag(self, cli_parser, mode):
+        if mode == "default":
+            argv = [
+                "default",
+                "--model-path",
+                "deepseek-ai/DeepSeek-V3",
+                "--total-gpus",
+                "4",
+                "--system",
+                "h100_pcie",
+            ]
+        else:
+            argv = [
+                "estimate",
+                "--model-path",
+                "deepseek-ai/DeepSeek-V3",
+                "--system",
+                "h100_pcie",
+            ]
+
+        args = cli_parser.parse_args(
+            argv
+            + [
+                "--workload-distribution",
+                "recorded",
+                "--strict-workload-distribution",
+            ]
+        )
+
+        assert args.workload_distribution == "recorded"
+        assert args.strict_workload_distribution is True
+
     def test_save_directory_argument(self, cli_parser):
         """Test that save directory can be specified."""
         args = cli_parser.parse_args(
