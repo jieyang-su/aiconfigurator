@@ -567,6 +567,38 @@ def load_custom_allreduce_data(custom_allreduce_file):
     return custom_allreduce_data
 
 
+def load_flashinfer_fused_allreduce_data(data_file):
+    """Load FlashInfer fused all-reduce + residual RMSNorm measurements."""
+    rows = _read_filtered_rows(data_file)
+    if rows is None:
+        logger.debug(f"FlashInfer fused allreduce data file {data_file} not found.")
+        return None
+    data = defaultdict(
+        lambda: defaultdict(
+            lambda: defaultdict(
+                lambda: defaultdict(lambda: defaultdict(lambda: defaultdict()))
+            )
+        )
+    )
+    for row in rows:
+        dtype = common.CommQuantMode.half
+        tp_size = int(row["num_gpus"])
+        hidden_size = int(row["hidden_size"])
+        pattern = str(row["pattern"])
+        execution_mode = str(row["execution_mode"])
+        token_num = int(row["token_num"])
+        latency = float(row["latency"])
+        power = float(row.get("power", 0.0))
+        bucket = data[dtype][tp_size][hidden_size][pattern][execution_mode]
+        if token_num not in bucket:
+            bucket[token_num] = {
+                "latency": latency,
+                "power": power,
+                "energy": power * latency,
+            }
+    return data
+
+
 def load_nccl_data(nccl_file):
     """
     Load the nccl data with power support (backward compatible).
@@ -2690,6 +2722,7 @@ class PerfDatabase:
                 PerfDataFilename.generation_attention: load_generation_attention_data,
                 PerfDataFilename.moe: load_moe_data,
                 PerfDataFilename.custom_allreduce: load_custom_allreduce_data,
+                PerfDataFilename.flashinfer_fused_allreduce: load_flashinfer_fused_allreduce_data,
                 PerfDataFilename.nccl: load_nccl_data,
                 PerfDataFilename.oneccl: load_nccl_data,
                 PerfDataFilename.context_mla: load_context_mla_data,
@@ -2761,6 +2794,9 @@ class PerfDatabase:
 
         # Comm ops
         self._custom_allreduce_data = _load_op_data(PerfDataFilename.custom_allreduce)
+        self._flashinfer_fused_allreduce_data = _load_op_data(
+            PerfDataFilename.flashinfer_fused_allreduce
+        )
         self._nccl_data = _load_op_data(PerfDataFilename.nccl)
         self._oneccl_data = _load_op_data(PerfDataFilename.oneccl) if oneccl_data_dir else None
 
@@ -3943,7 +3979,13 @@ class PerfDatabase:
             error_msg += "."
 
         try:
-            return get_silicon()
+            result = get_silicon()
+            if float(result) < 0:
+                raise PerfDataNotAvailableError(
+                    f"Silicon database returned negative latency {float(result)} ms; "
+                    "treating this result as a database miss"
+                )
+            return result
 
         except Exception as e:
             if database_mode == common.DatabaseMode.HYBRID:
@@ -5299,6 +5341,52 @@ class PerfDatabase:
                     f"{kvcache_quant_mode=}, {fmha_quant_mode=}"
                 ),
             )
+
+    @functools.lru_cache(maxsize=32768)
+    def query_flashinfer_fused_allreduce(
+        self,
+        quant_mode: common.CommQuantMode,
+        tp_size: int,
+        token_num: int,
+        hidden_size: int,
+        pattern: str = "auto",
+        execution_mode: str = "eager",
+    ) -> PerformanceResult:
+        """Query synchronized FlashInfer fused all-reduce + residual RMSNorm data."""
+        self._flashinfer_fused_allreduce_data.raise_if_not_loaded()
+        by_tp = self._flashinfer_fused_allreduce_data.get(quant_mode, {}).get(tp_size, {})
+        by_hidden = by_tp.get(hidden_size, {})
+        token_data = by_hidden.get(pattern, {}).get(execution_mode, {})
+        if not token_data:
+            raise PerfDataNotAvailableError(
+                "No FlashInfer fused allreduce data for "
+                f"quant_mode={quant_mode.value.name}, tp_size={tp_size}, "
+                f"hidden_size={hidden_size}, pattern={pattern}, "
+                f"execution_mode={execution_mode}"
+            )
+        token_points = sorted(token_data)
+        if token_num < token_points[0] or token_num > token_points[-1]:
+            raise PerfDataNotAvailableError(
+                f"FlashInfer fused allreduce token_num={token_num} is outside collected "
+                f"range [{token_points[0]}, {token_points[-1]}] for tp_size={tp_size}"
+            )
+        left, right = self._nearest_1d_point_helper(
+            token_num,
+            token_points,
+            inner_only=False,
+        )
+        result = self._interp_1d(
+            [left, right],
+            [token_data[left], token_data[right]],
+            token_num,
+        )
+        if isinstance(result, dict):
+            return PerformanceResult(
+                result["latency"],
+                energy=result.get("energy", 0.0),
+                source="silicon",
+            )
+        return PerformanceResult(result, energy=0.0, source="silicon")
 
     # to simplify, we no longer support allreduce_strategy
     @functools.lru_cache(maxsize=32768)

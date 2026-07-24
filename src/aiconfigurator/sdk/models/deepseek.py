@@ -168,6 +168,9 @@ class DeepSeekModel(BaseModel):
         kvcache_quant_mode = self.config.kvcache_quant_mode
         fmha_quant_mode = self.config.fmha_quant_mode
         attn_backend = self.config.attention_backend
+        mla_module_kvcache_quant_mode = (
+            self.config.mla_module_kvcache_quant_mode or kvcache_quant_mode
+        )
         # wideep_*_mla_perf.txt is the only archived module-level SGLang MLA
         # data family for DeepSeek, and its historical mla_dtype key is fp8_block.
         # Keep granular prefix attention on fmha_quant_mode, but force module
@@ -179,83 +182,106 @@ class DeepSeekModel(BaseModel):
             else self.config.workload_distribution
         )
 
+        context_mla_granular_ops = [
+            ops.GEMM(
+                "context_q_b_proj_gemm",
+                self._num_layers,
+                24576 // tp_size,
+                1536,
+                gemm_quant_mode,
+            ),
+            ops.ContextKVBProjGEMM(
+                "context_kv_b_proj_gemm",
+                self._num_layers,
+                32768 // tp_size,
+                512,
+                gemm_quant_mode,
+            ),
+            *(
+                [
+                    ops.MLAConcatK(
+                        "context_mla_concat_k",
+                        self._num_layers,
+                        128 // tp_size,
+                    )
+                ]
+                if self._backend_name == "sglang"
+                else []
+            ),
+            ops.ContextAttention(
+                "context_attention",
+                self._num_layers,
+                self._num_heads // tp_size,
+                self._num_kv_heads // tp_size,
+                kvcache_quant_mode,
+                fmha_quant_mode,
+                head_size=self._vllm_head_size,
+            )
+            if self._backend_name == "vllm"
+            else ops.ContextMLA(
+                "context_attention",
+                self._num_layers,
+                128 // tp_size,
+                kvcache_quant_mode,
+                fmha_quant_mode,
+            ),
+            ops.GEMM(
+                "context_proj_gemm",
+                self._num_layers,
+                h,
+                128 * 128 // tp_size,
+                gemm_quant_mode,
+            ),
+        ]
+
+        context_norm_op = (
+            ops.FusedAllReduceResidualRMSNorm
+            if self._backend_name == "sglang" and tp_size > 1
+            else ops.ElementWise
+        )
+        generation_norm_op = (
+            ops.FusedAllReduceResidualRMSNorm
+            if self._backend_name == "sglang" and tp_size > 1
+            else ops.ElementWise
+        )
+
         self.context_ops.extend(
             [
                 ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3),
-                ops.ElementWise("context_add_norm_1", self._num_layers, 2 * h, 2 * h, 0.8),
+                context_norm_op(
+                    "context_allreduce_residual_rmsnorm_1"
+                    if context_norm_op is ops.FusedAllReduceResidualRMSNorm
+                    else "context_add_norm_1",
+                    self._num_layers,
+                    h,
+                    tp_size,
+                )
+                if context_norm_op is ops.FusedAllReduceResidualRMSNorm
+                else context_norm_op("context_add_norm_1", self._num_layers, 2 * h, 2 * h, 0.8),
                 # qkv_a/downscale is outside SGLang's MLA module collector boundary.
                 # Keep it as a shared op so both module and granular paths count it once.
                 ops.GEMM("context_downscale_gemm", self._num_layers, 2112, h, gemm_quant_mode),
-                # Old behavior:
-                #   ops.FallbackOp(primary=ops.MLAModule(...), fallback=[context_downscale_gemm, ...])
-                # That made the path depend on perf-table availability and counted
-                # downscale only when falling back. The refreshed H100 comparison
-                # shows the semantic rule should be explicit: prefix=0 uses the
-                # module table; prefix>0 uses granular ops where prefix correction
-                # is applied at the attention-kernel level.
+                # The qkv_a/downscale projection is kept outside the MLA block;
+                # the MLA block itself is granular for ordinary TP SGLang.
                 ops.PrefixConditionalOp(
                     "context_mla_block",
-                    no_prefix_ops=[
-                        # The archived SGLang module data lives in
-                        # wideep_context_mla_perf.txt. Reuse the WideEP op
-                        # wrapper here instead of the legacy mla_*_module path,
-                        # whose txt files are not present in systems/data.
-                        ops.WideEPContextMLA(
-                            "context_mla_module",
-                            self._num_layers,
-                            tp_size,
-                            kvcache_quant_mode,
-                            mla_module_quant_mode,
-                            attn_backend,
-                        )
-                    ],
-                    prefix_ops=[
-                        ops.GEMM(
-                            "context_q_b_proj_gemm",
-                            self._num_layers,
-                            24576 // tp_size,
-                            1536,
-                            gemm_quant_mode,
-                        ),
-                        ops.ContextKVBProjGEMM(
-                            "context_kv_b_proj_gemm",
-                            self._num_layers,
-                            32768 // tp_size,
-                            512,
-                            gemm_quant_mode,
-                        ),
-                        *(
-                            [
-                                ops.MLAConcatK(
-                                    "context_mla_concat_k",
-                                    self._num_layers,
-                                    128 // tp_size,
-                                )
-                            ]
-                            if self._backend_name == "sglang"
-                            else []
-                        ),
-                        ops.ContextAttention(
-                            "context_attention",
-                            self._num_layers,
-                            self._num_heads // tp_size,
-                            self._num_kv_heads // tp_size,
-                            kvcache_quant_mode,
-                            fmha_quant_mode,
-                            head_size=self._vllm_head_size,
-                        )
-                        if self._backend_name == "vllm"
-                        else ops.ContextMLA(
-                            "context_attention",
-                            self._num_layers,
-                            128 // tp_size,
-                            kvcache_quant_mode,
-                            fmha_quant_mode,
-                        ),
-                        ops.GEMM("context_proj_gemm", self._num_layers, h, 128 * 128 // tp_size, gemm_quant_mode),
-                    ],
+                    # Ordinary TP SGLang uses the granular MLA kernels for both
+                    # fresh and prefix-hit prefill.  WideEP module data has a
+                    # different collector boundary and badly overestimates the
+                    # short-context TP path.
+                    no_prefix_ops=context_mla_granular_ops,
+                    prefix_ops=context_mla_granular_ops,
                 ),
-                ops.ElementWise("context_add_norm_2", self._num_layers, 2 * h, 2 * h, 0.8),
+                context_norm_op(
+                    "context_allreduce_residual_rmsnorm_2"
+                    if context_norm_op is ops.FusedAllReduceResidualRMSNorm
+                    else "context_add_norm_2",
+                    self._num_layers,
+                    h,
+                    tp_size,
+                )
+                if context_norm_op is ops.FusedAllReduceResidualRMSNorm
+                else context_norm_op("context_add_norm_2", self._num_layers, 2 * h, 2 * h, 0.8),
             ]
         )
 
@@ -399,7 +425,17 @@ class DeepSeekModel(BaseModel):
         self.generation_ops.extend(
             [
                 ops.Embedding("generation_embedding", 1 * self._mtp_scale_factor, self._vocab_size, h, 0.3),
-                ops.ElementWise(
+                generation_norm_op(
+                    "generation_allreduce_residual_rmsnorm_1"
+                    if generation_norm_op is ops.FusedAllReduceResidualRMSNorm
+                    else "generation_add_norm_1",
+                    self._num_layers * self._mtp_scale_factor,
+                    h,
+                    tp_size,
+                    "graph",
+                )
+                if generation_norm_op is ops.FusedAllReduceResidualRMSNorm
+                else generation_norm_op(
                     "generation_add_norm_1",
                     self._num_layers * self._mtp_scale_factor,
                     2 * h,
@@ -428,11 +464,21 @@ class DeepSeekModel(BaseModel):
                     "generation_mla_module",
                     self._num_layers * self._mtp_scale_factor,
                     tp_size,
-                    kvcache_quant_mode,
+                    mla_module_kvcache_quant_mode,
                     mla_module_quant_mode,
                     attn_backend,
                 ),
-                ops.ElementWise(
+                generation_norm_op(
+                    "generation_allreduce_residual_rmsnorm_2"
+                    if generation_norm_op is ops.FusedAllReduceResidualRMSNorm
+                    else "generation_add_norm_2",
+                    self._num_layers * self._mtp_scale_factor,
+                    h,
+                    tp_size,
+                    "graph",
+                )
+                if generation_norm_op is ops.FusedAllReduceResidualRMSNorm
+                else generation_norm_op(
                     "generation_add_norm_2",
                     self._num_layers * self._mtp_scale_factor,
                     2 * h,

@@ -299,6 +299,16 @@ class BaseBackend(ABC):
         else:
             memory = self._get_memory_usage(model, database, batch_size, beam_width, isl, osl, prefix=prefix)
 
+        kv_cache_num_tokens = runtime_config.kv_cache_num_tokens
+        if kv_cache_num_tokens is not None:
+            if kv_cache_num_tokens < 0:
+                raise ValueError("kv_cache_num_tokens must be non-negative")
+            memory = dict(memory)
+            old_kv_gib = float(memory.get("kvcache", 0.0))
+            new_kv_gib = model.get_kvcache_bytes_per_sequence(kv_cache_num_tokens) / (1 << 30)
+            memory["kvcache"] = new_kv_gib
+            memory["total"] = float(memory["total"]) - old_kv_gib + new_kv_gib
+
         # Calculate total latencies and energies (simple sums - decoupled!)
         context_latency_ms = sum(context_latency_dict.values())  # milliseconds
         context_energy_wms = sum(context_energy_wms_dict.values())  # watt-milliseconds

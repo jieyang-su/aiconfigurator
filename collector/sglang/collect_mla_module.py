@@ -227,9 +227,31 @@ def _get_mla_backend_list() -> list[str]:
 # Test Case Generation
 # ═══════════════════════════════════════════════════════════════════════
 
-# Sweep ranges — aligned with vllm/trtllm collect_mla_module.py
-_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
-_SEQ_LENGTHS = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+# Sweep ranges — aligned with vllm/trtllm collect_mla_module.py.
+# B=24 is a production sweep point and must not be inferred between B=16/32.
+_BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024]
+_CONTEXT_SEQ_LENGTHS = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+_GENERATION_KV_LENGTHS = [
+    1,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
+]
+_DECODE_NEW_TOKENS = 1
+_DEFAULT_MODEL_MAX_SEQUENCE_LENGTH = 163840
 _HEAD_NUMS = [128, 64, 32, 16, 8]  # 8 covers GLM-5 (native 64) at tp=8
 
 # Reduced head-count list for module-level benchmarks.  Each test case spawns a
@@ -239,6 +261,23 @@ _HEAD_NUMS = [128, 64, 32, 16, 8]  # 8 covers GLM-5 (native 64) at tp=8
 # collect_attn.py) already sweep all 5 head counts; the module benchmark captures
 # scheduling/dispatch overhead which varies less with head count.
 _MODULE_HEAD_NUMS = [128, 64]
+
+
+def _get_model_max_sequence_length(model_id: str) -> int:
+    """Read the model sequence limit from AIC's cached HuggingFace config.
+
+    All models in ``SUPPORTED_MODELS`` have a cached config.  Keep the
+    DeepSeek-V3 limit as a conservative fallback for custom model IDs whose
+    config is not present locally.
+    """
+    config_file = os.path.join(_MODEL_CONFIG_DIR, f"{model_id.replace('/', '--')}_config.json")
+    if os.path.exists(config_file):
+        with open(config_file) as f:
+            config = json.load(f)
+        max_sequence_length = config.get("max_position_embeddings")
+        if isinstance(max_sequence_length, int) and max_sequence_length > 0:
+            return max_sequence_length
+    return _DEFAULT_MODEL_MAX_SEQUENCE_LENGTH
 
 
 def get_context_test_cases(attn_type: str):
@@ -251,7 +290,7 @@ def get_context_test_cases(attn_type: str):
     for compute_dtype, kv_dtype, gemm_type in _get_precision_combos("context"):
         for num_heads in _HEAD_NUMS:
             for batch_size in _BATCH_SIZES:
-                for seq_len in _SEQ_LENGTHS:
+                for seq_len in _CONTEXT_SEQ_LENGTHS:
                     if batch_size * seq_len > 128 * 1024:
                         continue
                     if seq_len >= 8192 and batch_size > 8:
@@ -260,7 +299,10 @@ def get_context_test_cases(attn_type: str):
     return cases
 
 
-def get_generation_test_cases(attn_type: str):
+def get_generation_test_cases(
+    attn_type: str,
+    max_sequence_length: int = _DEFAULT_MODEL_MAX_SEQUENCE_LENGTH,
+):
     """Generation-phase test cases.
 
     Returns list of [kv_cache_len, batch_size, num_heads, kv_cache_dtype,
@@ -270,10 +312,12 @@ def get_generation_test_cases(attn_type: str):
     for compute_dtype, kv_dtype, gemm_type in _get_precision_combos("generation"):
         for num_heads in _HEAD_NUMS:
             for batch_size in _BATCH_SIZES:
-                for seq_len in _SEQ_LENGTHS:
-                    if batch_size * seq_len > 256 * 1024:
-                        continue
-                    if seq_len >= 8192 and batch_size > 16:
+                for seq_len in _GENERATION_KV_LENGTHS:
+                    # Decode is constrained by each request's logical sequence
+                    # length, not by the aggregate independent-KV footprint
+                    # batch_size * past_kv.  Runtime OOM handling below remains
+                    # responsible for shapes that do not fit on a given GPU.
+                    if seq_len + _DECODE_NEW_TOKENS >= max_sequence_length:
                         continue
                     cases.append([seq_len, batch_size, num_heads, kv_dtype, compute_dtype, gemm_type])
     return cases
@@ -1198,7 +1242,8 @@ def run_mla_module(
         all_cases = get_context_test_cases(attn_type)
         phase_name = "Context"
     else:
-        all_cases = get_generation_test_cases(attn_type)
+        max_sequence_length = _get_model_max_sequence_length(model_path)
+        all_cases = get_generation_test_cases(attn_type, max_sequence_length=max_sequence_length)
         phase_name = "Generation"
 
     # Filter to matching precision combo.
@@ -1454,7 +1499,13 @@ def main():
             native_heads = MODEL_NATIVE_HEADS.get(model_path, 128)
             head_nums = [args.num_heads] if args.num_heads else [h for h in _HEAD_NUMS if h <= native_heads]
 
-            for compute_dtype, kv_dtype, gemm_type in _get_precision_combos(args.mode):
+            # WideEP MLA is intentionally executed with BF16 compute, BF16 KV,
+            # and BF16 GEMMs.  run_attention_torch retains the historical
+            # fp8_block/fp8 labels expected by the perf database.
+            precision_combos = (
+                _get_module_precision_combos() if attn_type == "mla" else _get_precision_combos(args.mode)
+            )
+            for compute_dtype, kv_dtype, gemm_type in precision_combos:
                 if args.kv_cache_dtype and kv_dtype != args.kv_cache_dtype:
                     continue
 

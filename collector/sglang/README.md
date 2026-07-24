@@ -15,6 +15,9 @@ The collected performance data can be used for performance modeling, scheduling 
 ## Overview
 
 - **collect_mla_module.py**: Collects performance data for MLA and DSA attention module operators
+- **diagnose_mla_shared_pages.py**：在三种物理 KV 共享拓扑下复现
+  `bs=32, s=32768, heads=32` MLA decode 测试点；详见
+  [README_mla_shared_pages.md](README_mla_shared_pages.md)
 - **collect_wideep_deepep_moe.py**: Collects performance data for DeepSeek MoE operators
 
 ## Requirements
@@ -95,7 +98,8 @@ output_path = "/aiconfigurator/src/aiconfigurator/systems/data/h100_sxm/sglang/0
 
 ### Features
 - Unified MLA (DeepSeek-V3) and DSA (DeepSeek-V3.2, GLM-5) benchmarking
-- SM-gated precision sweep (bfloat16 + fp8 on Hopper+)
+- SM-gated precision sweep for DSA; WideEP MLA runs with BF16 compute/KV/GEMM
+  while retaining the historical `fp8_block`/`fp8` database labels
 - Tests various batch sizes, sequence lengths, and head numbers
 - Supports both prefill and decode phases
 - Optional dummy weights mode for fast testing
@@ -127,9 +131,13 @@ python collect.py --backend sglang --ops wideep_mla_context wideep_mla_generatio
 ### Test Parameters
 The script automatically tests the following configuration combinations:
 - Attention backends: `flashinfer`, `fa3`
-- Head numbers: 128, 64, 32, 16
-- Batch sizes: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024
-- Sequence lengths: 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384
+- Head numbers: 128, 64, 32, 16, 8
+- Batch sizes: 1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 512, 1024
+- Context lengths: 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384
+- Generation KV lengths: 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024,
+  2048, 4096, 8192, 16384, 32768, 65536, 131072. Decode cases are
+  admitted solely when `past_kv + new_token < model_max_sequence_length`;
+  aggregate `batch_size * past_kv` is not a generation-case filter.
 
 ### Output
 Results are saved to:
@@ -210,5 +218,3 @@ Output format:
 ```
 framework,version,device,op_name,kernel_source,moe_dtype,num_tokens,hidden_size,inter_size,topk,num_experts,moe_tp_size,moe_ep_size,distribution,latency
 ```
-
-

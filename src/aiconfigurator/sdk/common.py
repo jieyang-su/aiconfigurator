@@ -651,6 +651,7 @@ class PerfDataFilename(Enum):
     mla_bmm = "mla_bmm_perf.txt"
     moe = "moe_perf.txt"
     custom_allreduce = "custom_allreduce_perf.txt"
+    flashinfer_fused_allreduce = "flashinfer_fused_allreduce_perf.txt"
     wideep_context_mla = "wideep_context_mla_perf.txt"
     wideep_generation_mla = "wideep_generation_mla_perf.txt"
     wideep_context_moe = "wideep_context_moe_perf.txt"

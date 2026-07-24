@@ -66,6 +66,76 @@ class CustomAllReduce(Operation):
         return self._weights * self._scale_factor
 
 
+class FusedAllReduceResidualRMSNorm(Operation):
+    """SGLang TP all-reduce fused with residual addition and RMSNorm.
+
+    FlashInfer executes the collective and the residual/RMSNorm epilogue in one
+    fused operation.  Model the critical path as the slower of communication
+    and elementwise work, while retaining the energy of both components.  For
+    TP=1 this naturally reduces to the ordinary residual/RMSNorm operation.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        h: int,
+        tp_size: int,
+        execution_mode: str = "eager",
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._h = h
+        self._tp_size = tp_size
+        self._execution_mode = execution_mode
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        x = kwargs.get("x")
+        # Residual add + RMSNorm reads two hidden vectors and writes one.
+        norm_result = database.query_mem_op(x * self._h * 2 * 3)
+        if self._tp_size == 1:
+            return PerformanceResult(
+                float(norm_result) * self._scale_factor,
+                energy=norm_result.energy * self._scale_factor,
+                source=getattr(norm_result, "source", "silicon"),
+            )
+
+        try:
+            fused_result = database.query_flashinfer_fused_allreduce(
+                common.CommQuantMode.half,
+                self._tp_size,
+                x,
+                self._h,
+                pattern="auto",
+                execution_mode=self._execution_mode,
+            )
+            return PerformanceResult(
+                float(fused_result) * self._scale_factor,
+                energy=fused_result.energy * self._scale_factor,
+                source=getattr(fused_result, "source", "silicon"),
+            )
+        except Exception as error:
+            from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
+
+            if not isinstance(error, PerfDataNotAvailableError):
+                raise
+
+        comm_result = database.query_custom_allreduce(
+            common.CommQuantMode.half, self._tp_size, x * self._h
+        )
+        comm_source = getattr(comm_result, "source", "silicon")
+        norm_source = getattr(norm_result, "source", "silicon")
+        source = comm_source if comm_source == norm_source else "mixed"
+        return PerformanceResult(
+            max(float(comm_result), float(norm_result)) * self._scale_factor,
+            energy=(comm_result.energy + norm_result.energy) * self._scale_factor,
+            source=source,
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights
+
+
 class P2P(Operation):
     """
     P2P operation with power tracking.

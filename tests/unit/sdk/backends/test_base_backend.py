@@ -50,7 +50,7 @@ class _TestBackend(BaseBackend):
         num_tokens=0,
         prefix=0,
     ) -> dict[str, float]:
-        return {"total": 1.0}
+        return {"total": 1.0, "kvcache": 0.25}
 
 
 @pytest.fixture
@@ -180,3 +180,40 @@ def test_run_static_can_route_to_rust_engine_step_backend(
     assert summary.get_generation_energy_wms_dict() == {"rust_engine_step_generation": 0.0}
     assert summary.get_context_source_dict() == {"rust_engine_step_context": "rust"}
     assert summary.get_generation_source_dict() == {"rust_engine_step_generation": "rust"}
+
+
+def test_run_static_uses_explicit_unique_kv_token_count(
+    backend: BaseBackend,
+    model,
+    database,
+) -> None:
+    one_gib = 1 << 30
+    model.get_kvcache_bytes_per_sequence.side_effect = lambda token_count: token_count * one_gib
+    runtime = RuntimeConfig(
+        batch_size=4,
+        beam_width=1,
+        isl=100,
+        osl=2,
+        kv_cache_num_tokens=10,
+    )
+
+    summary = backend.run_static(model, database, runtime, mode="static_gen")
+
+    assert summary.get_memory()["kvcache"] == pytest.approx(10.0)
+    assert summary.get_memory()["total"] == pytest.approx(10.75)
+
+
+def test_run_static_rejects_negative_unique_kv_token_count(
+    backend: BaseBackend,
+    model,
+    database,
+) -> None:
+    runtime = RuntimeConfig(
+        batch_size=1,
+        isl=8,
+        osl=2,
+        kv_cache_num_tokens=-1,
+    )
+
+    with pytest.raises(ValueError, match="kv_cache_num_tokens"):
+        backend.run_static(model, database, runtime, mode="static_gen")
