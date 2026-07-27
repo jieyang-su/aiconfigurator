@@ -1,0 +1,6 @@
+interface:
+  display_name: "MoE Recorded Hardware Calibration"
+  short_description: "Validate recorded MoE across hardware"
+  default_prompt: "Use $moe-recorded-cross-hardware-calibration to validate recorded MoE AIC across hardware for this runtime version."
+policy:
+  allow_implicit_invocation: true

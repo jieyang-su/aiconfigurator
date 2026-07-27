@@ -1,0 +1,6 @@
+interface:
+  display_name: "MoE Recorded AIC Porting"
+  short_description: "Port recorded MoE AIC to model/runtime"
+  default_prompt: "Use $moe-recorded-aic-porting to migrate recorded MoE AIC support for this model and SGLang version."
+policy:
+  allow_implicit_invocation: true
