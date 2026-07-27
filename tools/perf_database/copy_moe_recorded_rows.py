@@ -70,6 +70,7 @@ def selected_source_rows(source_rows: list[dict[str, str]]) -> list[dict[str, st
         2,
         4,
         8,
+        16,
         32,
         40,
         64,
@@ -96,7 +97,8 @@ def selected_source_rows(source_rows: list[dict[str, str]]) -> list[dict[str, st
     }
     if counts != {"context": len(expected_tokens), "generation": len(expected_tokens)}:
         raise ValueError(
-            "unexpected selected source grid; expected 23 context and generation rows "
+            f"unexpected selected source grid; expected {len(expected_tokens)} context "
+            "and generation rows "
             f"with tokens {sorted(expected_tokens)}, found {dict(counts)}"
         )
     for phase, tokens in tokens_by_phase.items():
