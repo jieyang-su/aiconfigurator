@@ -114,12 +114,14 @@ _DSEEK_V3_ORDINARY_MOE_REPLAY_TOKENS = (
     "1536 2048 2560 4096 5120 8192 10240 12288 14336 16384"
 )
 _DSEEK_V3_RECORDED_MOE_EP_SIZES = "1,2,4,8,16,32"
+_DSEEK_V3_ORDINARY_TINY_SCALED_SOURCE_MAX_TOKENS = "16"
+_DSEEK_V3_ORDINARY_TINY_SCALED_TARGET_ASSIGNMENTS = "8192"
 _DSEEK_V3_MOE_DISTRIBUTION_GENERATION_TOKENS = (
-    "8 32 40 64 128 288 512 640 896 1024 "
+    "1 2 4 8 16 32 40 64 128 288 512 640 896 1024 "
     "1536 2048 2560 4096 5120 8192 10240 12288 14336 16384"
 )
 _DSEEK_V3_ORDINARY_MOE_RECORDED_TOKENS = (
-    "1 2 4 8 32 40 64 128 288 512 640 896 1024 "
+    "1 2 4 8 16 32 40 64 128 288 512 640 896 1024 "
     "1536 2048 2560 4096 5120 8192 10240 12288 14336 16384"
 )
 _DSEEK_V3_LEGACY_BASE_OP_CASES = (
@@ -203,6 +205,123 @@ def _bool_env_enabled(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in _DYNAMIC_FALSE_VALUES
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        if logger is not None:
+            logger.warning("Ignoring invalid integer env %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _gpu_compute_pids() -> set[int]:
+    """Return PIDs with active compute contexts on visible NVIDIA GPUs."""
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("Unable to query GPU compute PIDs with nvidia-smi: %s", exc)
+        return set()
+    if result.returncode != 0:
+        if logger is not None:
+            logger.warning("nvidia-smi compute PID query failed: %s", result.stderr.strip())
+        return set()
+    pids: set[int] = set()
+    for line in result.stdout.splitlines():
+        value = line.strip()
+        if not value or value.upper() in {"N/A", "[N/A]"}:
+            continue
+        try:
+            pids.add(int(value))
+        except ValueError:
+            continue
+    return pids
+
+
+def _describe_pids(pids: set[int]) -> str:
+    details = []
+    for pid in sorted(pids):
+        cmdline_path = Path("/proc") / str(pid) / "cmdline"
+        try:
+            raw = cmdline_path.read_bytes()
+            cmd = raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+        except Exception:
+            cmd = "<exited>"
+        if len(cmd) > 220:
+            cmd = cmd[:217] + "..."
+        details.append(f"{pid}:{cmd}")
+    return "; ".join(details)
+
+
+def _stage_gpu_drain_guard_enabled_for_collections(
+    *,
+    backend: str,
+    model_path: str | None,
+    collections: list[dict],
+) -> bool:
+    requested_types = {str(collection.get("type", "")) for collection in collections}
+    model = (model_path or os.environ.get("COLLECTOR_MODEL_PATH", "")).lower()
+    default = (
+        backend == "sglang"
+        and "deepseek" in model
+        and "v3" in model
+        and "moe_token_distribution" in requested_types
+        and ("moe" in requested_types or "wideep_moe" in requested_types)
+    )
+    return _bool_env_enabled("COLLECTOR_STAGE_GPU_DRAIN_GUARD", default)
+
+
+def _wait_for_stage_gpu_drain(
+    *,
+    module_label: str,
+    baseline_pids: set[int],
+) -> tuple[bool, set[int]]:
+    """Wait until GPU compute PIDs created after stage start have exited.
+
+    The baseline lets shared machines keep pre-existing jobs visible while still
+    catching collector subprocesses that outlive a stage and external jobs that
+    start mid-collection.
+    """
+
+    timeout_s = _int_env("COLLECTOR_STAGE_GPU_DRAIN_TIMEOUT_SECONDS", 120)
+    poll_s = max(1, _int_env("COLLECTOR_STAGE_GPU_DRAIN_POLL_SECONDS", 2))
+    deadline = time.monotonic() + max(0, timeout_s)
+    last_new: set[int] = set()
+
+    while True:
+        current = _gpu_compute_pids()
+        new_pids = current - baseline_pids
+        if not new_pids:
+            if last_new and logger is not None:
+                logger.info("%s: GPU stage drain completed", module_label)
+            return True, set()
+        if new_pids != last_new and logger is not None:
+            logger.warning(
+                "%s: waiting for post-stage GPU compute PIDs to exit: %s",
+                module_label,
+                _describe_pids(new_pids),
+            )
+            last_new = set(new_pids)
+        if time.monotonic() >= deadline:
+            return False, new_pids
+        time.sleep(poll_s)
 
 
 def _keep_dsv3_latency_sources() -> bool:
@@ -443,6 +562,15 @@ def _maybe_apply_deepseek_v3_ep8_defaults(args, ops: list[str] | None) -> None:
         os.environ.get("COLLECTOR_DSV3_EP8_SINGLE_GPU_SIM"),
         os.environ.get("COLLECTOR_MOE_DISTRIBUTION_SINGLE_CARD_EP_SIM"),
         os.environ.get("COLLECTOR_MOE_DISTRIBUTION_MATERIALIZED_PROFILE"),
+        os.environ.get("COLLECTOR_ORDINARY_MOE_TINY_SCALED_SOURCE"),
+        os.environ.get("COLLECTOR_ORDINARY_MOE_TINY_SCALED_SOURCE_MAX_TOKENS"),
+        os.environ.get("COLLECTOR_ORDINARY_MOE_TINY_SCALED_TARGET_ASSIGNMENTS"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_GUARD"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_CONTEXT_MAX_TOKENS"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_GENERATION_MAX_TOKENS"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_SESSIONS"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_MAX_SESSIONS"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_MAX_RETRIES"),
     )
     # Real-EP mode is retained as an explicit escape hatch.  It caps live
     # recorder EP sizes to visible GPUs and defaults WideEP to EP8 only.
@@ -477,6 +605,26 @@ def _maybe_apply_deepseek_v3_ep8_defaults(args, ops: list[str] | None) -> None:
     os.environ.setdefault("COLLECTOR_MOE_TOKENS", _DSEEK_V3_ORDINARY_MOE_TOKENS)
     os.environ.setdefault("COLLECTOR_MOE_RECORDED_TOKENS", _DSEEK_V3_ORDINARY_MOE_RECORDED_TOKENS)
     os.environ.setdefault("COLLECTOR_MOE_EP_SIZES", _DSEEK_V3_RECORDED_MOE_EP_SIZES)
+    os.environ.setdefault("COLLECTOR_ORDINARY_MOE_TINY_SCALED_SOURCE", "1")
+    os.environ.setdefault("COLLECTOR_ORDINARY_MOE_TINY_SCALED_SOURCE_PHASES", "context,generation")
+    os.environ.setdefault(
+        "COLLECTOR_ORDINARY_MOE_TINY_SCALED_SOURCE_MAX_TOKENS",
+        _DSEEK_V3_ORDINARY_TINY_SCALED_SOURCE_MAX_TOKENS,
+    )
+    os.environ.setdefault(
+        "COLLECTOR_ORDINARY_MOE_TINY_SCALED_TARGET_ASSIGNMENTS",
+        _DSEEK_V3_ORDINARY_TINY_SCALED_TARGET_ASSIGNMENTS,
+    )
+    os.environ.setdefault("COLLECTOR_RECORDED_SOURCE_HEALTH_GUARD", "1")
+    os.environ.setdefault("COLLECTOR_RECORDED_SOURCE_HEALTH_CONTEXT_MAX_TOKENS", "32")
+    os.environ.setdefault("COLLECTOR_RECORDED_SOURCE_HEALTH_GENERATION_MAX_TOKENS", "32")
+    os.environ.setdefault("COLLECTOR_RECORDED_SOURCE_HEALTH_SESSIONS", "3")
+    os.environ.setdefault("COLLECTOR_RECORDED_SOURCE_HEALTH_MAX_SESSIONS", "5")
+    os.environ.setdefault("COLLECTOR_RECORDED_SOURCE_HEALTH_MAX_RETRIES", "2")
+    os.environ.setdefault(
+        "COLLECTOR_RECORDED_SOURCE_HEALTH_AUDIT",
+        "1" if _keep_dsv3_latency_sources() else "0",
+    )
     if "COLLECTOR_MOE_DISTRIBUTION_EPLB_MODES" not in os.environ:
         wideep_eplb = os.environ.get("COLLECTOR_WIDEEP_MOE_ENABLE_EPLB")
         if wideep_eplb is not None:
@@ -495,6 +643,15 @@ def _maybe_apply_deepseek_v3_ep8_defaults(args, ops: list[str] | None) -> None:
         os.environ.get("COLLECTOR_DSV3_EP8_SINGLE_GPU_SIM"),
         os.environ.get("COLLECTOR_MOE_DISTRIBUTION_SINGLE_CARD_EP_SIM"),
         os.environ.get("COLLECTOR_MOE_DISTRIBUTION_MATERIALIZED_PROFILE"),
+        os.environ.get("COLLECTOR_ORDINARY_MOE_TINY_SCALED_SOURCE"),
+        os.environ.get("COLLECTOR_ORDINARY_MOE_TINY_SCALED_SOURCE_MAX_TOKENS"),
+        os.environ.get("COLLECTOR_ORDINARY_MOE_TINY_SCALED_TARGET_ASSIGNMENTS"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_GUARD"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_CONTEXT_MAX_TOKENS"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_GENERATION_MAX_TOKENS"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_SESSIONS"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_MAX_SESSIONS"),
+        os.environ.get("COLLECTOR_RECORDED_SOURCE_HEALTH_MAX_RETRIES"),
     )
     if logger is not None and before != after:
         logger.info(
@@ -502,7 +659,13 @@ def _maybe_apply_deepseek_v3_ep8_defaults(args, ops: list[str] | None) -> None:
             "COLLECTOR_MOE_DISTRIBUTION_EP_SIZES=%s, "
             "COLLECTOR_WIDEEP_MOE_EP_SIZES=%s, "
             "context_tokens=%s, generation_tokens=%s, "
-            "single_gpu_sim=%s, single_card_ep_sim=%s, materialized_profile=%s",
+            "single_gpu_sim=%s, single_card_ep_sim=%s, materialized_profile=%s, "
+            "ordinary_tiny_scaled_source=%s, ordinary_tiny_scaled_max_tokens=%s, "
+            "ordinary_tiny_scaled_target_assignments=%s, "
+            "recorded_source_health_guard=%s, recorded_source_health_context_max_tokens=%s, "
+            "recorded_source_health_generation_max_tokens=%s, "
+            "recorded_source_health_sessions=%s, recorded_source_health_max_sessions=%s, "
+            "recorded_source_health_max_retries=%s",
             after[0],
             after[1],
             after[2],
@@ -510,6 +673,15 @@ def _maybe_apply_deepseek_v3_ep8_defaults(args, ops: list[str] | None) -> None:
             after[6],
             after[7],
             after[8],
+            after[9],
+            after[10],
+            after[11],
+            after[12],
+            after[13],
+            after[14],
+            after[15],
+            after[16],
+            after[17],
         )
         if single_gpu_sim:
             logger.info(
@@ -1032,6 +1204,8 @@ def _run_clean_latency_postprocess(args, ops: list[str] | None) -> None:
     wideep_required = [
         source_root / "wideep_context_moe_perf.txt",
         source_root / "wideep_generation_moe_perf.txt",
+        source_root / "raw_collector_source" / "wideep_context_moe_perf.txt",
+        source_root / "raw_collector_source" / "wideep_generation_moe_perf.txt",
         source_root / "aic_latency_source_bundle" / "recorded_materialization_inputs",
     ]
     ordinary_required = [
@@ -2022,6 +2196,12 @@ def collect_ops(
             return get_func()
 
     all_errors = []
+    gpu_drain_guard = _stage_gpu_drain_guard_enabled_for_collections(
+        backend=backend,
+        model_path=model_path,
+        collections=collections,
+    )
+    gpu_drain_strict = _bool_env_enabled("COLLECTOR_STAGE_GPU_DRAIN_STRICT", gpu_drain_guard)
 
     for collection in collections:
         try:
@@ -2139,6 +2319,14 @@ def collect_ops(
                     f"{collection['name']}.{collection['type']}: overriding worker count "
                     f"{num_processes} -> {collection_num_processes}"
                 )
+            stage_label = f"{collection['name']}.{collection['type']}"
+            stage_gpu_baseline = _gpu_compute_pids() if gpu_drain_guard else set()
+            if gpu_drain_guard and logger is not None:
+                logger.info(
+                    "%s: GPU stage drain guard baseline PIDs: %s",
+                    stage_label,
+                    _describe_pids(stage_gpu_baseline) if stage_gpu_baseline else "<none>",
+                )
             errors = collect_module_safe(
                 collection["name"],
                 collection["type"],
@@ -2159,6 +2347,27 @@ def collect_ops(
                 ),
             )
             all_errors.extend(errors)
+            if gpu_drain_guard:
+                drained, lingering = _wait_for_stage_gpu_drain(
+                    module_label=stage_label,
+                    baseline_pids=stage_gpu_baseline,
+                )
+                if not drained:
+                    error = {
+                        "module": stage_label,
+                        "error_type": "GPUStageDrainTimeout",
+                        "error_message": (
+                            "GPU compute PIDs created during this collection stage "
+                            "were still alive after timeout: "
+                            + _describe_pids(lingering)
+                        ),
+                        "traceback": "",
+                    }
+                    all_errors.append(error)
+                    if logger is not None:
+                        logger.error("%s: %s", error["error_type"], error["error_message"])
+                    if gpu_drain_strict:
+                        break
 
         except Exception as e:
             logger.exception(f"Failed to process {collection['name']}.{collection['type']}")

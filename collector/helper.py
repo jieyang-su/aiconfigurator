@@ -569,11 +569,17 @@ def setup_logging(scope=["all"], debug=False, worker_id=None):
     if mp.current_process().name != "MainProcess":
         return logging.getLogger()
 
-    # Create log directory
-    time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _LOG_DIR = Path(_make_log_dir_name(scope, time_stamp))
+    # Create log directory.  Parent orchestrators may set COLLECTOR_LOG_DIR
+    # explicitly for child sessions; keep that directory instead of creating a
+    # sibling timestamped top-level run.
+    explicit_log_dir = os.environ.get("COLLECTOR_LOG_DIR", "").strip()
+    if explicit_log_dir:
+        _LOG_DIR = Path(explicit_log_dir)
+    else:
+        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _LOG_DIR = Path(_make_log_dir_name(scope, time_stamp))
     if not _LOG_DIR.is_dir():
-        _LOG_DIR.mkdir()
+        _LOG_DIR.mkdir(parents=True)
 
     # Set environment variables for workers
     os.environ["COLLECTOR_DEBUG"] = "true" if debug else "false"

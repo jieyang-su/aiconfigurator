@@ -73,6 +73,13 @@ except ModuleNotFoundError:
         sys.path.append(THIS_DIR)
     from rank_local_moe_replay import select_replay_workloads
 
+try:
+    from collector.recorded_source_health_guard import select_recorded_source
+except ModuleNotFoundError:
+    if COLLECTOR_ROOT not in sys.path:
+        sys.path.append(COLLECTOR_ROOT)
+    from recorded_source_health_guard import select_recorded_source
+
 MOE_SUBPROCESS_TIMEOUT_SEC = 1800
 MOE_PROGRESS_LOG_INTERVAL_SEC = 60
 DEFAULT_MOE_MEM_FRACTION_STATIC = 0.3
@@ -103,6 +110,7 @@ DEFAULT_DSV3_CONTEXT_LOGGED_TOKENS = (
     18888,
 )
 DEFAULT_REPLAY_RANDOM_SEED = 20260620
+SOURCE_STABILITY_GUARD_NAME = "wideep_context_tiny_token_source_stability_v1"
 
 
 @dataclass(frozen=True)
@@ -163,6 +171,20 @@ def _env_int_list(name: str) -> list[int] | None:
     for item in raw_value.replace(",", " ").split():
         values.append(int(item))
     return values
+
+
+def _env_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    return int(raw_value)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    return float(raw_value)
 
 
 def _env_float_list(name: str) -> list[float] | None:
@@ -352,6 +374,103 @@ def _apply_profile_free_hybrid_recorded_row(
     merged = apply_profile_free_hybrid_latency(row, phase=phase)
     merged["latency_policy_scope"] = "profile_free_hybrid_recorded"
     return merged
+
+
+def _source_stability_guard_enabled(*, phase: str, num_tokens_log: int) -> bool:
+    if phase != "context":
+        return False
+    if not get_bool_env_var("COLLECTOR_WIDEEP_MOE_SOURCE_STABILITY_GUARD", "false"):
+        return False
+    max_tokens = _env_int("COLLECTOR_WIDEEP_MOE_SOURCE_STABILITY_MAX_TOKENS", 32)
+    return int(num_tokens_log) <= max_tokens
+
+
+def _select_stable_recorded_source(
+    *,
+    measure_once,
+    phase: str,
+    num_tokens_log: int,
+    rank_print,
+) -> dict:
+    """Repeat high-risk recorded source probes and select a stable median row.
+
+    The selector keeps the row internally consistent by returning one complete
+    measured item, instead of mixing latency and feature columns across runs.
+    """
+
+    if not _source_stability_guard_enabled(
+        phase=phase,
+        num_tokens_log=num_tokens_log,
+    ):
+        return measure_once()
+
+    initial_sessions = max(
+        1,
+        _env_int("COLLECTOR_WIDEEP_MOE_SOURCE_STABILITY_SESSIONS", 3),
+    )
+    max_sessions = max(
+        initial_sessions,
+        _env_int("COLLECTOR_WIDEEP_MOE_SOURCE_STABILITY_MAX_SESSIONS", 5),
+    )
+    stable_spread = _env_float(
+        "COLLECTOR_WIDEEP_MOE_SOURCE_STABILITY_SPREAD",
+        1.08,
+    )
+    max_spread = _env_float(
+        "COLLECTOR_WIDEEP_MOE_SOURCE_STABILITY_MAX_SPREAD",
+        1.20,
+    )
+
+    measured: list[dict] = []
+
+    def _spread() -> float:
+        values = [float(item["latency"]) for item in measured]
+        min_value = min(values)
+        max_value = max(values)
+        if min_value <= 0:
+            return float("inf") if max_value > 0 else 1.0
+        return max_value / min_value
+
+    while len(measured) < initial_sessions:
+        measured.append(measure_once())
+
+    spread = _spread()
+    if spread > stable_spread and len(measured) < max_sessions:
+        while len(measured) < max_sessions:
+            measured.append(measure_once())
+        spread = _spread()
+
+    ordered = sorted(
+        enumerate(measured, start=1),
+        key=lambda entry: float(entry[1]["latency"]),
+    )
+    selected_session, selected_item = ordered[len(ordered) // 2]
+    selected = dict(selected_item)
+    if spread <= stable_spread:
+        status = "stable"
+    elif spread <= max_spread:
+        status = "weak_stable"
+    else:
+        status = "unstable"
+    latency_values = [float(item["latency"]) for item in measured]
+    selected.update(
+        {
+            "source_stability_guard": SOURCE_STABILITY_GUARD_NAME,
+            "source_stability_status": status,
+            "source_stability_sessions": len(measured),
+            "source_stability_selected_session": selected_session,
+            "source_stability_spread_ratio": spread,
+            "source_stability_values_ms_json": json.dumps(latency_values),
+        }
+    )
+    rank_print(
+        "Recorded source stability guard: "
+        f"phase={phase}, token={num_tokens_log}, sessions={len(measured)}, "
+        f"spread={spread:.4f}, status={status}, "
+        f"selected_session={selected_session}, "
+        f"values_ms={[round(value, 6) for value in latency_values]}"
+    )
+    return selected
 
 
 def _rank_local_replay_samples(
@@ -2252,35 +2371,36 @@ def benchmark_moe_layer_prefill(
             if distributed == "recorded":
                 recorded_expected_count += 1
             if replay_samples is not None:
-                replay_stats = _benchmark_rank_local_prefill_replay(
-                    moe_layer=moe_layer,
-                    replay_samples=replay_samples,
-                    hidden_size=model_hidden_size,
-                    device=device,
-                    num_warmup=num_warmup,
-                    num_iterations=num_iterations,
+                collector_dir = os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))
                 )
-                replay_stats = _apply_recorded_latency_policy(
-                    replay_stats,
-                    phase="context",
-                    num_tokens_log=num_tokens_log,
+                perf_filename = (
+                    os.path.join(collector_dir, "wideep_context_moe_perf.txt")
+                    if output_path is None
+                    else os.path.join(output_path, "wideep_context_moe_perf.txt")
                 )
-                rank_print(
-                    "Rank-local recorded replay (Prefill): "
-                    f"samples={len(replay_samples)}, ranks={simulated_ep_size}, "
-                    f"steady mean/p90/max={replay_stats['latency']:.3f}/"
-                    f"{replay_stats['latency_p90']:.3f}/"
-                    f"{replay_stats['latency_max']:.3f}ms, "
-                    f"cold={replay_stats['cold_latency']:.3f}ms"
-                )
-                if tp_rank == 0:
-                    collector_dir = os.path.dirname(
-                        os.path.dirname(os.path.abspath(__file__))
+
+                def _measure_recorded_prefill_item_once() -> dict:
+                    replay_stats = _benchmark_rank_local_prefill_replay(
+                        moe_layer=moe_layer,
+                        replay_samples=replay_samples,
+                        hidden_size=model_hidden_size,
+                        device=device,
+                        num_warmup=num_warmup,
+                        num_iterations=num_iterations,
                     )
-                    perf_filename = (
-                        os.path.join(collector_dir, "wideep_context_moe_perf.txt")
-                        if output_path is None
-                        else os.path.join(output_path, "wideep_context_moe_perf.txt")
+                    replay_stats = _apply_recorded_latency_policy(
+                        replay_stats,
+                        phase="context",
+                        num_tokens_log=num_tokens_log,
+                    )
+                    rank_print(
+                        "Rank-local recorded replay (Prefill): "
+                        f"samples={len(replay_samples)}, ranks={simulated_ep_size}, "
+                        f"steady mean/p90/max={replay_stats['latency']:.3f}/"
+                        f"{replay_stats['latency_p90']:.3f}/"
+                        f"{replay_stats['latency_max']:.3f}ms, "
+                        f"cold={replay_stats['cold_latency']:.3f}ms"
                     )
                     item = {
                         "moe_dtype": "fp8_block",
@@ -2296,10 +2416,32 @@ def benchmark_moe_layer_prefill(
                         "measurement_scope": "single_card_rank_local_replay",
                         **replay_stats,
                     }
-                    item = _apply_profile_free_hybrid_recorded_row(
+                    return _apply_profile_free_hybrid_recorded_row(
                         item,
                         phase="context",
                     )
+
+                def _reset_recorded_prefill_guard_attempt() -> None:
+                    torch.get_device_module(device).synchronize()
+                    model_runner.req_to_token_pool.clear()
+                    model_runner.token_to_kv_pool_allocator.clear()
+                    torch.cuda.empty_cache()
+
+                item = select_recorded_source(
+                    family="wideep_context",
+                    phase="context",
+                    ep=simulated_ep_size,
+                    eplb="on" if _rank_local_replay_enable_eplb() else "off",
+                    token=num_tokens_log,
+                    measure_once=_measure_recorded_prefill_item_once,
+                    reset_before_attempt=_reset_recorded_prefill_guard_attempt,
+                    warmup_once=_measure_recorded_prefill_item_once,
+                    output_path=output_path,
+                    rank_print=rank_print,
+                    kernel_source="deepepmoe_rank_local_replay",
+                )
+
+                if tp_rank == 0:
                     log_perf(
                         item_list=[item],
                         framework="SGLang",
@@ -2660,35 +2802,27 @@ def benchmark_moe_layer_decode(
                 else None
             )
             if replay_samples is not None:
-                replay_stats = _benchmark_rank_local_decode_replay(
-                    moe_layer=moe_layer,
-                    replay_samples=replay_samples,
-                    hidden_size=model_hidden_size,
-                    device=device,
-                    num_warmup=num_warmup,
-                    num_iterations=num_iterations,
-                )
-                replay_stats = _apply_recorded_latency_policy(
-                    replay_stats,
-                    phase="generation",
-                    num_tokens_log=num_tokens_log,
-                )
-                rank_print(
-                    "Rank-local recorded replay (Decode): "
-                    f"samples={len(replay_samples)}, ranks={simulated_ep_size}, "
-                    f"steady mean/p90/max={replay_stats['latency']:.3f}/"
-                    f"{replay_stats['latency_p90']:.3f}/"
-                    f"{replay_stats['latency_max']:.3f}ms, "
-                    f"cold={replay_stats['cold_latency']:.3f}ms"
-                )
-                if tp_rank == 0:
-                    collector_dir = os.path.dirname(
-                        os.path.dirname(os.path.abspath(__file__))
+                def _measure_recorded_decode_item_once() -> dict:
+                    replay_stats = _benchmark_rank_local_decode_replay(
+                        moe_layer=moe_layer,
+                        replay_samples=replay_samples,
+                        hidden_size=model_hidden_size,
+                        device=device,
+                        num_warmup=num_warmup,
+                        num_iterations=num_iterations,
                     )
-                    perf_filename = (
-                        os.path.join(collector_dir, "wideep_generation_moe_perf.txt")
-                        if output_path is None
-                        else os.path.join(output_path, "wideep_generation_moe_perf.txt")
+                    replay_stats = _apply_recorded_latency_policy(
+                        replay_stats,
+                        phase="generation",
+                        num_tokens_log=num_tokens_log,
+                    )
+                    rank_print(
+                        "Rank-local recorded replay (Decode): "
+                        f"samples={len(replay_samples)}, ranks={simulated_ep_size}, "
+                        f"steady mean/p90/max={replay_stats['latency']:.3f}/"
+                        f"{replay_stats['latency_p90']:.3f}/"
+                        f"{replay_stats['latency_max']:.3f}ms, "
+                        f"cold={replay_stats['cold_latency']:.3f}ms"
                     )
                     item = {
                         "moe_dtype": "fp8_block",
@@ -2704,9 +2838,38 @@ def benchmark_moe_layer_decode(
                         "measurement_scope": "single_card_rank_local_replay",
                         **replay_stats,
                     }
-                    item = _apply_profile_free_hybrid_recorded_row(
+                    return _apply_profile_free_hybrid_recorded_row(
                         item,
                         phase="generation",
+                    )
+
+                def _reset_recorded_decode_guard_attempt() -> None:
+                    torch.get_device_module(device).synchronize()
+                    model_runner.req_to_token_pool.clear()
+                    model_runner.token_to_kv_pool_allocator.clear()
+                    torch.cuda.empty_cache()
+
+                item = select_recorded_source(
+                    family="wideep_generation",
+                    phase="generation",
+                    ep=simulated_ep_size,
+                    eplb="on" if _rank_local_replay_enable_eplb() else "off",
+                    token=num_tokens_log,
+                    measure_once=_measure_recorded_decode_item_once,
+                    reset_before_attempt=_reset_recorded_decode_guard_attempt,
+                    warmup_once=_measure_recorded_decode_item_once,
+                    output_path=output_path,
+                    rank_print=rank_print,
+                    kernel_source="deepepmoe_rank_local_replay",
+                )
+                if tp_rank == 0:
+                    collector_dir = os.path.dirname(
+                        os.path.dirname(os.path.abspath(__file__))
+                    )
+                    perf_filename = (
+                        os.path.join(collector_dir, "wideep_generation_moe_perf.txt")
+                        if output_path is None
+                        else os.path.join(output_path, "wideep_generation_moe_perf.txt")
                     )
                     log_perf(
                         item_list=[item],

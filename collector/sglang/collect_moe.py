@@ -63,6 +63,10 @@ from collector.wideep.sglang.rank_local_moe_replay import (
     MANIFEST_FILENAME as RANK_LOCAL_REPLAY_MANIFEST,
     select_replay_workloads,
 )
+try:
+    from collector.recorded_source_health_guard import select_recorded_source
+except ModuleNotFoundError:
+    from recorded_source_health_guard import select_recorded_source
 
 try:
     import sglang.srt.layers.quantization.mxfp4 as _mxfp4_mod
@@ -1128,6 +1132,7 @@ def benchmark_config(
     moe_ep_size: int = 1,
     model_name: str = "",
     phase: str = "generation",
+    outside_loop_count: int | None = None,
 ) -> float:
     device = torch.device("cuda")
     use_mxfp4_moe = use_mxfp4_w4a16 or use_mxfp4_w4a8
@@ -1646,7 +1651,10 @@ def benchmark_config(
                 )
 
     # 3. Unified Execution Loop
-    outside_loop_count = 5  # Repeat ops within kernel_func to increase accuracy for fast kernels
+    # Repeat ops inside one timed region to improve accuracy for fast kernels.
+    # Optional tiny-source probes can raise this value while preserving the
+    # default collector latency path.
+    outside_loop_count = max(1, int(outside_loop_count or 5))
 
     def kernel_func():
         for i in range(outside_loop_count):
@@ -1710,6 +1718,7 @@ def benchmark(
     moe_ep_size: int = 1,
     model_name: str = "",
     phase: str = "generation",
+    outside_loop_count: int | None = None,
 ) -> tuple[dict[str, int], float]:
     torch.cuda.manual_seed_all(0)
     benchmark_num_tokens = (
@@ -1745,6 +1754,7 @@ def benchmark(
             moe_ep_size=moe_ep_size,
             model_name=model_name,
             phase=phase,
+            outside_loop_count=outside_loop_count,
         )
         return kernel_time, power_stats
 
@@ -1797,6 +1807,7 @@ def benchmark(
         moe_ep_size=moe_ep_size,
         model_name=model_name,
         phase=phase,
+        outside_loop_count=outside_loop_count,
     )
     return kernel_time, power_stats
 
@@ -1884,6 +1895,117 @@ def _rank_local_replay_source_features(
         "ordinary_rank_local_active_experts_max": max(rank_active_experts_max) if rank_active_experts_max else 0.0,
         "ordinary_rank_local_assignments_max": max(rank_assignments_max) if rank_assignments_max else 0.0,
         "ordinary_rank_local_measurement_scope": "single_card_rank_local_replay",
+    }
+
+
+def _ordinary_tiny_amortized_source_enabled(*, phase: str, num_tokens: int) -> bool:
+    if phase != "context":
+        return False
+    if int(num_tokens) > int(os.environ.get("COLLECTOR_ORDINARY_MOE_TINY_SOURCE_MAX_TOKENS", "4")):
+        return False
+    return _env_bool("COLLECTOR_ORDINARY_MOE_TINY_AMORTIZED_SOURCE", False)
+
+
+def _ordinary_tiny_amortized_loop_count() -> int:
+    return max(
+        5,
+        int(os.environ.get("COLLECTOR_ORDINARY_MOE_TINY_AMORTIZED_LOOP_COUNT", "64")),
+    )
+
+
+def _rank_local_tiny_amortized_features(
+    *,
+    rank_results: list[tuple[float, dict | None]],
+    loop_count: int,
+) -> dict[str, object]:
+    latencies = [float(result[0]) for result in rank_results]
+    return {
+        "ordinary_rank_local_tiny_amortized_latency_mean": _mean_float(latencies),
+        "ordinary_rank_local_tiny_amortized_latency_p90": _p90_float(latencies),
+        "ordinary_rank_local_tiny_amortized_latency_max": max(latencies) if latencies else 0.0,
+        "ordinary_rank_local_tiny_amortized_latency_min": min(latencies) if latencies else 0.0,
+        "ordinary_rank_local_tiny_amortized_loop_count": int(loop_count),
+        "ordinary_rank_local_tiny_amortized_measurement_scope": "single_card_rank_local_replay_amortized",
+    }
+
+
+def _ordinary_tiny_scaled_source_enabled(*, phase: str, num_tokens: int) -> bool:
+    phases = {
+        item.strip()
+        for item in os.environ.get(
+            "COLLECTOR_ORDINARY_MOE_TINY_SCALED_SOURCE_PHASES",
+            "context",
+        ).split(",")
+        if item.strip()
+    }
+    if phase not in phases:
+        return False
+    if int(num_tokens) > int(os.environ.get("COLLECTOR_ORDINARY_MOE_TINY_SCALED_SOURCE_MAX_TOKENS", "4")):
+        return False
+    return _env_bool("COLLECTOR_ORDINARY_MOE_TINY_SCALED_SOURCE", False)
+
+
+def _ordinary_tiny_scaled_target_assignments() -> int:
+    return max(
+        16,
+        int(os.environ.get("COLLECTOR_ORDINARY_MOE_TINY_SCALED_TARGET_ASSIGNMENTS", "1024")),
+    )
+
+
+def _scale_rank_local_workloads_for_source(
+    workloads: list[Rank0Workload],
+    *,
+    target_assignments: int,
+) -> tuple[list[Rank0Workload], int]:
+    current_assignments = 0
+    for workload in workloads:
+        current_assignments += int(workload["masked_m"].sum().item())
+    scale = max(1, int(math.ceil(int(target_assignments) / max(1, current_assignments))))
+    scaled: list[Rank0Workload] = []
+    for workload in workloads:
+        hidden_states = workload["hidden_states"]
+        topk_output = workload["topk_output"]
+        topk_weights = topk_output.topk_weights.repeat((scale, 1)).contiguous()
+        topk_ids = topk_output.topk_ids.repeat((scale, 1)).contiguous()
+        scaled.append(
+            {
+                "hidden_states": hidden_states.repeat((scale, 1)).contiguous(),
+                "topk_output": StandardTopKOutput(
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    router_logits=torch.empty(
+                        (int(topk_ids.shape[0]), 0),
+                        dtype=torch.float32,
+                        device=hidden_states.device,
+                    ),
+                ),
+                "masked_m": (workload["masked_m"] * int(scale)).contiguous(),
+            }
+        )
+    return scaled, scale
+
+
+def _rank_local_tiny_scaled_features(
+    *,
+    rank_results: list[tuple[float, dict | None]],
+    scales: list[int],
+    target_assignments: int,
+) -> dict[str, object]:
+    latencies = [float(result[0]) for result in rank_results]
+    max_latency = max(latencies) if latencies else 0.0
+    max_rank = latencies.index(max_latency) if latencies else -1
+    max_scale = int(scales[max_rank]) if 0 <= max_rank < len(scales) else 1
+    normalized = max_latency / max(1, max_scale)
+    return {
+        "ordinary_rank_local_tiny_scaled_latency_mean": _mean_float(latencies),
+        "ordinary_rank_local_tiny_scaled_latency_p90": _p90_float(latencies),
+        "ordinary_rank_local_tiny_scaled_latency_max": max_latency,
+        "ordinary_rank_local_tiny_scaled_latency_min": min(latencies) if latencies else 0.0,
+        "ordinary_rank_local_tiny_scaled_latency_max_rank": max_rank,
+        "ordinary_rank_local_tiny_scaled_latency_max_normalized": normalized,
+        "ordinary_rank_local_tiny_scaled_scale_at_max_rank": max_scale,
+        "ordinary_rank_local_tiny_scaled_target_assignments": int(target_assignments),
+        "ordinary_rank_local_tiny_scaled_measurement_scope": "single_card_rank_local_replay_scaled_rows",
     }
 
 
@@ -2234,43 +2356,163 @@ def run_moe_torch(
     )
 
     if replay_rank_workloads is not None:
-        rank_results = []
-        for rank, workloads in enumerate(replay_rank_workloads):
-            if not workloads:
-                raise ValueError(f"Replay has no workloads for rank={rank}")
-            rank_results.append(
-                benchmark(
-                    num_tokens,
-                    num_local_experts,
-                    2 * inter_size // moe_tp_size,
-                    hidden_size,
-                    topk,
-                    torch.bfloat16,
-                    moe_type == "fp8_block",
-                    False,
-                    False,
-                    use_nvfp4=use_nvfp4_kernel,
-                    use_trtllm_bf16_fp4=use_trtllm_bf16_fp4,
-                    use_int4_w4a16=use_int4_w4a16,
-                    use_mxfp4_w4a16=False,
-                    use_mxfp4_w4a8=False,
-                    block_shape=block_shape,
-                    distributed=distributed,
-                    power_law_alpha=power_law_alpha,
-                    workloads=workloads,
-                    swiglu_limit=swiglu_limit,
-                    moe_tp_size=moe_tp_size,
-                    moe_ep_size=moe_ep_size,
-                    model_name=model_name,
-                    phase=output_phase,
+        def _measure_rank_local_replay_item_once() -> dict:
+            rank_results = []
+            for rank, workloads in enumerate(replay_rank_workloads):
+                if not workloads:
+                    raise ValueError(f"Replay has no workloads for rank={rank}")
+                rank_results.append(
+                    benchmark(
+                        num_tokens,
+                        num_local_experts,
+                        2 * inter_size // moe_tp_size,
+                        hidden_size,
+                        topk,
+                        torch.bfloat16,
+                        moe_type == "fp8_block",
+                        False,
+                        False,
+                        use_nvfp4=use_nvfp4_kernel,
+                        use_trtllm_bf16_fp4=use_trtllm_bf16_fp4,
+                        use_int4_w4a16=use_int4_w4a16,
+                        use_mxfp4_w4a16=False,
+                        use_mxfp4_w4a8=False,
+                        block_shape=block_shape,
+                        distributed=distributed,
+                        power_law_alpha=power_law_alpha,
+                        workloads=workloads,
+                        swiglu_limit=swiglu_limit,
+                        moe_tp_size=moe_tp_size,
+                        moe_ep_size=moe_ep_size,
+                        model_name=model_name,
+                        phase=output_phase,
+                    )
                 )
-            )
-        latency, power_stats = max(rank_results, key=lambda result: result[0])
-        rank_local_source_features = (
-            _rank_local_replay_source_features(rank_results, replay_rank_workloads)
-            if _keep_aic_latency_sources()
-            else {}
+            item_latency, item_power_stats = max(rank_results, key=lambda result: result[0])
+            item_features = _rank_local_replay_source_features(rank_results, replay_rank_workloads)
+            if _ordinary_tiny_amortized_source_enabled(
+                phase=output_phase,
+                num_tokens=num_tokens,
+            ):
+                tiny_loop_count = _ordinary_tiny_amortized_loop_count()
+                tiny_rank_results = []
+                for rank, workloads in enumerate(replay_rank_workloads):
+                    if not workloads:
+                        raise ValueError(f"Replay has no workloads for rank={rank}")
+                    tiny_rank_results.append(
+                        benchmark(
+                            num_tokens,
+                            num_local_experts,
+                            2 * inter_size // moe_tp_size,
+                            hidden_size,
+                            topk,
+                            torch.bfloat16,
+                            moe_type == "fp8_block",
+                            False,
+                            False,
+                            use_nvfp4=use_nvfp4_kernel,
+                            use_trtllm_bf16_fp4=use_trtllm_bf16_fp4,
+                            use_int4_w4a16=use_int4_w4a16,
+                            use_mxfp4_w4a16=False,
+                            use_mxfp4_w4a8=False,
+                            block_shape=block_shape,
+                            distributed=distributed,
+                            power_law_alpha=power_law_alpha,
+                            workloads=workloads,
+                            swiglu_limit=swiglu_limit,
+                            moe_tp_size=moe_tp_size,
+                            moe_ep_size=moe_ep_size,
+                            model_name=model_name,
+                            phase=output_phase,
+                            outside_loop_count=tiny_loop_count,
+                        )
+                    )
+                item_features.update(
+                    _rank_local_tiny_amortized_features(
+                        rank_results=tiny_rank_results,
+                        loop_count=tiny_loop_count,
+                    )
+                )
+            if _ordinary_tiny_scaled_source_enabled(
+                phase=output_phase,
+                num_tokens=num_tokens,
+            ):
+                target_assignments = _ordinary_tiny_scaled_target_assignments()
+                scaled_rank_results = []
+                scaled_rank_scales = []
+                for rank, workloads in enumerate(replay_rank_workloads):
+                    if not workloads:
+                        raise ValueError(f"Replay has no workloads for rank={rank}")
+                    scaled_workloads, scale = _scale_rank_local_workloads_for_source(
+                        workloads,
+                        target_assignments=target_assignments,
+                    )
+                    scaled_rank_scales.append(scale)
+                    scaled_rank_results.append(
+                        benchmark(
+                            num_tokens,
+                            num_local_experts,
+                            2 * inter_size // moe_tp_size,
+                            hidden_size,
+                            topk,
+                            torch.bfloat16,
+                            moe_type == "fp8_block",
+                            False,
+                            False,
+                            use_nvfp4=use_nvfp4_kernel,
+                            use_trtllm_bf16_fp4=use_trtllm_bf16_fp4,
+                            use_int4_w4a16=use_int4_w4a16,
+                            use_mxfp4_w4a16=False,
+                            use_mxfp4_w4a8=False,
+                            block_shape=block_shape,
+                            distributed=distributed,
+                            power_law_alpha=power_law_alpha,
+                            workloads=scaled_workloads,
+                            swiglu_limit=swiglu_limit,
+                            moe_tp_size=moe_tp_size,
+                            moe_ep_size=moe_ep_size,
+                            model_name=model_name,
+                            phase=output_phase,
+                        )
+                    )
+                item_features.update(
+                    _rank_local_tiny_scaled_features(
+                        rank_results=scaled_rank_results,
+                        scales=scaled_rank_scales,
+                        target_assignments=target_assignments,
+                    )
+                )
+            return {
+                "latency": item_latency,
+                "power_stats": item_power_stats,
+                **item_features,
+            }
+
+        def _reset_rank_local_replay_guard_attempt() -> None:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        family = (
+            "ordinary_context"
+            if output_phase == "context"
+            else "ordinary_generation"
         )
+        guarded_item = select_recorded_source(
+            family=family,
+            phase=output_phase,
+            ep=moe_ep_size,
+            eplb="on" if output_distribution == "recorded_eplb" else "off",
+            token=num_tokens,
+            measure_once=_measure_rank_local_replay_item_once,
+            reset_before_attempt=_reset_rank_local_replay_guard_attempt,
+            warmup_once=_measure_rank_local_replay_item_once,
+            output_path=os.environ.get("COLLECTOR_CURRENT_OUTPUT_DIR"),
+            latency_field="latency",
+            kernel_source="ordinary_rank_local_replay",
+        )
+        latency = float(guarded_item.pop("latency"))
+        power_stats = guarded_item.pop("power_stats", {})
+        rank_local_source_features = dict(guarded_item)
     elif rank0_workloads is not None:
         latency, power_stats = benchmark(
             num_tokens,

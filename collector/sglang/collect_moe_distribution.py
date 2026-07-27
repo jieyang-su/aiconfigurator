@@ -251,13 +251,11 @@ def get_moe_distribution_test_cases(model_path: str | None = None):
     if "generation" in phases:
         for global_tokens in sorted(set(generation_tokens)):
             for ep_size in sorted(set(ep_sizes)):
-                if global_tokens % ep_size:
-                    if not _single_card_ep_sim_enabled():
-                        continue
+                if _single_card_ep_sim_enabled():
                     cases.extend(
                         [
                             int(global_tokens),
-                            max(1, (global_tokens + ep_size - 1) // ep_size),
+                            1,
                             max(2, output_len),
                             int(ep_size),
                             enable_eplb,
@@ -265,6 +263,8 @@ def get_moe_distribution_test_cases(model_path: str | None = None):
                         ]
                         for enable_eplb in valid_eplb_modes_for_ep(ep_size)
                     )
+                    continue
+                if global_tokens % ep_size:
                     continue
                 for enable_eplb in valid_eplb_modes_for_ep(ep_size):
                     cases.append(
@@ -500,11 +500,7 @@ def run_moe_distribution(
         table_num_tokens = (
             int(num_tokens) * int(batch_size)
             if phase == "context"
-            else (
-                int(num_tokens)
-                if int(num_tokens) > 1
-                else int(batch_size) * int(requested_ep_size)
-            )
+            else int(num_tokens)
         )
         bundle_path, replay_rows = materialize_synthetic_replay_bundle(
             output_dir=replay_dir,
