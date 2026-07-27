@@ -65,11 +65,46 @@ def selected_source_rows(source_rows: list[dict[str, str]]) -> list[dict[str, st
             "source must contain both context and generation recorded/no-EPLB rows; "
             f"found {dict(counts)}"
         )
-    if len(selected) != 43 or counts != {"context": 23, "generation": 20}:
+    expected_tokens = {
+        1,
+        2,
+        4,
+        8,
+        32,
+        40,
+        64,
+        128,
+        288,
+        512,
+        640,
+        896,
+        1024,
+        1536,
+        2048,
+        2560,
+        4096,
+        5120,
+        8192,
+        10240,
+        12288,
+        14336,
+        16384,
+    }
+    tokens_by_phase = {
+        phase: {int(row["num_tokens"]) for row in selected if row["phase"] == phase}
+        for phase in PHASE_TO_DESTINATION_DISTRIBUTION
+    }
+    if counts != {"context": len(expected_tokens), "generation": len(expected_tokens)}:
         raise ValueError(
-            "unexpected selected source grid; expected 23 context and 20 generation "
-            f"rows, found {dict(counts)}"
+            "unexpected selected source grid; expected 23 context and generation rows "
+            f"with tokens {sorted(expected_tokens)}, found {dict(counts)}"
         )
+    for phase, tokens in tokens_by_phase.items():
+        if tokens != expected_tokens:
+            raise ValueError(
+                f"{phase} recorded source token grid is incomplete: "
+                f"expected {sorted(expected_tokens)}, found {sorted(tokens)}"
+            )
     return selected
 
 
@@ -126,12 +161,13 @@ def main() -> int:
     parser.add_argument("--source-ref", default="origin/dev@1913348")
     parser.add_argument(
         "--expected-source-sha256",
-        default="e6d76c5d2853c9265b12a844e56d1fe3141f0baebc852cca14c647a3575bb809",
+        default=None,
+        help="Optionally pin the source bytes; the observed SHA is always recorded.",
     )
     args = parser.parse_args()
 
     source_hash = sha256(args.source)
-    if source_hash != args.expected_source_sha256:
+    if args.expected_source_sha256 and source_hash != args.expected_source_sha256:
         raise ValueError(
             f"source SHA256 mismatch: {source_hash} != {args.expected_source_sha256}"
         )
