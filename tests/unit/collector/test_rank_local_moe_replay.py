@@ -261,13 +261,16 @@ def test_ordinary_moe_discovers_rank_local_replay(monkeypatch, tmp_path: Path):
     ]
     assert _parse_rank_local_distribution(
         "recorded_dummy_rank_local_eplb"
-    ) == ("dummy", True)
+    ) == ("dummy", "context", True)
     assert _parse_rank_local_distribution(
         "recorded_dummy_rank_local_no_eplb"
-    ) == ("dummy", False)
+    ) == ("dummy", "context", False)
     assert _parse_rank_local_distribution(
         "recorded_dummy_rank_local_eplb1"
-    ) == ("dummy", True)
+    ) == ("dummy", "context", True)
+    assert _parse_rank_local_distribution(
+        "recorded_dummy_generation_rank_local_no_eplb"
+    ) == ("dummy", "generation", False)
 
 
 def test_distribution_rejects_ep_larger_than_visible_gpu_set(

@@ -59,6 +59,44 @@ class PrefixConditionalOp(Operation):
         return sum(op.get_weights(**kwargs) for op in self._selected_ops(**kwargs))
 
 
+class SystemConditionalOp(Operation):
+    """Route an operation group by the active performance-database system.
+
+    System-specific calibration tables sometimes have a different valid
+    operation boundary even when the serving backend and model are the same.
+    Keep that choice at query time, where ``PerfDatabase.system`` is available,
+    instead of leaking a system name into the model configuration.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        default_ops: list[Operation],
+        system_ops: dict[str, list[Operation]],
+    ) -> None:
+        super().__init__(name, 1.0)
+        self._default_ops = default_ops
+        self._system_ops = system_ops
+        self._last_selected_system: str | None = None
+
+    def _selected_ops(self, database: PerfDatabase) -> list[Operation]:
+        system = str(database.system)
+        self._last_selected_system = system
+        return self._system_ops.get(system, self._default_ops)
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        total = PerformanceResult(0.0, energy=0.0, source="empirical")
+        for op in self._selected_ops(database):
+            total += op.query(database, **kwargs)
+        return total
+
+    def get_weights(self, **kwargs):
+        # Model-memory accounting happens before a PerfDatabase is passed to
+        # query(). The branches model the same block, so the default branch is
+        # the stable source of truth for weights.
+        return sum(op.get_weights(**kwargs) for op in self._default_ops)
+
+
 class FallbackOp(Operation):
     """
     Try a primary operation first; if it raises PerfDataNotAvailableError,

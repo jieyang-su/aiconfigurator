@@ -218,14 +218,22 @@ def alloc_prefix_indices(model_runner, batch_size: int, prefix_len: int) -> list
     seq_lens = seq_lens_cpu.to(device, non_blocking=True)
     last_loc = torch.full((batch_size,), -1, dtype=torch.int64, device=device)
 
-    flat = alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        batch_size * prefix_len,
-    )
+    token_count = batch_size * prefix_len
+    try:
+        flat = alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            token_count,
+        )
+    except NotImplementedError:
+        # SGLang's non-paged TokenToKVPoolAllocator intentionally exposes the
+        # base alloc_extend method as unsupported. Prefix-context collectors
+        # only need unique KV slots, so its ordinary flat allocator is
+        # equivalent here.
+        flat = allocator.alloc(token_count)
     if flat is None:
         raise RuntimeError(f"failed to allocate prefix cache: batch_size={batch_size}, prefix_len={prefix_len}")
     return [flat[i * prefix_len : (i + 1) * prefix_len].contiguous() for i in range(batch_size)]

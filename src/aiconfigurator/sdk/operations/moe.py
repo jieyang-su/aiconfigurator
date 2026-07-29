@@ -359,6 +359,16 @@ class MoE(Operation):
         self._strict_workload_distribution = strict_workload_distribution
         self._moe_backend = kwargs.get("moe_backend")
         self._enable_eplb = kwargs.get("enable_eplb", False)
+        self._local_token_divisor_by_system = {
+            str(system): int(divisor)
+            for system, divisor in kwargs.get("local_token_divisor_by_system", {}).items()
+        }
+        self._local_token_divisor_distributions = {
+            str(distribution)
+            for distribution in kwargs.get("local_token_divisor_distributions", ())
+        }
+        if any(divisor <= 0 for divisor in self._local_token_divisor_by_system.values()):
+            raise ValueError("MoE local token divisors must be positive")
         # 3 GEMMs for gated (gate, up, down), 2 GEMMs for non-gated (up, down)
         num_gemms = 3 if is_gated else 2
         self._weights = (
@@ -1315,6 +1325,19 @@ class MoE(Operation):
         """Query MoE latency with energy data."""
         # attention dp size will scale up the total input tokens.
         x = kwargs.get("x") * self._attention_dp_size
+        # Ordinary TP prefill can sequence-shard the routed-MoE input. Some
+        # archived system tables use the rank-local token-row count, so select
+        # that geometry only for explicitly calibrated systems.
+        apply_local_divisor = (
+            not self._local_token_divisor_distributions
+            or self._workload_distribution in self._local_token_divisor_distributions
+        )
+        token_divisor = (
+            self._local_token_divisor_by_system.get(str(database.system), 1)
+            if apply_local_divisor
+            else 1
+        )
+        x = max(1, ceil(x / token_divisor))
         overwrite_quant_mode = kwargs.get("quant_mode")
         quant_mode = self._quant_mode if overwrite_quant_mode is None else overwrite_quant_mode
 

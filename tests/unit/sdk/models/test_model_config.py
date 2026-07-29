@@ -682,7 +682,7 @@ class TestDeepSeekMLAModulePath:
             moe_tp_size=1,
             moe_ep_size=4,
             attention_dp_size=1,
-            overwrite_num_layers=1,
+            overwrite_num_layers=4,
             moe_backend=None,
             attention_backend="flashinfer",
             kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
@@ -691,15 +691,24 @@ class TestDeepSeekMLAModulePath:
         model = get_model("deepseek-ai/DeepSeek-V3", model_config, backend_name="sglang")
 
         context_route = next(op for op in model.context_ops if op._name == "context_mla_block")
-        assert isinstance(context_route, operations.PrefixConditionalOp)
-        assert [type(op) for op in context_route._no_prefix_ops] == [
+        assert isinstance(context_route, operations.SystemConditionalOp)
+        default_route = context_route._default_ops[0]
+        assert isinstance(default_route, operations.PrefixConditionalOp)
+        assert [type(op) for op in default_route._no_prefix_ops] == [
             operations.GEMM,
             operations.ContextKVBProjGEMM,
             operations.MLAConcatK,
             operations.ContextMLA,
             operations.GEMM,
         ]
-        assert context_route._no_prefix_ops is context_route._prefix_ops
+        assert default_route._no_prefix_ops is default_route._prefix_ops
+        assert [type(op) for op in context_route._system_ops["h20_pcie"]] == [
+            operations.WideEPContextMLA
+        ]
+
+        context_moe = next(op for op in model.context_ops if op._name == "context_moe")
+        assert context_moe._local_token_divisor_by_system == {"h20_pcie": 4}
+        assert context_moe._local_token_divisor_distributions == {"balanced"}
 
         context_norms = [
             op

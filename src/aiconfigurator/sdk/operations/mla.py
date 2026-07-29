@@ -86,6 +86,7 @@ _WIDEEP_CONTEXT_MLA_TARGET_Y: list[int] = (
 _WIDEEP_CONTEXT_MLA_TARGET_Z: list[int] = [
     1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048,
 ]  # b
+_WIDEEP_CONTEXT_MLA_PREFIX_DATA_KEY = "__prefix_shapes__"
 
 _GENERATION_MLA_TARGET_Y: list[int] = [
     1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048, 8192,
@@ -1356,8 +1357,19 @@ class WideEPContextMLA(Operation):
                 sources = database._build_op_sources(
                     PerfDataFilename.wideep_context_mla, primary_path, system_data_root
                 )
+                raw_data = load_wideep_context_mla_data(sources)
+                prefix_data = (
+                    raw_data.pop(_WIDEEP_CONTEXT_MLA_PREFIX_DATA_KEY, None)
+                    if raw_data is not None
+                    else None
+                )
                 cls._data_cache[key] = LoadedOpData(
-                    load_wideep_context_mla_data(sources),
+                    raw_data,
+                    PerfDataFilename.wideep_context_mla,
+                    primary_path,
+                )
+                cls._data_cache[key].prefix_data = LoadedOpData(
+                    prefix_data,
                     PerfDataFilename.wideep_context_mla,
                     primary_path,
                 )
@@ -1506,6 +1518,20 @@ class WideEPContextMLA(Operation):
         def get_silicon():
             data_wrapper.raise_if_not_loaded()
             attn_backend = attention_backend or "flashinfer"
+            prefix_data = getattr(data_wrapper, "prefix_data", None)
+            if prefix > 0 and prefix_data is not None and prefix_data.loaded:
+                try:
+                    exact = prefix_data[attn_backend][fmha_quant_mode][
+                        kvcache_quant_mode
+                    ][128 // tp_size][prefix][s][b]
+                except KeyError:
+                    exact = None
+                if exact is not None:
+                    return database._interp_pr(
+                        exact["latency"],
+                        energy=exact.get("energy", 0.0),
+                    )
+
             if attn_backend == "flashinfer":
                 attn_data = data_wrapper["flashinfer"]
             elif attn_backend == "fa3":
@@ -1784,6 +1810,17 @@ def load_wideep_context_mla_data(wideep_context_mla_file):
     wideep_context_mla_data = defaultdict(
         lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict()))))
     )
+    prefix_data = defaultdict(
+        lambda: defaultdict(
+            lambda: defaultdict(
+                lambda: defaultdict(
+                    lambda: defaultdict(
+                        lambda: defaultdict(lambda: defaultdict())
+                    )
+                )
+            )
+        )
+    )
 
     # Check if power columns exist (backward compatibility)
     has_power = len(rows) > 0 and "power" in rows[0]
@@ -1809,6 +1846,7 @@ def load_wideep_context_mla_data(wideep_context_mla_file):
 
         b = int(b)
         s = int(s)
+        prefix = int(row.get("step", 0) or 0)
         latency = float(latency)
 
         # NEW: Read power with backward compatibility
@@ -1820,20 +1858,36 @@ def load_wideep_context_mla_data(wideep_context_mla_file):
         quant_mode = common.FMHAQuantMode[quant_mode]
         kv_cache_dtype = common.KVCacheQuantMode[kv_cache_dtype]
 
-        try:
-            # Check for conflict
-            wideep_context_mla_data[kernel_source][quant_mode][kv_cache_dtype][num_heads][s][b]
-            logger.debug(
-                f"value conflict in context mla data: {kernel_source} {quant_mode} {kv_cache_dtype} {num_heads} {s} {b}"
+        if prefix > 0:
+            target = prefix_data[kernel_source][quant_mode][kv_cache_dtype][
+                num_heads
+            ][prefix][s]
+            conflict_key = (
+                f"{kernel_source} {quant_mode} {kv_cache_dtype} "
+                f"{num_heads} {s} {b} prefix={prefix}"
             )
-        except KeyError:
-            # Store all three values
-            wideep_context_mla_data[kernel_source][quant_mode][kv_cache_dtype][num_heads][s][b] = {
+        else:
+            target = wideep_context_mla_data[kernel_source][quant_mode][
+                kv_cache_dtype
+            ][num_heads][s]
+            conflict_key = (
+                f"{kernel_source} {quant_mode} {kv_cache_dtype} "
+                f"{num_heads} {s} {b}"
+            )
+
+        if b in target:
+            logger.debug(f"value conflict in context mla data: {conflict_key}")
+        else:
+            target[b] = {
                 "latency": latency,
                 "power": power,
                 "energy": energy,  # NEW: precomputed energy
             }
 
+    if prefix_data:
+        wideep_context_mla_data[_WIDEEP_CONTEXT_MLA_PREFIX_DATA_KEY] = (
+            prefix_data
+        )
     return wideep_context_mla_data
 
 

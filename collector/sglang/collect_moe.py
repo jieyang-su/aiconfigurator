@@ -599,6 +599,13 @@ def get_moe_test_cases():
             if num_tokens <= 20480
         ]
         num_tokens_set = set(base_num_tokens_list)
+        if requested_tokens is not None:
+            # Gap-only collections may need a production shape that is absent
+            # from the checked-in sweep grid.  Treat the explicit token filter
+            # as an additive request instead of silently filtering it away.
+            num_tokens_set.update(
+                token for token in requested_tokens if 0 < int(token) <= 20480
+            )
         if include_rank_local_replay:
             replay_tokens = _rank_local_replay_tokens(
                 ep_size=common_moe_testcase.ep,

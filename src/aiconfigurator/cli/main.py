@@ -188,7 +188,7 @@ def _add_default_mode_arguments(parser):
         required=True,
         help=(
             "System name (GPU type). Example: "
-            "h200_sxm,h100_sxm,h100_pcie,b200_sxm,b300_sxm,gb200,a100_sxm,a100_pcie,l40s,l4,a30,gb300."
+            "h200_sxm,h100_sxm,h100_pcie,h20_pcie,b200_sxm,b300_sxm,gb200,a100_sxm,a100_pcie,l40s,l4,a30,gb300."
         ),
     )
     parser.add_argument(
@@ -433,7 +433,7 @@ def _add_generate_mode_arguments(parser):
         required=True,
         help=(
             "System name (GPU type). Example: "
-            "h200_sxm,h100_sxm,h100_pcie,b200_sxm,b300_sxm,gb200,a100_sxm,a100_pcie,l40s,l4,a30,gb300."
+            "h200_sxm,h100_sxm,h100_pcie,h20_pcie,b200_sxm,b300_sxm,gb200,a100_sxm,a100_pcie,l40s,l4,a30,gb300."
         ),
     )
     parser.add_argument(
@@ -471,7 +471,7 @@ def _add_estimate_mode_arguments(parser):
         required=True,
         help=(
             "System name (GPU type). Example: "
-            "h200_sxm,h100_sxm,h100_pcie,b200_sxm,b300_sxm,gb200,a100_sxm,a100_pcie,l40s,l4,a30,gb300."
+            "h200_sxm,h100_sxm,h100_pcie,h20_pcie,b200_sxm,b300_sxm,gb200,a100_sxm,a100_pcie,l40s,l4,a30,gb300."
         ),
     )
     parser.add_argument(
@@ -836,7 +836,7 @@ def _add_support_mode_arguments(parser):
         type=str,
         required=True,
         help="System name (GPU type) or 'all' for a matrix view across every system. "
-        "Example: h200_sxm, h100_sxm, h100_pcie, b200_sxm, b300_sxm, gb200, a100_sxm, a100_pcie, l40s, l4, a30, gb300.",
+        "Example: h200_sxm, h100_sxm, h100_pcie, h20_pcie, b200_sxm, b300_sxm, gb200, a100_sxm, a100_pcie, l40s, l4, a30, gb300.",
     )
     parser.add_argument(
         "--backend",

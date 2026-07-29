@@ -1,0 +1,14 @@
+framework,version,device,op_name,kernel_source,model,architecture,mla_dtype,kv_cache_dtype,gemm_type,num_heads,batch_size,isl,tp_size,step,latency
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,1,1,0,0.6312
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,4,1,0,0.6305
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,8,1,0,0.6305
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,16,1,0,0.6303
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,32,1,0,0.6308
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,64,1,0,0.6355
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,128,1,0,0.6408
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,256,1,0,0.6425
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,512,1,0,0.6470
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,1024,1,0,0.6613
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,2048,1,0,0.6856
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,4096,1,0,0.7423
+SGLang,0.0.0.dev9872+gbbe9c7eeb.d20260702,NVIDIA H20,mla_generation,fa3,deepseek-ai/DeepSeek-V3,DeepseekV3ForCausalLM,fp8_block,fp8,fp8_block,16,24,8192,1,0,0.8501

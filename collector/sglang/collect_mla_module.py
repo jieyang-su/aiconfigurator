@@ -138,12 +138,23 @@ def _parse_int_list(value: str | None) -> list[int] | None:
 
 
 def _filter_cases_from_env(test_cases, *, is_prefill: bool, attn_type: str):
-    if not (is_prefill and attn_type == "dsa"):
+    if is_prefill and attn_type == "dsa":
+        label = "DSA context"
+        seq_filter = _parse_int_list(os.environ.get("AIC_DSA_CONTEXT_SEQ_LENS"))
+        prefix_filter = _parse_int_list(os.environ.get("AIC_DSA_CONTEXT_PREFIX_LENS"))
+        batch_filter = _parse_int_list(os.environ.get("AIC_DSA_CONTEXT_BATCH_SIZES"))
+    elif is_prefill and attn_type == "mla":
+        label = "MLA context"
+        seq_filter = _parse_int_list(os.environ.get("AIC_MLA_CONTEXT_SEQ_LENS"))
+        prefix_filter = None
+        batch_filter = _parse_int_list(os.environ.get("AIC_MLA_CONTEXT_BATCH_SIZES"))
+    elif not is_prefill and attn_type == "mla":
+        label = "MLA generation"
+        seq_filter = _parse_int_list(os.environ.get("AIC_MLA_GENERATION_KV_LENS"))
+        prefix_filter = None
+        batch_filter = _parse_int_list(os.environ.get("AIC_MLA_GENERATION_BATCH_SIZES"))
+    else:
         return test_cases
-
-    seq_filter = _parse_int_list(os.environ.get("AIC_DSA_CONTEXT_SEQ_LENS"))
-    prefix_filter = _parse_int_list(os.environ.get("AIC_DSA_CONTEXT_PREFIX_LENS"))
-    batch_filter = _parse_int_list(os.environ.get("AIC_DSA_CONTEXT_BATCH_SIZES"))
 
     if seq_filter is None and prefix_filter is None and batch_filter is None:
         return test_cases
@@ -161,7 +172,7 @@ def _filter_cases_from_env(test_cases, *, is_prefill: bool, attn_type: str):
         if prefix_set is not None and prefix_len not in prefix_set:
             continue
         filtered.append((bs, seq_len, ip, prefix_len))
-    print(f"[DSA] Env-filtered context cases: {len(filtered)}/{len(test_cases)}")
+    print(f"[{label}] Env-filtered cases: {len(filtered)}/{len(test_cases)}")
     return filtered
 
 
@@ -346,11 +357,17 @@ def _get_mla_backend_list() -> list[str]:
     """
     sm = get_sm_version()
     if sm >= 100:
-        return ["trtllm_mla"]
+        backends = ["trtllm_mla"]
     elif sm >= 90:
-        return ["flashinfer", "fa3"]
+        backends = ["flashinfer", "fa3"]
     else:
-        return ["triton"]
+        backends = ["triton"]
+
+    requested = os.environ.get("AIC_MLA_ATTENTION_BACKENDS")
+    if requested:
+        requested_set = {item.strip() for item in requested.split(",") if item.strip()}
+        backends = [backend for backend in backends if backend in requested_set]
+    return backends
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -397,7 +414,25 @@ def get_context_test_cases(attn_type: str):
     return cases
 
 
-def get_generation_test_cases(attn_type: str):
+def _get_model_max_sequence_length(model_id: str) -> int:
+    """Read the per-request sequence limit from AIC's cached HF config."""
+    config_file = os.path.join(
+        _MODEL_CONFIG_DIR,
+        f"{model_id.replace('/', '--')}_config.json",
+    )
+    if os.path.exists(config_file):
+        with open(config_file) as f:
+            config = json.load(f)
+        max_sequence_length = config.get("max_position_embeddings")
+        if isinstance(max_sequence_length, int) and max_sequence_length > 0:
+            return max_sequence_length
+    return 163840
+
+
+def get_generation_test_cases(
+    attn_type: str,
+    max_sequence_length: int = 163840,
+):
     """Generation-phase test cases.
 
     Returns list of [kv_cache_len, batch_size, num_heads, kv_cache_dtype,
@@ -409,12 +444,10 @@ def get_generation_test_cases(attn_type: str):
         for num_heads in sweep.inner_sweep_head_counts:
             for batch_size in sweep.generation_batch_sizes:
                 for seq_len in sweep.generation_sequence_lengths:
-                    if batch_size * seq_len > sweep.generation_max_tokens:
-                        continue
-                    if (
-                        seq_len >= sweep.generation_large_sequence_min
-                        and batch_size > sweep.generation_large_sequence_max_batch_size
-                    ):
+                    # Decode is constrained by each request's logical sequence
+                    # length. Aggregate batch_size * past_kv is a runtime
+                    # capacity concern, not a semantic validity constraint.
+                    if seq_len + 1 >= max_sequence_length:
                         continue
                     cases.append([seq_len, batch_size, num_heads, kv_dtype, compute_dtype, gemm_type])
     return cases
@@ -1832,7 +1865,10 @@ def run_mla_module(
         all_cases = get_context_test_cases(attn_type)
         phase_name = "Context"
     else:
-        all_cases = get_generation_test_cases(attn_type)
+        all_cases = get_generation_test_cases(
+            attn_type,
+            max_sequence_length=_get_model_max_sequence_length(model_path),
+        )
         phase_name = "Generation"
 
     # Filter to matching precision combo.

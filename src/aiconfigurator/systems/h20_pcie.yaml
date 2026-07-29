@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# H20 PCIe system measured on the TP8+EP8 alignment node. Each accelerator is
+# attached through PCIe Gen5 x16, while intra-node GPU traffic can use the
+# observed all-to-all NV18 fabric. Keep that distinction when interpreting
+# communication results; this is not a PCIe-only, no-NVLink topology.
+
+data_dir: data/h20_pcie # relative to systems_dir
+gpu:
+  mem_bw: 4022000000000 # 4022 GB/s
+  mem_bw_empirical_scaling_factor: 0.8
+  mem_empirical_constant_latency: 0.000003
+  mem_capacity: 103079215104 # 96 GiB
+  bfloat16_tc_flops: 148000000000000 # 148 TFLOPS
+  int8_tc_flops: 296000000000000 # 296 TOPS
+  fp8_tc_flops: 296000000000000 # 296 TFLOPS
+  power: 500 # Watt
+  sm_version: 90
+
+node:
+  num_gpus_per_node: 8
+  inter_node_bw: 50000000000 # 400 Gb/s per GPU, single direction
+  intra_node_bw: 450000000000 # observed NV18 fabric, single direction
+  pcie_bw: 64000000000 # PCIe Gen5 x16, single direction
+  p2p_latency: 0.00001
+
+misc:
+  nccl_mem:
+    1: 0
+    2: 358612992
+    4: 411041792
+    8: 411041792
+  other_mem: 3758096384
+  # Reuse the authenticated H20 LFS table; no relabeling or recollection.
+  nccl_version: "2.28.9"

@@ -16,6 +16,7 @@ def _mock_helper_imports(monkeypatch):
     fake_helper.get_sm_version = lambda: 90  # default Hopper
     fake_helper.log_perf = lambda **kw: None
     fake_helper.benchmark_with_power = lambda **kw: None
+    fake_helper.resolve_subprocess_visible_device = lambda gpu_id: str(gpu_id)
     monkeypatch.setitem(__import__("sys").modules, "helper", fake_helper)
 
     fake_torch = types.ModuleType("torch")
@@ -135,12 +136,71 @@ class TestGetContextTestCases:
 
 
 class TestGetGenerationTestCases:
-    def test_memory_guard(self):
-        """No test case exceeds batch_size * seq_len > 256K."""
+    def test_includes_batch_24_long_kv_gap(self):
         mod = _import_module()
         with patch.object(mod, "get_sm_version", return_value=90):
-            for case in mod.get_generation_test_cases("dsa"):
-                assert case[0] * case[1] <= 256 * 1024
+            shapes = {(case[1], case[0]) for case in mod.get_generation_test_cases("mla")}
+        assert (24, 32768) in shapes
+        assert (32, 32768) in shapes
+
+    def test_filters_only_by_per_request_sequence_limit(self):
+        mod = _import_module()
+        with patch.object(mod, "get_sm_version", return_value=90):
+            excluded = {
+                (case[1], case[0])
+                for case in mod.get_generation_test_cases("mla", max_sequence_length=32769)
+            }
+            included = {
+                (case[1], case[0])
+                for case in mod.get_generation_test_cases("mla", max_sequence_length=32770)
+            }
+        assert (24, 32768) not in excluded
+        assert (24, 32768) in included
+
+    def test_env_filter_targets_only_missing_mla_generation_shapes(self, monkeypatch):
+        mod = _import_module()
+        monkeypatch.setenv("AIC_MLA_GENERATION_BATCH_SIZES", "24,32")
+        monkeypatch.setenv("AIC_MLA_GENERATION_KV_LENS", "16384,32768")
+        cases = [
+            (16, 16384, False, 0),
+            (24, 16384, False, 0),
+            (24, 32768, False, 0),
+            (32, 32768, False, 0),
+            (32, 65536, False, 0),
+        ]
+        assert mod._filter_cases_from_env(cases, is_prefill=False, attn_type="mla") == [
+            (24, 16384, False, 0),
+            (24, 32768, False, 0),
+            (32, 32768, False, 0),
+        ]
+
+
+class TestMlaContextGapCases:
+    def test_includes_long_context_gap_within_token_limit(self):
+        mod = _import_module()
+        with patch.object(mod, "get_sm_version", return_value=90):
+            shapes = {(case[1], case[0]) for case in mod.get_context_test_cases("mla")}
+        assert (1, 32768) in shapes
+        assert (2, 32768) in shapes
+        assert (4, 32768) in shapes
+        assert (8, 32768) not in shapes
+
+    def test_env_filter_targets_only_missing_mla_context_shapes(self, monkeypatch):
+        mod = _import_module()
+        monkeypatch.setenv("AIC_MLA_CONTEXT_BATCH_SIZES", "1,2,4")
+        monkeypatch.setenv("AIC_MLA_CONTEXT_SEQ_LENS", "32768")
+        cases = [
+            (1, 16384, True, 0),
+            (1, 32768, True, 0),
+            (2, 32768, True, 0),
+            (4, 32768, True, 0),
+            (8, 16384, True, 0),
+        ]
+        assert mod._filter_cases_from_env(cases, is_prefill=True, attn_type="mla") == [
+            (1, 32768, True, 0),
+            (2, 32768, True, 0),
+            (4, 32768, True, 0),
+        ]
 
 
 class TestDsaContextPrefixShape:
@@ -371,6 +431,12 @@ class TestGetMlaBackendList:
         mod = _import_module()
         with patch.object(mod, "get_sm_version", return_value=90):
             assert mod._get_mla_backend_list() == ["flashinfer", "fa3"]
+
+    def test_hopper_explicit_backend_filter(self, monkeypatch):
+        mod = _import_module()
+        monkeypatch.setenv("AIC_MLA_ATTENTION_BACKENDS", "fa3")
+        with patch.object(mod, "get_sm_version", return_value=90):
+            assert mod._get_mla_backend_list() == ["fa3"]
 
     def test_blackwell(self):
         mod = _import_module()

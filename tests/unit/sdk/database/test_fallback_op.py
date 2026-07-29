@@ -8,7 +8,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from aiconfigurator.sdk import common
-from aiconfigurator.sdk.operations import FallbackOp, MLAModule, PerformanceResult, PrefixConditionalOp
+from aiconfigurator.sdk.operations import (
+    FallbackOp,
+    MLAModule,
+    PerformanceResult,
+    PrefixConditionalOp,
+    SystemConditionalOp,
+)
 from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
 
 
@@ -371,3 +377,42 @@ class TestPrefixConditionalOp:
         no_prefix.query.assert_not_called()
         prefix_1.query.assert_called_once()
         prefix_2.query.assert_called_once()
+
+
+class TestSystemConditionalOp:
+    def test_matching_system_uses_system_ops(self):
+        mock_db = _make_mock_db()
+        mock_db.system = "h20_pcie"
+        default = _make_mock_op(10.0, 100.0)
+        h20_1 = _make_mock_op(3.0, 30.0)
+        h20_2 = _make_mock_op(4.0, 40.0)
+
+        op = SystemConditionalOp(
+            "test_system_route",
+            default_ops=[default],
+            system_ops={"h20_pcie": [h20_1, h20_2]},
+        )
+        result = op.query(mock_db, batch_size=1)
+
+        assert float(result) == 7.0
+        assert result.energy == 70.0
+        default.query.assert_not_called()
+        h20_1.query.assert_called_once()
+        h20_2.query.assert_called_once()
+
+    def test_unknown_system_uses_default_ops(self):
+        mock_db = _make_mock_db()
+        mock_db.system = "h100_pcie"
+        default = _make_mock_op(10.0, 100.0)
+        h20 = _make_mock_op(3.0, 30.0)
+
+        op = SystemConditionalOp(
+            "test_system_route",
+            default_ops=[default],
+            system_ops={"h20_pcie": [h20]},
+        )
+        result = op.query(mock_db)
+
+        assert float(result) == 10.0
+        default.query.assert_called_once()
+        h20.query.assert_not_called()

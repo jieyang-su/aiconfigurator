@@ -87,12 +87,16 @@ class TestParseHFConfig:
             "num_experts_per_tok": 8,
             "n_routed_experts": 256,
             "moe_intermediate_size": 2048,
+            "first_k_dense_replace": 3,
+            "moe_layer_freq": 1,
         }
 
         result = _parse_hf_config_json(config)
 
         assert result["architecture"] == "DeepseekV3ForCausalLM"  # architecture
         assert result["num_experts"] == 256  # num_experts from n_routed_experts
+        assert result["extra_params"]["first_k_dense_replace"] == 3
+        assert result["extra_params"]["moe_layer_freq"] == 1
 
     def test_parse_config_with_head_dim(self):
         """Test parsing config that explicitly provides head_dim."""

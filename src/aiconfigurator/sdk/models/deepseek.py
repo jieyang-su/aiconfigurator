@@ -255,6 +255,26 @@ class DeepSeekModel(BaseModel):
                     prefix_ops=context_mla_granular_ops,
                 ),
             ]
+            context_mla_ops[-1] = ops.SystemConditionalOp(
+                "context_mla_block",
+                default_ops=[context_mla_ops[-1]],
+                system_ops={
+                    # The H20 LFS granular context-MLA table was collected with
+                    # the legacy absorbed/decode-style KV geometry. The
+                    # module-level FA3 table matches the ordinary TP8 runtime
+                    # boundary and covers both fresh and prefix-hit prefill.
+                    "h20_pcie": [
+                        ops.WideEPContextMLA(
+                            "context_mla_h20_module",
+                            self._num_layers,
+                            tp_size,
+                            mla_module_kvcache_quant_mode,
+                            mla_module_quant_mode,
+                            attn_backend,
+                        )
+                    ]
+                },
+            )
         else:
             context_mla_ops = [
                 ops.FallbackOp(
@@ -420,6 +440,12 @@ class DeepSeekModel(BaseModel):
                         attention_dp_size,
                         is_context=True,
                         strict_workload_distribution=self.config.strict_workload_distribution,
+                        # H20 ordinary TP8 prefill sequence-shards the MoE input;
+                        # its archived ordinary-MoE table key is rank-local M.
+                        # Decode already matches the global-batch table and is
+                        # intentionally left unchanged.
+                        local_token_divisor_by_system={"h20_pcie": tp_size},
+                        local_token_divisor_distributions={"balanced"},
                     )
                 ]
             )

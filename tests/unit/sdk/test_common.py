@@ -69,7 +69,9 @@ class TestSupportedSystems:
 
     def test_pcie_estimate_only_systems_are_registered(self):
         """Cloud/colo PCIe systems should be available for naive and SOL-style estimates."""
-        assert {"h100_pcie", "a100_pcie", "l4", "a30"}.issubset(common.SupportedSystems)
+        assert {"h100_pcie", "h20_pcie", "a100_pcie", "l4", "a30"}.issubset(
+            common.SupportedSystems
+        )
 
     def test_support_matrix_systems_sort_by_display_priority(self):
         """Support matrix systems should sort by product priority before name."""
