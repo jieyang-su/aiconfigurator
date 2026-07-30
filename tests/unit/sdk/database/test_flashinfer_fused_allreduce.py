@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from aiconfigurator.sdk.operations.communication import (
     load_flashinfer_fused_allreduce_data,
 )
 from aiconfigurator.sdk.perf_database import LoadedOpData, PerfDataNotAvailableError, PerfDatabase
+from aiconfigurator.sdk.performance_result import PerformanceResult
 
 pytestmark = pytest.mark.unit
 
@@ -76,3 +78,59 @@ def test_flashinfer_fused_allreduce_rejects_extrapolation(tmp_path, monkeypatch)
             token_num=128,
             hidden_size=7168,
         )
+
+
+@pytest.mark.parametrize(
+    ("token_num", "expected_latency"),
+    [
+        (2048, 10.0),
+        (2049, 14.0),
+    ],
+)
+def test_flashinfer_fallback_respects_sglang_fusion_boundary(
+    token_num,
+    expected_latency,
+):
+    calls = {}
+
+    def query_mem_op(size):
+        calls["mem_size"] = size
+        return PerformanceResult(2.0, energy=3.0, source="silicon")
+
+    def query_fused(*args, **kwargs):
+        raise PerfDataNotAvailableError("missing fused row")
+
+    def query_custom_allreduce(quant_mode, tp_size, size):
+        calls["comm"] = (quant_mode, tp_size, size)
+        return PerformanceResult(5.0, energy=7.0, source="empirical")
+
+    database = SimpleNamespace(
+        query_mem_op=query_mem_op,
+        query_flashinfer_fused_allreduce=query_fused,
+        query_custom_allreduce=query_custom_allreduce,
+    )
+    operation = FusedAllReduceResidualRMSNorm(
+        "allreduce_residual_rmsnorm",
+        scale_factor=2.0,
+        h=4,
+        tp_size=8,
+    )
+
+    result = operation.query(database, x=token_num)
+
+    assert float(result) == pytest.approx(expected_latency)
+    assert result.energy == pytest.approx(20.0)
+    assert result.source == "mixed"
+    assert calls["mem_size"] == token_num * 4 * 2 * 3
+    assert calls["comm"] == (
+        common.CommQuantMode.half,
+        8,
+        token_num * 4,
+    )
+    if token_num <= 2048:
+        assert not hasattr(result, "component_latency_ms")
+    else:
+        assert result.component_latency_ms == {
+            "Communication/reduce": pytest.approx(10.0),
+            "Norm": pytest.approx(4.0),
+        }

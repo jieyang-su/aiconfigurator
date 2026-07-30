@@ -149,12 +149,18 @@ class BaseBackend:
         batch_size: int,
         isl: int,
         prefix: int,
-    ) -> tuple[dict[str, float], dict[str, float], dict[str, str]]:
+    ) -> tuple[
+        dict[str, float],
+        dict[str, float],
+        dict[str, str],
+        dict[str, dict[str, float]],
+    ]:
         context_latency_dict = defaultdict(float)
         context_energy_wms_dict = defaultdict(float)
         # Per-op data source, accumulated by merging across calls to the same op.
         # Same-source repeated calls keep the tag; mismatched calls collapse to "mixed".
         context_source_dict: dict[str, str] = {}
+        context_component_latency_dict: dict[str, dict[str, float]] = {}
 
         effective_isl = isl - prefix
         if effective_isl <= 0:
@@ -174,6 +180,15 @@ class BaseBackend:
             )
             context_latency_dict[op._name] += float(result)
             context_energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
+            components = getattr(result, "component_latency_ms", None)
+            if isinstance(components, dict):
+                op_components = context_component_latency_dict.setdefault(op._name, {})
+                for component_name, component_latency_ms in components.items():
+                    component_name = str(component_name)
+                    op_components[component_name] = (
+                        op_components.get(component_name, 0.0)
+                        + float(component_latency_ms)
+                    )
             new_src = getattr(result, "source", "silicon")
             existing = context_source_dict.get(op._name)
             if existing is None or existing == new_src:
@@ -181,7 +196,12 @@ class BaseBackend:
             else:
                 context_source_dict[op._name] = "mixed"
 
-        return context_latency_dict, context_energy_wms_dict, context_source_dict
+        return (
+            context_latency_dict,
+            context_energy_wms_dict,
+            context_source_dict,
+            context_component_latency_dict,
+        )
 
     def _run_generation_phase(
         self,
@@ -193,16 +213,23 @@ class BaseBackend:
         isl: int,
         osl: int,
         stride: int,
-    ) -> tuple[dict[str, float], dict[str, float], dict[str, str]]:
+    ) -> tuple[
+        dict[str, float],
+        dict[str, float],
+        dict[str, str],
+        dict[str, dict[str, float]],
+    ]:
         generation_latency_dict = defaultdict(float)
         generation_energy_wms_dict = defaultdict(float)
         generation_source_dict: dict[str, str] = {}
+        generation_component_latency_dict: dict[str, dict[str, float]] = {}
 
         batch_size = batch_size * (model._nextn + 1)
 
         for i in range(0, osl - 1, stride):
             latency_dict = defaultdict(float)
             energy_wms_dict = defaultdict(float)
+            component_latency_dict: dict[str, dict[str, float]] = {}
 
             for op in model.generation_ops:
                 result = op.query(
@@ -216,6 +243,15 @@ class BaseBackend:
                 )
                 latency_dict[op._name] += float(result)
                 energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
+                components = getattr(result, "component_latency_ms", None)
+                if isinstance(components, dict):
+                    op_components = component_latency_dict.setdefault(op._name, {})
+                    for component_name, component_latency_ms in components.items():
+                        component_name = str(component_name)
+                        op_components[component_name] = (
+                            op_components.get(component_name, 0.0)
+                            + float(component_latency_ms)
+                        )
                 new_src = getattr(result, "source", "silicon")
                 existing = generation_source_dict.get(op._name)
                 if existing is None or existing == new_src:
@@ -227,10 +263,24 @@ class BaseBackend:
             for op in latency_dict:
                 generation_latency_dict[op] += latency_dict[op] * repeat_count
                 generation_energy_wms_dict[op] += energy_wms_dict[op] * repeat_count
+            for op_name, components in component_latency_dict.items():
+                op_components = generation_component_latency_dict.setdefault(
+                    op_name, {}
+                )
+                for component_name, component_latency_ms in components.items():
+                    op_components[component_name] = (
+                        op_components.get(component_name, 0.0)
+                        + component_latency_ms * repeat_count
+                    )
 
-        return generation_latency_dict, generation_energy_wms_dict, generation_source_dict
+        return (
+            generation_latency_dict,
+            generation_energy_wms_dict,
+            generation_source_dict,
+            generation_component_latency_dict,
+        )
 
-    # TODO: refactor this 6-tuple return into a NamedTuple (or @dataclass) for
+    # TODO: refactor this 8-tuple return into a NamedTuple (or @dataclass) for
     # readability; current call sites unpack positionally and the signature is
     # hard to scan.
     def _run_static_breakdown(
@@ -249,6 +299,8 @@ class BaseBackend:
         dict[str, float],
         dict[str, str],
         dict[str, str],
+        dict[str, dict[str, float]],
+        dict[str, dict[str, float]],
     ]:
         batch_size, beam_width, isl, osl, prefix = (
             runtime_config.batch_size,
@@ -261,6 +313,8 @@ class BaseBackend:
 
         context_latency_dict, context_energy_wms_dict, context_source_dict = {}, {}, {}
         generation_latency_dict, generation_energy_wms_dict, generation_source_dict = {}, {}, {}
+        context_component_latency_dict: dict[str, dict[str, float]] = {}
+        generation_component_latency_dict: dict[str, dict[str, float]] = {}
 
         if should_use_rust_engine_step(runtime_config):
             (
@@ -285,21 +339,43 @@ class BaseBackend:
                 generation_energy_wms_dict,
                 context_source_dict,
                 generation_source_dict,
+                context_component_latency_dict,
+                generation_component_latency_dict,
             )
 
         if mode == "static_ctx":
-            context_latency_dict, context_energy_wms_dict, context_source_dict = self._run_context_phase(
+            (
+                context_latency_dict,
+                context_energy_wms_dict,
+                context_source_dict,
+                context_component_latency_dict,
+            ) = self._run_context_phase(
                 model, database, runtime_config, batch_size, isl_eff, prefix
             )
         elif mode == "static_gen":
-            generation_latency_dict, generation_energy_wms_dict, generation_source_dict = self._run_generation_phase(
+            (
+                generation_latency_dict,
+                generation_energy_wms_dict,
+                generation_source_dict,
+                generation_component_latency_dict,
+            ) = self._run_generation_phase(
                 model, database, runtime_config, batch_size, beam_width, isl_eff, osl, stride
             )
         else:
-            context_latency_dict, context_energy_wms_dict, context_source_dict = self._run_context_phase(
+            (
+                context_latency_dict,
+                context_energy_wms_dict,
+                context_source_dict,
+                context_component_latency_dict,
+            ) = self._run_context_phase(
                 model, database, runtime_config, batch_size, isl_eff, prefix
             )
-            generation_latency_dict, generation_energy_wms_dict, generation_source_dict = self._run_generation_phase(
+            (
+                generation_latency_dict,
+                generation_energy_wms_dict,
+                generation_source_dict,
+                generation_component_latency_dict,
+            ) = self._run_generation_phase(
                 model, database, runtime_config, batch_size, beam_width, isl_eff, osl, stride
             )
 
@@ -311,6 +387,12 @@ class BaseBackend:
             for op in generation_latency_dict:
                 generation_latency_dict[op] *= latency_correction_scale
                 generation_energy_wms_dict[op] *= latency_correction_scale
+            for components in context_component_latency_dict.values():
+                for component_name in components:
+                    components[component_name] *= latency_correction_scale
+            for components in generation_component_latency_dict.values():
+                for component_name in components:
+                    components[component_name] *= latency_correction_scale
 
         return (
             context_latency_dict,
@@ -319,6 +401,8 @@ class BaseBackend:
             generation_energy_wms_dict,
             context_source_dict,
             generation_source_dict,
+            context_component_latency_dict,
+            generation_component_latency_dict,
         )
 
     def run_static_latency_only(
@@ -340,6 +424,8 @@ class BaseBackend:
             context_latency_dict,
             _,
             generation_latency_dict,
+            _,
+            _,
             _,
             _,
             _,
@@ -476,6 +562,8 @@ class BaseBackend:
             generation_energy_wms_dict,
             context_source_dict,
             generation_source_dict,
+            context_component_latency_dict,
+            generation_component_latency_dict,
         ) = self._run_static_breakdown(
             model,
             database,
@@ -625,6 +713,12 @@ class BaseBackend:
         summary.set_generation_energy_wms_dict(generation_energy_wms_dict)  # UPDATED: explicit units
         summary.set_context_source_dict(context_source_dict)
         summary.set_generation_source_dict(generation_source_dict)
+        summary.set_context_component_latency_dict(
+            context_component_latency_dict
+        )
+        summary.set_generation_component_latency_dict(
+            generation_component_latency_dict
+        )
         summary.set_encoder_power_avg(encoder_power_avg)
         summary.set_context_power_avg(context_power_avg)
         summary.set_generation_power_avg(generation_power_avg)

@@ -19,6 +19,8 @@ class InferenceSummary:
         memory: memory breakdown
         context_latency_dict: latency breakdown for context (ms)
         generation_latency_dict: latency breakdown for generation (ms)
+        context_component_latency_dict: optional per-op component latency for context (ms)
+        generation_component_latency_dict: optional per-op component latency for generation (ms)
         context_energy_wms_dict: energy breakdown for context (W·ms)
         generation_energy_wms_dict: energy breakdown for generation (W·ms)
         summary_df: summary dataframe
@@ -38,6 +40,10 @@ class InferenceSummary:
         set_generation_latency_dict: set generation latency dict
         get_context_latency_dict: get context latency dict
         get_generation_latency_dict: get generation latency dict
+        set_context_component_latency_dict: set context component latency dict
+        set_generation_component_latency_dict: set generation component latency dict
+        get_context_component_latency_dict: get context component latency dict
+        get_generation_component_latency_dict: get generation component latency dict
         set_context_energy_wms_dict: set context energy dict
         set_generation_energy_wms_dict: set generation energy dict
         get_context_energy_wms_dict: get context energy dict
@@ -62,6 +68,12 @@ class InferenceSummary:
         self._encoder_latency_dict = {}  # ms
         self._context_latency_dict = {}  # ms
         self._generation_latency_dict = {}  # ms
+        self._context_component_latency_dict: dict[
+            str, dict[str, float]
+        ] = {}  # ms
+        self._generation_component_latency_dict: dict[
+            str, dict[str, float]
+        ] = {}  # ms
         self._encoder_energy_wms_dict = {}  # W·ms
         self._context_energy_wms_dict = {}  # RENAMED from _context_power_dict, W·ms
         self._generation_energy_wms_dict = {}  # RENAMED from _generation_power_dict, W·ms
@@ -212,6 +224,28 @@ class InferenceSummary:
         Get generation latency dict.
         """
         return self._generation_latency_dict
+
+    def set_context_component_latency_dict(
+        self, component_latency_dict: dict[str, dict[str, float]]
+    ) -> None:
+        """Set optional per-op component latencies for the context phase."""
+        self._context_component_latency_dict = component_latency_dict
+
+    def get_context_component_latency_dict(self) -> dict[str, dict[str, float]]:
+        """Get optional per-op component latencies for the context phase."""
+        return self._context_component_latency_dict
+
+    def set_generation_component_latency_dict(
+        self, component_latency_dict: dict[str, dict[str, float]]
+    ) -> None:
+        """Set optional per-op component latencies for the generation phase."""
+        self._generation_component_latency_dict = component_latency_dict
+
+    def get_generation_component_latency_dict(
+        self,
+    ) -> dict[str, dict[str, float]]:
+        """Get optional per-op component latencies for the generation phase."""
+        return self._generation_component_latency_dict
 
     # NEW: Energy dict accessors (explicit _wms naming for clarity)
     def set_encoder_energy_wms_dict(self, energy_wms_dict: dict[str, float]) -> None:

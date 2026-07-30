@@ -40,6 +40,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Keep this boundary synchronized with SGLang 0.5.9
+# ``communicator.FUSE_ALLREDUCE_MAX_BATCH_SIZE``. Larger token batches execute
+# all-reduce and residual/RMSNorm as two sequential operations.
+_FLASHINFER_FUSED_ALLREDUCE_MAX_TOKENS = 2048
+
 
 def _comm_debug_enabled() -> bool:
     return os.environ.get("AIC_DEBUG_COMM_QUERIES", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -352,8 +357,10 @@ class FusedAllReduceResidualRMSNorm(Operation):
     """SGLang TP all-reduce fused with residual addition and RMSNorm.
 
     FlashInfer executes the collective and residual/RMSNorm epilogue as one
-    operation. When the fused table is unavailable, retain the historical
-    estimate by overlapping custom all-reduce with the elementwise epilogue.
+    operation for token batches up to SGLang's fusion boundary. When a fused
+    table row is unavailable inside that boundary, retain the historical
+    overlap estimate. Larger batches use SGLang's unfused path and therefore
+    add the sequential custom all-reduce and elementwise epilogue latencies.
     """
 
     _data_cache: ClassVar[dict] = {}
@@ -487,11 +494,23 @@ class FusedAllReduceResidualRMSNorm(Operation):
         comm_source = getattr(comm_result, "source", "silicon")
         norm_source = getattr(norm_result, "source", "silicon")
         source = comm_source if comm_source == norm_source else "mixed"
-        return PerformanceResult(
-            max(float(comm_result), float(norm_result)) * self._scale_factor,
+        if x <= _FLASHINFER_FUSED_ALLREDUCE_MAX_TOKENS:
+            latency = max(float(comm_result), float(norm_result))
+        else:
+            latency = float(comm_result) + float(norm_result)
+        result = PerformanceResult(
+            latency * self._scale_factor,
             energy=(comm_result.energy + norm_result.energy) * self._scale_factor,
             source=source,
         )
+        if x > _FLASHINFER_FUSED_ALLREDUCE_MAX_TOKENS:
+            result.component_latency_ms = {
+                "Communication/reduce": (
+                    float(comm_result) * self._scale_factor
+                ),
+                "Norm": float(norm_result) * self._scale_factor,
+            }
+        return result
 
     def get_weights(self, **kwargs):
         return self._weights

@@ -14,22 +14,40 @@ pytestmark = pytest.mark.unit
 
 
 class _LatencyResult:
-    def __init__(self, latency_ms: float, energy_wms: float) -> None:
+    def __init__(
+        self,
+        latency_ms: float,
+        energy_wms: float,
+        component_latency_ms: dict[str, float] | None = None,
+    ) -> None:
         self._latency_ms = latency_ms
         self.energy = energy_wms
+        if component_latency_ms is not None:
+            self.component_latency_ms = component_latency_ms
 
     def __float__(self) -> float:
         return self._latency_ms
 
 
 class _StaticOp:
-    def __init__(self, name: str, latency_ms: float, energy_wms: float) -> None:
+    def __init__(
+        self,
+        name: str,
+        latency_ms: float,
+        energy_wms: float,
+        component_latency_ms: dict[str, float] | None = None,
+    ) -> None:
         self._name = name
         self._latency_ms = latency_ms
         self._energy_wms = energy_wms
+        self._component_latency_ms = component_latency_ms
 
     def query(self, *args, **kwargs) -> _LatencyResult:
-        return _LatencyResult(self._latency_ms, self._energy_wms)
+        return _LatencyResult(
+            self._latency_ms,
+            self._energy_wms,
+            self._component_latency_ms,
+        )
 
 
 class _TestBackend(BaseBackend):
@@ -181,6 +199,66 @@ def test_run_static_can_route_to_rust_engine_step_backend(
     assert summary.get_generation_energy_wms_dict() == {"rust_engine_step_generation": 0.0}
     assert summary.get_context_source_dict() == {"rust_engine_step_context": "rust"}
     assert summary.get_generation_source_dict() == {"rust_engine_step_generation": "rust"}
+    assert summary.get_context_component_latency_dict() == {}
+    assert summary.get_generation_component_latency_dict() == {}
+
+
+def test_run_static_preserves_and_scales_component_latency(
+    backend: BaseBackend,
+    model,
+    database,
+    runtime_config: RuntimeConfig,
+) -> None:
+    model.context_ops = [
+        _StaticOp(
+            "context_allreduce_residual_rmsnorm",
+            latency_ms=7.0,
+            energy_wms=70.0,
+            component_latency_ms={
+                "Communication/reduce": 5.0,
+                "Norm": 2.0,
+            },
+        )
+    ]
+    model.generation_ops = [
+        _StaticOp(
+            "generation_allreduce_residual_rmsnorm",
+            latency_ms=3.0,
+            energy_wms=30.0,
+            component_latency_ms={
+                "Communication/reduce": 2.0,
+                "Norm": 1.0,
+            },
+        )
+    ]
+
+    summary = backend.run_static(
+        model,
+        database,
+        runtime_config,
+        mode="static",
+        stride=2,
+        latency_correction_scale=1.25,
+    )
+
+    assert summary.get_context_latency_dict() == {
+        "context_allreduce_residual_rmsnorm": pytest.approx(8.75),
+    }
+    assert summary.get_context_component_latency_dict() == {
+        "context_allreduce_residual_rmsnorm": {
+            "Communication/reduce": pytest.approx(6.25),
+            "Norm": pytest.approx(2.5),
+        }
+    }
+    assert summary.get_generation_latency_dict() == {
+        "generation_allreduce_residual_rmsnorm": pytest.approx(15.0),
+    }
+    assert summary.get_generation_component_latency_dict() == {
+        "generation_allreduce_residual_rmsnorm": {
+            "Communication/reduce": pytest.approx(10.0),
+            "Norm": pytest.approx(5.0),
+        }
+    }
 
 
 def test_run_static_uses_explicit_unique_kv_token_count(
