@@ -896,6 +896,7 @@ class PerfDataFilename(Enum):
     mla_bmm = "mla_bmm_perf.parquet"
     moe = "moe_perf.parquet"
     custom_allreduce = "custom_allreduce_perf.parquet"
+    flashinfer_fused_allreduce = "flashinfer_fused_allreduce_perf.parquet"
     wideep_context_mla = "wideep_context_mla_perf.parquet"
     wideep_generation_mla = "wideep_generation_mla_perf.parquet"
     wideep_context_moe = "wideep_context_moe_perf.parquet"

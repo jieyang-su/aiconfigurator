@@ -24,6 +24,9 @@ class ModelConfig:
     moe_ep_size: int = None
     attention_dp_size: int = 1
     workload_distribution: str = "power_law"
+    # Compatibility dtype used by the archived SGLang MLA module tables.
+    # This is intentionally independent from the granular KV-cache dtype.
+    mla_module_kvcache_quant_mode: common.KVCacheQuantMode | None = None
     # quantization options
     nextn: int = 0  # at most mtp5
     nextn_accept_rates: list = None

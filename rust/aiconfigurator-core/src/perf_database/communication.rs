@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Communication perf tables: custom_allreduce + NCCL + OneCCL.
+//! Communication perf tables: custom allreduce, FlashInfer fused allreduce,
+//! NCCL, and OneCCL.
 //!
 //! Mirrors the SILICON paths of
 //! `aiconfigurator.sdk.operations.communication.{CustomAllReduce, NCCL}._query_*_table`.
@@ -43,6 +44,7 @@ pub struct CommunicationTable {
     /// systems — OneCCL is the XPU fallback path).
     oneccl_root: Option<PathBuf>,
     custom_allreduce: OnceLock<Result<CustomAllReduceGrids, AicError>>,
+    flashinfer_fused_allreduce: OnceLock<Result<FlashInferFusedAllReduceGrids, AicError>>,
     nccl: OnceLock<Result<NcclGrids, AicError>>,
     oneccl: OnceLock<Result<NcclGrids, AicError>>,
 }
@@ -50,6 +52,12 @@ pub struct CommunicationTable {
 struct CustomAllReduceGrids {
     /// (quant_name, tp_size) -> {message_size -> latency_ms}
     by_keys: BTreeMap<(String, u32), BTreeMap<u64, f64>>,
+}
+
+struct FlashInferFusedAllReduceGrids {
+    /// (quant_name, tp_size, hidden_size, pattern, execution_mode)
+    /// -> {token_num -> latency_ms}
+    by_keys: BTreeMap<(String, u32, u32, String, String), BTreeMap<u32, f64>>,
 }
 
 struct NcclGrids {
@@ -74,6 +82,7 @@ impl CommunicationTable {
             nccl_root,
             oneccl_root,
             custom_allreduce: OnceLock::new(),
+            flashinfer_fused_allreduce: OnceLock::new(),
             nccl: OnceLock::new(),
             oneccl: OnceLock::new(),
         }
@@ -103,6 +112,44 @@ impl CommunicationTable {
             ))
         })?;
         interp_message_size(by_size, message_size)
+    }
+
+    pub fn query_flashinfer_fused_allreduce(
+        &self,
+        quant: CommQuantMode,
+        tp_size: u32,
+        token_num: u32,
+        hidden_size: u32,
+        pattern: &str,
+        execution_mode: &str,
+    ) -> Result<f64, AicError> {
+        let grids = self.load_flashinfer_fused_allreduce()?;
+        let key = (
+            quant.name().to_string(),
+            tp_size,
+            hidden_size,
+            pattern.to_string(),
+            execution_mode.to_string(),
+        );
+        let by_tokens = grids.by_keys.get(&key).ok_or_else(|| {
+            AicError::PerfDatabase(format!(
+                "FlashInfer fused allreduce data missing for {key:?} at {}",
+                self.data_root.display()
+            ))
+        })?;
+        let (&min_token, _) = by_tokens.first_key_value().ok_or_else(|| {
+            AicError::PerfDatabase(format!(
+                "FlashInfer fused allreduce token grid is empty for {key:?}"
+            ))
+        })?;
+        let (&max_token, _) = by_tokens.last_key_value().expect("non-empty grid");
+        if token_num < min_token || token_num > max_token {
+            return Err(AicError::PerfDatabase(format!(
+                "FlashInfer fused allreduce token_num={token_num} is outside collected \
+                 range [{min_token}, {max_token}] for {key:?}"
+            )));
+        }
+        interp_token_num(by_tokens, token_num)
     }
 
     /// Raw NCCL collective latency in ms.
@@ -171,6 +218,19 @@ impl CommunicationTable {
         cell.as_ref().map_err(clone_err)
     }
 
+    fn load_flashinfer_fused_allreduce(
+        &self,
+    ) -> Result<&FlashInferFusedAllReduceGrids, AicError> {
+        let cell = self.flashinfer_fused_allreduce.get_or_init(|| {
+            load_flashinfer_fused_allreduce_parquet(
+                &self
+                    .data_root
+                    .join("flashinfer_fused_allreduce_perf.parquet"),
+            )
+        });
+        cell.as_ref().map_err(clone_err)
+    }
+
     fn load_nccl(&self) -> Result<&NcclGrids, AicError> {
         let cell = self.nccl.get_or_init(|| {
             let Some(root) = self.nccl_root.as_ref() else {
@@ -215,6 +275,21 @@ fn interp_message_size(by_size: &BTreeMap<u64, f64>, message_size: u64) -> Resul
     Ok(interp_1d(lo as f64, hi as f64, y_lo, y_hi, query as f64))
 }
 
+fn interp_token_num(by_tokens: &BTreeMap<u32, f64>, token_num: u32) -> Result<f64, AicError> {
+    if let Some(&latency) = by_tokens.get(&token_num) {
+        return Ok(latency);
+    }
+    let tokens: Vec<u32> = by_tokens.keys().copied().collect();
+    let (lo, hi) = nearest_neighbors(token_num, &tokens, false)?;
+    Ok(interp_1d(
+        lo as f64,
+        hi as f64,
+        by_tokens[&lo],
+        by_tokens[&hi],
+        token_num as f64,
+    ))
+}
+
 fn load_custom_allreduce_parquet(path: &Path) -> Result<CustomAllReduceGrids, AicError> {
     let reader = PerfReader::open(path)?;
     let num_gpus_col = reader.col("num_gpus")?;
@@ -257,6 +332,42 @@ fn load_custom_allreduce_parquet(path: &Path) -> Result<CustomAllReduceGrids, Ai
         )));
     }
     Ok(CustomAllReduceGrids { by_keys })
+}
+
+fn load_flashinfer_fused_allreduce_parquet(
+    path: &Path,
+) -> Result<FlashInferFusedAllReduceGrids, AicError> {
+    let reader = PerfReader::open(path)?;
+    let num_gpus_col = reader.col("num_gpus")?;
+    let token_num_col = reader.col("token_num")?;
+    let hidden_size_col = reader.col("hidden_size")?;
+    let pattern_col = reader.col("pattern")?;
+    let execution_mode_col = reader.col("execution_mode")?;
+    let latency_col = reader.col("latency")?;
+
+    let mut by_keys = BTreeMap::new();
+    for row in reader.rows()? {
+        let row = row?;
+        let key = (
+            "half".to_string(),
+            row.u32(num_gpus_col)?,
+            row.u32(hidden_size_col)?,
+            row.str_owned(pattern_col)?,
+            row.str_owned(execution_mode_col)?,
+        );
+        by_keys
+            .entry(key)
+            .or_insert_with(BTreeMap::new)
+            .entry(row.u32(token_num_col)?)
+            .or_insert(row.f64(latency_col)?);
+    }
+    if by_keys.is_empty() {
+        return Err(AicError::PerfDatabase(format!(
+            "no FlashInfer fused allreduce rows loaded from {}",
+            path.display()
+        )));
+    }
+    Ok(FlashInferFusedAllReduceGrids { by_keys })
 }
 
 fn load_nccl_parquet(path: &Path) -> Result<NcclGrids, AicError> {
@@ -350,6 +461,23 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn flashinfer_fused_allreduce_loads_h100_sglang() {
+        let root = systems_root().join("data/h100_pcie/sglang/0.5.9");
+        let table = CommunicationTable::new(root, None, None);
+        let latency = table
+            .query_flashinfer_fused_allreduce(
+                CommQuantMode::Half,
+                4,
+                24,
+                7168,
+                "auto",
+                "graph",
+            )
+            .expect("H100 SGLang fused-allreduce row must be queryable");
+        assert!(latency > 0.0);
     }
 
     #[test]

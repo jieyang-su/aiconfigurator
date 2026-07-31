@@ -639,6 +639,8 @@ def _parse_hf_config_json(config: dict) -> dict:
             "v_head_dim": config.get("v_head_dim", 0),
             "kv_lora_rank": config.get("kv_lora_rank", 0),
             "qk_rope_head_dim": config.get("qk_rope_head_dim", 0),
+            "first_k_dense_replace": config.get("first_k_dense_replace", 0),
+            "moe_layer_freq": config.get("moe_layer_freq", 1),
         }
     elif architecture in {"DeepSeekForCausalLM", "DeepseekV3ForCausalLM"}:
         # DeepSeek V3 / R1 / Kimi K2: MLA latent geometry from config so the KV
@@ -649,6 +651,8 @@ def _parse_hf_config_json(config: dict) -> dict:
             "v_head_dim": config.get("v_head_dim", 0),
             "kv_lora_rank": config.get("kv_lora_rank", 0),
             "qk_rope_head_dim": config.get("qk_rope_head_dim", 0),
+            "first_k_dense_replace": config.get("first_k_dense_replace", 0),
+            "moe_layer_freq": config.get("moe_layer_freq", 1),
         }
     elif architecture in {"DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"}:
         # DeepSeek-V3.2 / GLM-5 share the DSA attention pattern but have different

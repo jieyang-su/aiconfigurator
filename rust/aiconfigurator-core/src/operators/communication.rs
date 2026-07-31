@@ -82,6 +82,60 @@ impl CustomAllReduceOp {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FusedAllReduceResidualRmsNormOp {
+    pub name: String,
+    pub scale_factor: f64,
+    pub hidden_size: u32,
+    pub tp_size: u32,
+    pub quant: CommQuantMode,
+    pub pattern: String,
+    pub execution_mode: String,
+}
+
+impl FusedAllReduceResidualRmsNormOp {
+    pub fn query(
+        &self,
+        db: &PerfDatabase,
+        num_tokens: u32,
+    ) -> Result<PerformanceResult, AicError> {
+        use crate::operators::attention::mem_op_latency_ms;
+
+        let norm_latency =
+            mem_op_latency_ms(&db.system_spec, num_tokens as f64 * self.hidden_size as f64 * 6.0);
+        if self.tp_size <= 1 {
+            return Ok(
+                PerformanceResult::new(norm_latency, Source::Empirical).scaled(self.scale_factor)
+            );
+        }
+        match db.communication.query_flashinfer_fused_allreduce(
+            self.quant,
+            self.tp_size,
+            num_tokens,
+            self.hidden_size,
+            &self.pattern,
+            &self.execution_mode,
+        ) {
+            Ok(latency) => Ok(
+                PerformanceResult::new(latency, Source::Silicon).scaled(self.scale_factor)
+            ),
+            Err(AicError::PerfDatabase(_)) | Err(AicError::Io { .. }) => {
+                let message_size = num_tokens as u64 * self.hidden_size as u64;
+                let comm_latency = db.communication.query_custom_allreduce(
+                    self.quant,
+                    self.tp_size.min(db.system_spec.node.num_gpus_per_node),
+                    message_size,
+                )?;
+                Ok(
+                    PerformanceResult::new(comm_latency.max(norm_latency), Source::Mixed)
+                        .scaled(self.scale_factor),
+                )
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NcclOp {
     pub name: String,
     pub scale_factor: f64,

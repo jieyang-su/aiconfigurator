@@ -26,6 +26,31 @@ pytestmark = pytest.mark.unit
 class TestParseHFConfig:
     """Test HuggingFace config parsing."""
 
+    def test_parse_deepseek_preserves_dense_moe_layer_contract(self):
+        result = _parse_hf_config_json(
+            {
+                "architectures": ["DeepseekV3ForCausalLM"],
+                "num_hidden_layers": 20,
+                "hidden_size": 7168,
+                "num_attention_heads": 128,
+                "num_key_value_heads": 128,
+                "intermediate_size": 18432,
+                "moe_intermediate_size": 2048,
+                "num_experts_per_tok": 8,
+                "n_routed_experts": 256,
+                "vocab_size": 129280,
+                "max_position_embeddings": 163840,
+                "first_k_dense_replace": 3,
+                "moe_layer_freq": 1,
+                "kv_lora_rank": 512,
+                "qk_rope_head_dim": 64,
+                "v_head_dim": 128,
+            }
+        )
+
+        assert result["extra_params"]["first_k_dense_replace"] == 3
+        assert result["extra_params"]["moe_layer_freq"] == 1
+
     def test_parse_llama_config(self):
         """Test parsing a Llama model config."""
         config = {

@@ -598,9 +598,11 @@ def _build_model_config(
     moe_ep_size: int,
     gemm_quant_mode: str | None = None,
     kvcache_quant_mode: str | None = None,
+    mla_module_kvcache_quant_mode: str | None = None,
     fmha_quant_mode: str | None = None,
     moe_quant_mode: str | None = None,
     comm_quant_mode: str | None = None,
+    workload_distribution: str | None = None,
 ):
     """Build a ModelConfig with optional quant mode overrides."""
     from aiconfigurator.sdk.common import (
@@ -612,17 +614,27 @@ def _build_model_config(
     )
     from aiconfigurator.sdk.config import ModelConfig
 
+    config_kwargs = {
+        "tp_size": tp_size,
+        "pp_size": pp_size,
+        "attention_dp_size": attention_dp_size,
+        "moe_tp_size": moe_tp_size,
+        "moe_ep_size": moe_ep_size,
+        "gemm_quant_mode": GEMMQuantMode[gemm_quant_mode] if gemm_quant_mode else None,
+        "kvcache_quant_mode": KVCacheQuantMode[kvcache_quant_mode] if kvcache_quant_mode else None,
+        "mla_module_kvcache_quant_mode": (
+            KVCacheQuantMode[mla_module_kvcache_quant_mode]
+            if mla_module_kvcache_quant_mode
+            else None
+        ),
+        "fmha_quant_mode": FMHAQuantMode[fmha_quant_mode] if fmha_quant_mode else None,
+        "moe_quant_mode": MoEQuantMode[moe_quant_mode] if moe_quant_mode else None,
+        "comm_quant_mode": CommQuantMode[comm_quant_mode] if comm_quant_mode else None,
+    }
+    if workload_distribution is not None:
+        config_kwargs["workload_distribution"] = workload_distribution
     return ModelConfig(
-        tp_size=tp_size,
-        pp_size=pp_size,
-        attention_dp_size=attention_dp_size,
-        moe_tp_size=moe_tp_size,
-        moe_ep_size=moe_ep_size,
-        gemm_quant_mode=GEMMQuantMode[gemm_quant_mode] if gemm_quant_mode else None,
-        kvcache_quant_mode=KVCacheQuantMode[kvcache_quant_mode] if kvcache_quant_mode else None,
-        fmha_quant_mode=FMHAQuantMode[fmha_quant_mode] if fmha_quant_mode else None,
-        moe_quant_mode=MoEQuantMode[moe_quant_mode] if moe_quant_mode else None,
-        comm_quant_mode=CommQuantMode[comm_quant_mode] if comm_quant_mode else None,
+        **config_kwargs,
     )
 
 

@@ -34,7 +34,9 @@ pub mod wideep_moe;
 
 pub use attention::{ContextAttentionOp, EncoderAttentionOp, GenerationAttentionOp};
 pub use base::{PerformanceResult, Source};
-pub use communication::{CustomAllReduceOp, NcclOp, P2POp};
+pub use communication::{
+    CustomAllReduceOp, FusedAllReduceResidualRmsNormOp, NcclOp, P2POp,
+};
 pub use dsa::DsaModuleOp;
 pub use dsv4::Dsv4ModuleOp;
 pub use elementwise::ElementwiseOp;

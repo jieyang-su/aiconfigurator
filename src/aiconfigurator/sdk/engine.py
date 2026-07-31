@@ -53,6 +53,7 @@ from aiconfigurator.sdk.operations import (
     Embedding,
     EncoderAttention,
     FallbackOp,
+    FusedAllReduceResidualRMSNorm,
     GDNKernel,
     GenerationAttention,
     GenerationDeepSeekV4AttentionModule,
@@ -291,6 +292,18 @@ def _custom_all_reduce(op: CustomAllReduce) -> dict:
         "hidden_size": op._h,
         "tp_size": op._tp_size,
         "quant": "half",
+    }
+
+
+def _fused_all_reduce_residual_rms_norm(op: FusedAllReduceResidualRMSNorm) -> dict:
+    return {
+        "name": op._name,
+        "scale_factor": op._scale_factor,
+        "hidden_size": op._h,
+        "tp_size": op._tp_size,
+        "quant": "half",
+        "pattern": "auto",
+        "execution_mode": op._execution_mode,
     }
 
 
@@ -534,6 +547,8 @@ def _to_opspec(op: Any, *, backend: str, architecture: str, database: Any) -> di
         return {"Moe": _moe(op)}
     if isinstance(op, CustomAllReduce):
         return {"CustomAllReduce": _custom_all_reduce(op)}
+    if isinstance(op, FusedAllReduceResidualRMSNorm):
+        return {"FusedAllReduceResidualRmsNorm": _fused_all_reduce_residual_rms_norm(op)}
     if isinstance(op, NCCL):
         return {"Nccl": _nccl(op)}
     if isinstance(op, P2P):
@@ -640,8 +655,10 @@ def compile_engine(
     gemm_quant_mode: str | None = None,
     moe_quant_mode: str | None = None,
     kvcache_quant_mode: str | None = None,
+    mla_module_kvcache_quant_mode: str | None = None,
     fmha_quant_mode: str | None = None,
     comm_quant_mode: str | None = None,
+    workload_distribution: str | None = None,
     nextn: int = 0,
     nextn_accept_rates: list[float] | None = None,
     kv_block_size: int | None = None,
@@ -667,9 +684,11 @@ def compile_engine(
         moe_ep_size=resolved_moe_ep,
         gemm_quant_mode=gemm_quant_mode,
         kvcache_quant_mode=kvcache_quant_mode,
+        mla_module_kvcache_quant_mode=mla_module_kvcache_quant_mode,
         fmha_quant_mode=fmha_quant_mode,
         moe_quant_mode=moe_quant_mode,
         comm_quant_mode=comm_quant_mode,
+        workload_distribution=workload_distribution,
     )
     model = get_model(model_path, model_config, backend)
 

@@ -309,8 +309,10 @@ pub fn build_aic_engine(
     gemm_quant_mode: Option<&str>,
     moe_quant_mode: Option<&str>,
     kvcache_quant_mode: Option<&str>,
+    mla_module_kvcache_quant_mode: Option<&str>,
     fmha_quant_mode: Option<&str>,
     comm_quant_mode: Option<&str>,
+    workload_distribution: Option<&str>,
     nextn: u32,
     nextn_accept_rates: Option<Vec<f64>>,
     kv_block_size: Option<u32>,
@@ -329,8 +331,10 @@ pub fn build_aic_engine(
         gemm_quant_mode,
         moe_quant_mode,
         kvcache_quant_mode,
+        mla_module_kvcache_quant_mode,
         fmha_quant_mode,
         comm_quant_mode,
+        workload_distribution,
         nextn,
         nextn_accept_rates,
         kv_block_size,
@@ -358,8 +362,10 @@ fn compile_engine_from_flat(
     gemm_quant_mode: Option<&str>,
     moe_quant_mode: Option<&str>,
     kvcache_quant_mode: Option<&str>,
+    mla_module_kvcache_quant_mode: Option<&str>,
     fmha_quant_mode: Option<&str>,
     comm_quant_mode: Option<&str>,
+    workload_distribution: Option<&str>,
     nextn: u32,
     nextn_accept_rates: Option<Vec<f64>>,
     kv_block_size: Option<u32>,
@@ -377,8 +383,13 @@ fn compile_engine_from_flat(
         kwargs.set_item("gemm_quant_mode", gemm_quant_mode)?;
         kwargs.set_item("moe_quant_mode", moe_quant_mode)?;
         kwargs.set_item("kvcache_quant_mode", kvcache_quant_mode)?;
+        kwargs.set_item(
+            "mla_module_kvcache_quant_mode",
+            mla_module_kvcache_quant_mode,
+        )?;
         kwargs.set_item("fmha_quant_mode", fmha_quant_mode)?;
         kwargs.set_item("comm_quant_mode", comm_quant_mode)?;
+        kwargs.set_item("workload_distribution", workload_distribution)?;
         kwargs.set_item("nextn", nextn)?;
         kwargs.set_item("nextn_accept_rates", nextn_accept_rates)?;
         kwargs.set_item("kv_block_size", kv_block_size)?;
@@ -451,8 +462,10 @@ pub(crate) fn compile_engine_to_engine(
         gemm_quant_name(config.quantization.weight_dtype.as_ref()),
         moe_quant_name(config.quantization.moe_dtype.as_ref()),
         kvcache_quant_name(config.quantization.kv_cache_dtype.as_ref()),
+        None, // module KV dtype is not carried on EngineConfig; inherit global KV.
         fmha_quant_name(config.quantization.activation_dtype.as_ref()),
         None, // comm quant is not carried on EngineConfig; let Python default it.
+        None, // workload distribution is not carried on EngineConfig; keep ModelConfig's default.
         nextn,
         nextn_accept_rates,
         config.kv_block_size,

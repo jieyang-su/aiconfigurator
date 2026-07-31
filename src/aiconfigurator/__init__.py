@@ -3,4 +3,8 @@
 
 import importlib.metadata
 
-__version__ = importlib.metadata.version("aiconfigurator")
+try:
+    __version__ = importlib.metadata.version("aiconfigurator")
+except importlib.metadata.PackageNotFoundError:
+    # Source-tree/maturin --skip-install execution used by offline DynoSim.
+    __version__ = "0.9.0"

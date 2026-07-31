@@ -718,6 +718,7 @@ from aiconfigurator.sdk.operations.attention import (  # noqa: F401
 )
 from aiconfigurator.sdk.operations.communication import (  # noqa: F401
     load_custom_allreduce_data,
+    load_flashinfer_fused_allreduce_data,
     load_nccl_data,
 )
 from aiconfigurator.sdk.operations.dsa import (  # noqa: F401
@@ -1879,6 +1880,28 @@ class PerfDatabase:
         from aiconfigurator.sdk.operations.communication import CustomAllReduce
 
         return CustomAllReduce._query_custom_allreduce_table(self, quant_mode, tp_size, size, database_mode)
+
+    @functools.lru_cache(maxsize=32768)
+    def query_flashinfer_fused_allreduce(
+        self,
+        quant_mode: common.CommQuantMode,
+        tp_size: int,
+        token_num: int,
+        hidden_size: int,
+        pattern: str = "auto",
+        execution_mode: str = "eager",
+    ) -> PerformanceResult:
+        from aiconfigurator.sdk.operations.communication import FusedAllReduceResidualRMSNorm
+
+        return FusedAllReduceResidualRMSNorm._query_flashinfer_fused_allreduce_table(
+            self,
+            quant_mode,
+            tp_size,
+            token_num,
+            hidden_size,
+            pattern,
+            execution_mode,
+        )
 
     @functools.lru_cache(maxsize=32768)
     def query_nccl(

@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::common::error::AicError;
 use crate::operators::{
     ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaModuleOp, Dsv4ModuleOp,
-    ElementwiseOp, EmbeddingOp, EncoderAttentionOp, GdnOp, GemmOp, GenerationAttentionOp,
+    ElementwiseOp, EmbeddingOp, EncoderAttentionOp, FusedAllReduceResidualRmsNormOp, GdnOp,
+    GemmOp, GenerationAttentionOp,
     GenerationMlaOp, Mamba2Op, MhcModuleOp, MlaBmmOp, MlaModuleOp, MoEDispatchOp, MoeOp,
     NcclOp, P2POp, PerformanceResult, Source, VisionEncoderOp, WideEpContextMlaOp,
     WideEpGenerationMlaOp, WideEpMoeOp,
@@ -104,6 +105,7 @@ pub enum Op {
     Moe(MoeOp),
     MoeDispatch(MoEDispatchOp),
     CustomAllReduce(CustomAllReduceOp),
+    FusedAllReduceResidualRmsNorm(FusedAllReduceResidualRmsNormOp),
     Nccl(NcclOp),
     P2P(P2POp),
     Vision(VisionEncoderOp),
@@ -195,6 +197,7 @@ impl Op {
             Op::Moe(o) => &o.name,
             Op::MoeDispatch(o) => &o.name,
             Op::CustomAllReduce(o) => &o.name,
+            Op::FusedAllReduceResidualRmsNorm(o) => &o.name,
             Op::Nccl(o) => &o.name,
             Op::P2P(o) => &o.name,
             Op::Vision(o) => &o.name,
@@ -275,6 +278,7 @@ impl Op {
             Op::Moe(op) => op.query(db, ctx.num_tokens),
             Op::MoeDispatch(op) => op.query(db, ctx.num_tokens),
             Op::CustomAllReduce(op) => op.query(db, ctx.num_tokens),
+            Op::FusedAllReduceResidualRmsNorm(op) => op.query(db, ctx.num_tokens),
             Op::Nccl(op) => op.query(db, ctx.num_tokens),
             Op::P2P(op) => op.query(db, ctx.num_tokens),
             Op::Vision(op) => op.query(db, ctx.num_image_tokens),
@@ -348,4 +352,3 @@ impl Op {
         }
     }
 }
-

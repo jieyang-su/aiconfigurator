@@ -130,7 +130,8 @@ mod tests {
     use crate::operators::op::{FallbackOp, OverlapOp};
     use crate::operators::{
         ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaModuleOp, Dsv4ModuleOp,
-        ElementwiseOp, EmbeddingOp, EncoderAttentionOp, GdnOp, GemmOp, GenerationAttentionOp,
+        ElementwiseOp, EmbeddingOp, EncoderAttentionOp, FusedAllReduceResidualRmsNormOp, GdnOp,
+        GemmOp, GenerationAttentionOp,
         GenerationMlaOp, Mamba2Op, MhcModuleOp, MlaBmmOp, MlaModuleOp, MoEDispatchOp, MoeOp,
         NcclOp, P2POp, VisionEncoderOp, WideEpContextMlaOp, WideEpGenerationMlaOp, WideEpMoeOp,
     };
@@ -290,6 +291,18 @@ mod tests {
             hidden_size: 4096,
             tp_size: 8,
             quant: CommQuantMode::Half,
+        }
+    }
+
+    fn fused_all_reduce_residual_rms_norm() -> FusedAllReduceResidualRmsNormOp {
+        FusedAllReduceResidualRmsNormOp {
+            name: "fused_all_reduce_residual_rms_norm".into(),
+            scale_factor: 1.0,
+            hidden_size: 7168,
+            tp_size: 4,
+            quant: CommQuantMode::Half,
+            pattern: "auto".into(),
+            execution_mode: "graph".into(),
         }
     }
 
@@ -478,6 +491,7 @@ mod tests {
             OpSpec::Moe(moe()),
             OpSpec::MoeDispatch(moe_dispatch()),
             OpSpec::CustomAllReduce(custom_all_reduce()),
+            OpSpec::FusedAllReduceResidualRmsNorm(fused_all_reduce_residual_rms_norm()),
             OpSpec::Nccl(nccl()),
             OpSpec::P2P(p2p()),
             OpSpec::Vision(vision()),
@@ -513,6 +527,7 @@ mod tests {
                 | OpSpec::Moe(_)
                 | OpSpec::MoeDispatch(_)
                 | OpSpec::CustomAllReduce(_)
+                | OpSpec::FusedAllReduceResidualRmsNorm(_)
                 | OpSpec::Nccl(_)
                 | OpSpec::P2P(_)
                 | OpSpec::Vision(_)

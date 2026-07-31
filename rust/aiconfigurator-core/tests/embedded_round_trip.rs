@@ -104,19 +104,21 @@ fn embedded_build_then_pure_rust_predict() {
         "b200_sxm",
         "vllm",
         Some("0.19.0"),
-        8,    // tp_size
-        1,    // pp_size
-        1,    // attention_dp_size
+        8,       // tp_size
+        1,       // pp_size
+        1,       // attention_dp_size
         Some(1), // moe_tp_size
         Some(8), // moe_ep_size
-        None, // gemm_quant_mode (inferred by compile_engine)
-        None, // moe_quant_mode
-        None, // kvcache_quant_mode
-        None, // fmha_quant_mode
-        None, // comm_quant_mode
-        0,    // nextn
-        None, // nextn_accept_rates
-        None, // kv_block_size
+        None,    // gemm_quant_mode (inferred by compile_engine)
+        None,    // moe_quant_mode
+        None,    // kvcache_quant_mode
+        None,    // mla_module_kvcache_quant_mode
+        None,    // fmha_quant_mode
+        None,    // comm_quant_mode
+        None,    // workload_distribution
+        0,       // nextn
+        None,    // nextn_accept_rates
+        None,    // kv_block_size
         systems_root().to_str(),
     )
     .expect("build_aic_engine must succeed end-to-end");
