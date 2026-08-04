@@ -1,0 +1,282 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unit tests for sweep.py helpers and sweep_disagg placeholder.
+
+Sweep output correctness is validated by the integration parity test
+(``tests/integration/test_task_v1_v2_parity.py``) against the legacy CLI path;
+the unit coverage here targets local control flow and terminal classification.
+"""
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from aiconfigurator.sdk import config, sweep
+from aiconfigurator.sdk.errors import (
+    InsufficientMemoryError,
+    KVCacheCapacityError,
+    NoFeasibleConfigError,
+)
+from aiconfigurator.sdk.sweep import (
+    _DEFAULT_AGG_BATCH_SCHEDULE,
+    _agg_ctx_tokens_list,
+    sweep_disagg,
+)
+
+pytestmark = pytest.mark.unit
+
+
+# ---------------------------------------------------------------------------
+# _agg_ctx_tokens_list — parity with legacy base_backend._get_ctx_tokens_list_for_agg_sweep
+# ---------------------------------------------------------------------------
+
+
+def _legacy_ctx_tokens_list(isl: int, ctx_stride: int, enable_chunked_prefill: bool) -> list[int]:
+    """Wrap the legacy helper on BaseBackend for parity comparison."""
+    from aiconfigurator.sdk.backends.factory import get_backend
+
+    legacy = get_backend("trtllm")  # any backend exposes the helper, it's on BaseBackend
+    return legacy._get_ctx_tokens_list_for_agg_sweep(
+        isl=isl,
+        ctx_stride=ctx_stride,
+        enable_chunked_prefill=enable_chunked_prefill,
+    )
+
+
+@pytest.mark.parametrize("isl", [1024, 2048, 4000, 8000, 16384])
+@pytest.mark.parametrize("ctx_stride", [128, 256, 512, 1024])
+@pytest.mark.parametrize("enable_chunked_prefill", [True, False])
+def test_agg_ctx_tokens_list_matches_legacy(isl, ctx_stride, enable_chunked_prefill):
+    new = _agg_ctx_tokens_list(isl, ctx_stride, enable_chunked_prefill)
+    old = _legacy_ctx_tokens_list(isl, ctx_stride, enable_chunked_prefill)
+    assert new == old, (
+        f"Mismatch for isl={isl}, ctx_stride={ctx_stride}, "
+        f"enable_chunked_prefill={enable_chunked_prefill}\nnew={new}\nold={old}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Batch schedule shape
+# ---------------------------------------------------------------------------
+
+
+def test_default_agg_batch_schedule_is_monotonic_and_capped():
+    assert sorted(_DEFAULT_AGG_BATCH_SCHEDULE) == _DEFAULT_AGG_BATCH_SCHEDULE
+    assert _DEFAULT_AGG_BATCH_SCHEDULE[0] == 1
+    assert _DEFAULT_AGG_BATCH_SCHEDULE[-1] == 1024
+
+
+# ---------------------------------------------------------------------------
+# sweep_agg no-result classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("memory_states", "expected_error"),
+    [
+        ([(True, False), (True, False)], InsufficientMemoryError),
+        ([(False, True), (True, False)], KVCacheCapacityError),
+        ([(False, False), (True, False)], NoFeasibleConfigError),
+    ],
+)
+def test_sweep_agg_classifies_no_result_outcomes(monkeypatch, memory_states, expected_error):
+    summaries = []
+    for model_oom, kv_cache_oom in memory_states:
+        summary = MagicMock()
+        summary.check_oom.return_value = model_oom
+        summary.check_kv_cache_oom.return_value = kv_cache_oom
+        summary.get_result_dict.return_value = {"ttft": 2.0, "tpot": 2.0}
+        summaries.append(summary)
+
+    monkeypatch.setattr(sweep, "get_backend", lambda _backend_name: MagicMock())
+    monkeypatch.setattr(sweep, "get_model", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(sweep, "predict_agg_worker", MagicMock(side_effect=summaries))
+
+    with pytest.raises(expected_error):
+        sweep.sweep_agg(
+            model_path="test-model",
+            runtime_config=config.RuntimeConfig(isl=1024, osl=1, ttft=1.0, tpot=1.0),
+            database=MagicMock(),
+            backend_name="trtllm",
+            model_config=config.ModelConfig(),
+            parallel_config_list=[(1, 1, 1, 1, 1, 1), (2, 1, 1, 2, 1, 1)],
+            max_batch_size=1,
+            ctx_stride=1024,
+        )
+
+
+def test_sweep_agg_point_config_preserves_multimodal_fields(monkeypatch):
+    """Regression for NVBug 6401839: the agg per-batch RuntimeConfig must carry
+    every multimodal field from the base runtime_config. The old field-by-field
+    construction dropped image_height/width, num_images_per_request, and
+    num_image_tokens, zeroing the image encoder workload in agg while disagg
+    (which deep-copies) stayed correct."""
+    captured: list[config.RuntimeConfig] = []
+
+    def _record(*, runtime_config, **_kwargs):
+        captured.append(runtime_config)
+        summary = MagicMock()
+        summary.check_oom.return_value = False
+        summary.check_kv_cache_oom.return_value = False
+        summary.get_result_dict.return_value = {"ttft": 1.0, "tpot": 1.0}
+        summary.get_per_ops_source.return_value = {}
+        return summary
+
+    monkeypatch.setattr(sweep, "get_backend", lambda _backend_name: MagicMock())
+    monkeypatch.setattr(sweep, "get_model", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(sweep, "predict_agg_worker", _record)
+
+    base_rt = config.RuntimeConfig(
+        isl=256,
+        osl=256,
+        ttft=1e9,
+        tpot=1e9,
+        image_height=1024,
+        image_width=1024,
+        num_images_per_request=2,
+        num_image_tokens=333,
+        seq_imbalance_correction_scale=1.5,
+        engine_step_backend="rust",
+    )
+
+    sweep.sweep_agg(
+        model_path="test-model",
+        runtime_config=base_rt,
+        database=MagicMock(),
+        backend_name="trtllm",
+        model_config=config.ModelConfig(),
+        parallel_config_list=[(1, 1, 1, 1, 1, 1)],
+        max_batch_size=1,
+        ctx_stride=1024,
+    )
+
+    assert captured, "expected at least one agg point to be evaluated"
+    for point_rt in captured:
+        assert point_rt.image_height == 1024
+        assert point_rt.image_width == 1024
+        assert point_rt.num_images_per_request == 2
+        assert point_rt.num_image_tokens == 333
+        # Non-multimodal fields must survive too (the deep-copy carries them all).
+        assert point_rt.seq_imbalance_correction_scale == 1.5
+        assert point_rt.engine_step_backend == "rust"
+        assert point_rt.batch_size == 1
+
+
+def test_sweep_agg_disables_gen_dedup_for_speculative_schedules(monkeypatch):
+    """The capped-gen dedup key assumes the non-speculative schedule; under
+    fractional decode iterations it merges batches whose real backend
+    schedules differ (e.g. vLLM runs b - ceil(ctx/isl) decode requests, which
+    distinguishes b=5 from the batch its capped key collides with). With an
+    active profile every guard-passing point must therefore be evaluated,
+    while an inactive profile must reproduce the legacy point set exactly."""
+    from aiconfigurator.sdk.speculative import SpeculativeDecodingProfile
+
+    def _run(profile):
+        points: list[tuple[int, int]] = []
+
+        def _record(*, runtime_config, ctx_tokens, **_kwargs):
+            points.append((runtime_config.batch_size, ctx_tokens))
+            summary = MagicMock()
+            summary.check_oom.return_value = False
+            summary.check_kv_cache_oom.return_value = False
+            summary.get_result_dict.return_value = {"ttft": 1.0, "tpot": 1.0}
+            summary.get_per_ops_source.return_value = {}
+            return summary
+
+        monkeypatch.setattr(sweep, "predict_agg_worker", _record)
+        sweep._sweep_one_parallel_agg(
+            model=MagicMock(),
+            backend=MagicMock(),
+            database=MagicMock(),
+            runtime_config=config.RuntimeConfig(isl=1024, osl=4, ttft=1e9, tpot=1e9),
+            top_k=0,
+            max_batch_size=64,
+            ctx_stride=512,
+            enable_chunked_prefill=False,
+            free_gpu_memory_fraction=None,
+            max_seq_len=None,
+            speculative_profile=profile,
+        )
+        return points
+
+    baseline = _run(None)
+    inactive = _run(SpeculativeDecodingProfile(0.0))
+    speculative = _run(SpeculativeDecodingProfile(1.0))  # progress = 2.0
+
+    assert inactive == baseline
+    # No dedup under speculation: the baseline's evaluated points are a strict
+    # subset (dedup only ever removes points, and at osl=4 it removes some).
+    assert set(baseline) < set(speculative)
+    # Hand-checked point the legacy key drops: at isl=ctx_tokens=1024, b=6
+    # gives balance 6/4 = 1.5 -> capped gen 6//1.5 = 4, colliding with b=5's
+    # group (5//1.25 = 4), so the baseline dedups it away; with speculation
+    # active it must be evaluated.
+    assert (6, 1024) not in baseline
+    assert (6, 1024) in speculative
+    assert len(speculative) == len(set(speculative))
+
+
+# ---------------------------------------------------------------------------
+# sweep_disagg validation
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_disagg_rejects_invalid_max_prefill_gpus():
+    with pytest.raises(ValueError, match="max_prefill_gpus must be > 0"):
+        sweep_disagg(
+            model_path="x",
+            runtime_config=None,
+            prefill_database=None,
+            prefill_backend_name="trtllm",
+            prefill_model_config=None,
+            prefill_parallel_config_list=[],
+            prefill_latency_correction=1.0,
+            decode_database=None,
+            decode_backend_name="trtllm",
+            decode_model_config=None,
+            decode_parallel_config_list=[],
+            decode_latency_correction=1.0,
+            max_prefill_gpus=0,
+        )
+
+
+def test_sweep_disagg_rejects_invalid_max_decode_gpus():
+    with pytest.raises(ValueError, match="max_decode_gpus must be > 0"):
+        sweep_disagg(
+            model_path="x",
+            runtime_config=None,
+            prefill_database=None,
+            prefill_backend_name="trtllm",
+            prefill_model_config=None,
+            prefill_parallel_config_list=[],
+            prefill_latency_correction=1.0,
+            decode_database=None,
+            decode_backend_name="trtllm",
+            decode_model_config=None,
+            decode_parallel_config_list=[],
+            decode_latency_correction=1.0,
+            max_decode_gpus=-5,
+        )
+
+
+def test_sweep_disagg_rejects_empty_num_worker_lists():
+    """Empty worker lists silently skipped the rate-match inner loop in earlier
+    versions; now fail loud to avoid surprising zero-result sweeps."""
+    with pytest.raises(ValueError, match="non-empty prefill_num_worker_list and decode_num_worker_list"):
+        sweep_disagg(
+            model_path="x",
+            runtime_config=None,
+            prefill_database=None,
+            prefill_backend_name="trtllm",
+            prefill_model_config=None,
+            prefill_parallel_config_list=[],
+            prefill_latency_correction=1.0,
+            decode_database=None,
+            decode_backend_name="trtllm",
+            decode_model_config=None,
+            decode_parallel_config_list=[],
+            decode_latency_correction=1.0,
+            prefill_num_worker_list=[],
+            decode_num_worker_list=[1, 2, 4],
+        )

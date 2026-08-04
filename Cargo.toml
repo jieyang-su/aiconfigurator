@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+members = [
+  "aic-core/rust/aiconfigurator-core",
+  "aic-core/rust/tests/public-api",
+]
+resolver = "2"
