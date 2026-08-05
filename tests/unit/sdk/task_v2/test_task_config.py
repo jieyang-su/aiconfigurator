@@ -344,6 +344,35 @@ def test_sweep_agg_kwargs_shape():
     assert len(kwargs["parallel_config_list"]) > 0
 
 
+def test_analytical_config_flows_into_database_view():
+    t = Task(
+        serving_mode="agg",
+        model_path="meta-llama/Meta-Llama-3.1-8B",
+        system_name="h100_sxm",
+        backend_name="sglang",
+        database_mode="ANALYTICAL",
+        analytical_level="high",
+        analytical_fp8_gemm_recipe="deepgemm-hopper",
+        analytical_attention_algorithm="fa3",
+        analytical_communication_mode="silicon",
+        analytical_moe_dispatch_dtype="fp8",
+        analytical_moe_combine_dtype="half",
+        analytical_wideep_dispatch_dtype="fp8",
+        analytical_wideep_combine_dtype="half",
+    )
+
+    database = t._load_database("h100_sxm", "sglang", t.backend_version)
+    config = database._analytical_config
+    assert config.level == "high"
+    assert config.fp8_gemm_recipe == "deepgemm-hopper"
+    assert config.attention_algorithm == "fa3"
+    assert config.communication_mode == "silicon"
+    assert config.moe_dispatch_dtype == "fp8"
+    assert config.moe_combine_dtype == "half"
+    assert config.wideep_dispatch_dtype == "fp8"
+    assert config.wideep_combine_dtype == "half"
+
+
 def test_sweep_disagg_kwargs_shape():
     t = Task(
         serving_mode="disagg",

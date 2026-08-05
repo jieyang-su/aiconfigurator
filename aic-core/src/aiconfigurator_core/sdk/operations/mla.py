@@ -220,6 +220,30 @@ class ContextMLA(Operation):
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            import math
+
+            from aiconfigurator_core.sdk.kernelsim.analytical import mla_latency_ms
+
+            if kvcache_quant_mode == common.KVCacheQuantMode.fp8 or fmha_quant_mode == common.FMHAQuantMode.fp8:
+                raise ValueError("ANALYTICAL MLA supports BF16 only; FP8 MLA is intentionally unsupported")
+            if s <= 0:
+                return PerformanceResult(0.0, energy=0.0, source="analytical")
+            return PerformanceResult(
+                mla_latency_ms(
+                    system=database.system,
+                    gpu=database.system_spec["gpu"],
+                    phase="prefill",
+                    batch=b,
+                    query_length=math.ceil(s),
+                    sequence_length=math.ceil(s + prefix),
+                    local_heads=num_heads,
+                    dtype="bf16",
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
+            )
 
         cls.load_data(database)
         data_wrapper = database._context_mla_data
@@ -438,6 +462,28 @@ class GenerationMLA(Operation):
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(b, s, num_heads, kvcache_quant_mode)
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            import math
+
+            from aiconfigurator_core.sdk.kernelsim.analytical import mla_latency_ms
+
+            if kvcache_quant_mode == common.KVCacheQuantMode.fp8:
+                raise ValueError("ANALYTICAL MLA supports BF16 only; FP8 MLA is intentionally unsupported")
+            return PerformanceResult(
+                mla_latency_ms(
+                    system=database.system,
+                    gpu=database.system_spec["gpu"],
+                    phase="decode",
+                    batch=b,
+                    query_length=1,
+                    sequence_length=max(1, math.ceil(s)),
+                    local_heads=num_heads,
+                    dtype="bf16",
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
+            )
 
         cls.load_data(database)
         data_wrapper = database._generation_mla_data
@@ -602,6 +648,25 @@ class MLABmm(Operation):
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(num_tokens, num_heads, quant_mode, if_pre)
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            from aiconfigurator_core.sdk.kernelsim.analytical import bmm_latency_ms
+
+            gpu = database.system_spec["gpu"]
+            is_fp8 = quant_mode != common.GEMMQuantMode.bfloat16
+            peak = gpu["fp8_tc_flops"] if is_fp8 else gpu["bfloat16_tc_flops"]
+            return PerformanceResult(
+                bmm_latency_ms(
+                    num_tokens=num_tokens,
+                    num_heads=num_heads,
+                    if_pre=if_pre,
+                    dtype="fp8" if is_fp8 else "bf16",
+                    peak_flops_s=peak,
+                    mem_bandwidth_bytes_s=gpu["mem_bw"],
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
+            )
 
         cls.load_data(database)
         data_wrapper = database._mla_bmm_data

@@ -1032,12 +1032,14 @@ def _cached_configured_database_view(
     root_template: PerfDatabase,
     mode: common.DatabaseMode,
     policy: frozenset[common.TransferKind],
+    analytical_config,
 ) -> PerfDatabase:
     """Build one lightweight immutable query view per normalized configuration."""
     view = copy.copy(root_template)
     view._root_database_template = root_template
     view._default_database_mode = mode
     view._transfer_policy = policy
+    view._analytical_config = analytical_config
     view._is_query_view = True
 
     # Lazy support resolution binds loaded op tables onto its database. Rebind
@@ -1059,6 +1061,7 @@ def _get_configured_database_view(
     mode: str | common.DatabaseMode | None,
     transfer_policy=None,
     shared_layer: bool | None = None,
+    analytical_config=None,
 ) -> PerfDatabase:
     """Return a cached configured copy rooted at the original data template."""
     normalized_mode = _normalize_database_mode(mode)
@@ -1073,7 +1076,15 @@ def _get_configured_database_view(
             "so the correct data template is selected."
         )
 
-    return _cached_configured_database_view(root_template, normalized_mode, policy)
+    from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig, warn_backend_compatibility
+
+    config = analytical_config or AnalyticalConfig()
+    if not isinstance(config, AnalyticalConfig):
+        config = AnalyticalConfig(**config)
+    view = _cached_configured_database_view(root_template, normalized_mode, policy, config)
+    if normalized_mode == common.DatabaseMode.ANALYTICAL:
+        warn_backend_compatibility(view.backend)
+    return view
 
 
 def get_database_view(
@@ -1086,6 +1097,7 @@ def get_database_view(
     transfer_policy=None,
     shared_layer: bool | None = None,
     strict_provenance: bool | None = None,
+    analytical_config=None,
 ) -> PerfDatabase | None:
     """Return an isolated, lightweight query view over a cached database.
 
@@ -1116,7 +1128,13 @@ def get_database_view(
     database = get_database(**database_kwargs)
     if database is None:
         return None
-    return _get_configured_database_view(database, mode, transfer_policy, shared_layer=shared_layer)
+    return _get_configured_database_view(
+        database,
+        mode,
+        transfer_policy,
+        shared_layer=shared_layer,
+        analytical_config=analytical_config,
+    )
 
 
 DatabaseRef = tuple[str, str, str, str]
@@ -2041,6 +2059,9 @@ class PerfDatabase:
         with open(os.path.join(systems_root, system + ".yaml")) as f:
             self.system_spec = SystemSpec(yaml.load(f, Loader=yaml.SafeLoader))
         self._default_database_mode = common.DatabaseMode.SILICON  # default mode is SILICON
+        from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig
+
+        self._analytical_config = AnalyticalConfig()
 
         # Manifest entries grouped by op_file. Used by ``_build_op_sources``
         # (lazy-load path inside each op class) to discover which sibling
@@ -3056,6 +3077,8 @@ class PerfDatabase:
         num_experts: int,
         topk: int,
         hidden_size: int,
+        dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
+        combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
         database_mode: common.DatabaseMode | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Delegates to ``MoEDispatch``; see
@@ -3069,6 +3092,8 @@ class PerfDatabase:
             num_experts=num_experts,
             topk=topk,
             hidden_size=hidden_size,
+            dispatch_dtype=dispatch_dtype,
+            combine_dtype=combine_dtype,
             database_mode=database_mode,
         )
 
@@ -3081,6 +3106,8 @@ class PerfDatabase:
         topk: int,
         hidden_size: int,
         sms: int,
+        dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
+        combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
         database_mode: common.DatabaseMode | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Delegates to ``MoEDispatch``; see
@@ -3095,6 +3122,8 @@ class PerfDatabase:
             topk=topk,
             hidden_size=hidden_size,
             sms=sms,
+            dispatch_dtype=dispatch_dtype,
+            combine_dtype=combine_dtype,
             database_mode=database_mode,
         )
 

@@ -249,7 +249,21 @@ def _validate_model_path(model_path: str) -> str:
         ) from e
 
 
+def _add_analytical_arguments(parser):
+    parser.add_argument("--analytical-level", choices=["standard", "low", "high"], default="standard")
+    parser.add_argument(
+        "--analytical-fp8-gemm-recipe",
+        choices=["sglang", "deepgemm-hopper", "deepgemm-blackwell"],
+        default="sglang",
+    )
+    parser.add_argument("--analytical-attention-algorithm", choices=["fa2", "fa3"], default="fa2")
+    parser.add_argument("--analytical-communication-mode", choices=["empirical", "silicon"], default="empirical")
+    for phase in ("moe-dispatch", "moe-combine", "wideep-dispatch", "wideep-combine"):
+        parser.add_argument(f"--analytical-{phase}-dtype", choices=["half", "fp8", "int8"], default="half")
+
+
 def _add_default_mode_arguments(parser):
+    _add_analytical_arguments(parser)
     parser.add_argument(
         "--model-path",
         "--model",
@@ -458,6 +472,7 @@ def _add_default_mode_arguments(parser):
 
 
 def _add_recommend_mode_arguments(parser):
+    _add_analytical_arguments(parser)
     parser.add_argument(
         "--model-path",
         "--model",
@@ -679,6 +694,7 @@ def _add_generate_mode_arguments(parser):
 
 
 def _add_estimate_mode_arguments(parser):
+    _add_analytical_arguments(parser)
     """Add arguments for the estimate mode (single-point TTFT/TPOT/power estimation)."""
     parser.add_argument(
         "--model-path",
@@ -1422,6 +1438,14 @@ def build_default_tasks(
     backend_version: str | None = None,
     database_mode: str = "SILICON",
     transfer_policy: str | list | None = None,
+    analytical_level: str = "standard",
+    analytical_fp8_gemm_recipe: str = "sglang",
+    analytical_attention_algorithm: str = "fa2",
+    analytical_communication_mode: str = "empirical",
+    analytical_moe_dispatch_dtype: str = "half",
+    analytical_moe_combine_dtype: str = "half",
+    analytical_wideep_dispatch_dtype: str = "half",
+    analytical_wideep_combine_dtype: str = "half",
     isl: int = 4000,
     osl: int = 1000,
     image_height: int = 0,
@@ -1583,6 +1607,14 @@ def build_default_tasks(
         "total_gpus": total_gpus,
         "database_mode": database_mode,
         "transfer_policy": transfer_policy,
+        "analytical_level": analytical_level,
+        "analytical_fp8_gemm_recipe": analytical_fp8_gemm_recipe,
+        "analytical_attention_algorithm": analytical_attention_algorithm,
+        "analytical_communication_mode": analytical_communication_mode,
+        "analytical_moe_dispatch_dtype": analytical_moe_dispatch_dtype,
+        "analytical_moe_combine_dtype": analytical_moe_combine_dtype,
+        "analytical_wideep_dispatch_dtype": analytical_wideep_dispatch_dtype,
+        "analytical_wideep_combine_dtype": analytical_wideep_combine_dtype,
         "free_gpu_memory_fraction": free_gpu_memory_fraction,
         "max_seq_len": max_seq_len,
         "engine_step_backend": engine_step_backend,
@@ -2320,6 +2352,14 @@ def _run_estimate_mode(args):
         backend_version=args.backend_version,
         database_mode=args.database_mode,
         transfer_policy=args.transfer_policy,
+        analytical_level=args.analytical_level,
+        analytical_fp8_gemm_recipe=args.analytical_fp8_gemm_recipe,
+        analytical_attention_algorithm=args.analytical_attention_algorithm,
+        analytical_communication_mode=args.analytical_communication_mode,
+        analytical_moe_dispatch_dtype=args.analytical_moe_dispatch_dtype,
+        analytical_moe_combine_dtype=args.analytical_moe_combine_dtype,
+        analytical_wideep_dispatch_dtype=args.analytical_wideep_dispatch_dtype,
+        analytical_wideep_combine_dtype=args.analytical_wideep_combine_dtype,
         isl=args.isl,
         osl=args.osl,
         image_height=args.image_height,
@@ -2621,6 +2661,14 @@ def _run_recommend(args) -> None:
             backend_version=args.backend_version,
             database_mode=args.database_mode,
             transfer_policy=args.transfer_policy,
+            analytical_level=args.analytical_level,
+            analytical_fp8_gemm_recipe=args.analytical_fp8_gemm_recipe,
+            analytical_attention_algorithm=args.analytical_attention_algorithm,
+            analytical_communication_mode=args.analytical_communication_mode,
+            analytical_moe_dispatch_dtype=args.analytical_moe_dispatch_dtype,
+            analytical_moe_combine_dtype=args.analytical_moe_combine_dtype,
+            analytical_wideep_dispatch_dtype=args.analytical_wideep_dispatch_dtype,
+            analytical_wideep_combine_dtype=args.analytical_wideep_combine_dtype,
             isl=args.isl,
             osl=args.osl,
             image_height=args.image_height,
@@ -2774,6 +2822,14 @@ def main(args):
             backend_version=args.backend_version,
             database_mode=args.database_mode,
             transfer_policy=args.transfer_policy,
+            analytical_level=args.analytical_level,
+            analytical_fp8_gemm_recipe=args.analytical_fp8_gemm_recipe,
+            analytical_attention_algorithm=args.analytical_attention_algorithm,
+            analytical_communication_mode=args.analytical_communication_mode,
+            analytical_moe_dispatch_dtype=args.analytical_moe_dispatch_dtype,
+            analytical_moe_combine_dtype=args.analytical_moe_combine_dtype,
+            analytical_wideep_dispatch_dtype=args.analytical_wideep_dispatch_dtype,
+            analytical_wideep_combine_dtype=args.analytical_wideep_combine_dtype,
             isl=args.isl,
             osl=args.osl,
             image_height=args.image_height,

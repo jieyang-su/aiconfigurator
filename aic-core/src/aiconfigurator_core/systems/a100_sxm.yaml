@@ -11,6 +11,12 @@ gpu:
   int8_tc_flops: 624000000000000 # 624TFLOPS
   power: 400  # Watt
   sm_version: 80
+  sm_count: 108
+  clock_hz: 1410000000
+  shared_memory_per_sm_bytes: 196608
+  l2_capacity_bytes: 41943040
+  l2_bandwidth_bytes_s: 7219200000000
+  vector_peak_flops: 77967360000000
 
 node:
   num_gpus_per_node: 8

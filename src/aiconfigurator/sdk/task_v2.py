@@ -343,6 +343,14 @@ class Task:
     request_latency: float | None = None
     total_gpus: int | None = None
     database_mode: str | None = None
+    analytical_level: str = "standard"
+    analytical_fp8_gemm_recipe: str = "sglang"
+    analytical_attention_algorithm: str = "fa2"
+    analytical_communication_mode: str = "empirical"
+    analytical_moe_dispatch_dtype: str = "half"
+    analytical_moe_combine_dtype: str = "half"
+    analytical_wideep_dispatch_dtype: str = "half"
+    analytical_wideep_combine_dtype: str = "half"
     # Fine-grained HYBRID/EMPIRICAL transfer control: which empirical transfer kinds are
     # permitted (see common.TransferKind). None = all (default). Accepts a preset name
     # ("conservative"/"balanced"/"aggressive"/"off"), a kind ("xshape"), or a list thereof.
@@ -1551,6 +1559,18 @@ class Task:
         from aiconfigurator.sdk.perf_database import get_database_view
 
         allow_missing = self.database_mode is not None and self.database_mode != common.DatabaseMode.SILICON.name
+        analytical_config = None
+        if (self.database_mode or "").upper() == common.DatabaseMode.ANALYTICAL.name:
+            analytical_config = {
+                "level": self.analytical_level,
+                "fp8_gemm_recipe": self.analytical_fp8_gemm_recipe,
+                "attention_algorithm": self.analytical_attention_algorithm,
+                "communication_mode": self.analytical_communication_mode,
+                "moe_dispatch_dtype": self.analytical_moe_dispatch_dtype,
+                "moe_combine_dtype": self.analytical_moe_combine_dtype,
+                "wideep_dispatch_dtype": self.analytical_wideep_dispatch_dtype,
+                "wideep_combine_dtype": self.analytical_wideep_combine_dtype,
+            }
         return get_database_view(
             system,
             backend,
@@ -1558,6 +1578,7 @@ class Task:
             allow_missing_data=allow_missing,
             database_mode=self.database_mode,
             transfer_policy=self.transfer_policy,
+            analytical_config=analytical_config,
         )
 
     def run(self, *, autoscale: bool = False, validate: bool = True):
