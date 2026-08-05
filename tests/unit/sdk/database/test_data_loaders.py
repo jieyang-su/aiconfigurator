@@ -1025,7 +1025,7 @@ def test_load_context_mla_module_data_nonexistent(tmp_path):
 def test_load_context_mla_module_data_basic(tmp_path):
     """
     Test loading context MLA module data.
-    Structure: data[fmha_quant_mode][kv_cache_quant_mode][gemm_quant_mode][num_heads][s][b]
+    Structure: data[fmha][kv][gemm][num_heads][prefix][fresh_s][batch]
     """
     csv_file = tmp_path / "mla_context_module_perf.txt"
     headers = (
@@ -1048,9 +1048,29 @@ def test_load_context_mla_module_data_basic(tmp_path):
     assert kv in data[fmha]
     assert gemm in data[fmha][kv]
     assert 16 in data[fmha][kv][gemm]  # num_heads
-    assert 4000 in data[fmha][kv][gemm][16]  # s = isl (step=0)
-    assert 2 in data[fmha][kv][gemm][16][4000]  # b
-    assert data[fmha][kv][gemm][16][4000][2]["latency"] == pytest.approx(1.5)
+    assert 0 in data[fmha][kv][gemm][16]
+    assert 4000 in data[fmha][kv][gemm][16][0]
+    assert 2 in data[fmha][kv][gemm][16][0][4000]
+    assert data[fmha][kv][gemm][16][0][4000][2]["latency"] == pytest.approx(1.5)
+
+
+def test_load_context_mla_module_data_preserves_prefix_axis(tmp_path):
+    csv_file = tmp_path / "mla_context_module_perf.txt"
+    headers = (
+        "framework,version,device,op_name,kernel_source,model,architecture,"
+        "mla_dtype,kv_cache_dtype,gemm_type,num_heads,batch_size,isl,tp_size,step,latency\n"
+    )
+    rows = [
+        "VLLM,0.17.0,NVIDIA B200,mla_context_module,default,deepseek-ai/DeepSeek-V3,"
+        f"DeepseekV3ForCausalLM,bfloat16,bfloat16,bfloat16,16,2,64,1,{prefix},{latency}\n"
+        for prefix, latency in ((0, 0.1), (128, 0.3))
+    ]
+    csv_file.write_text(headers + "".join(rows))
+
+    data = load_context_mla_module_data(str(csv_file))
+    per_head = data[FMHAQuantMode.bfloat16][KVCacheQuantMode.bfloat16][GEMMQuantMode.bfloat16][16]
+    assert per_head[0][64][2]["latency"] == pytest.approx(0.1)
+    assert per_head[128][64][2]["latency"] == pytest.approx(0.3)
 
 
 def test_load_context_mla_module_data_with_power(tmp_path):
@@ -1067,7 +1087,7 @@ def test_load_context_mla_module_data_with_power(tmp_path):
     csv_file.write_text(headers + row)
 
     data = load_context_mla_module_data(str(csv_file))
-    entry = data[FMHAQuantMode.bfloat16][KVCacheQuantMode.bfloat16][GEMMQuantMode.bfloat16][128][1024][1]
+    entry = data[FMHAQuantMode.bfloat16][KVCacheQuantMode.bfloat16][GEMMQuantMode.bfloat16][128][0][1024][1]
     assert entry["latency"] == pytest.approx(0.5)
     assert entry["power"] == pytest.approx(800.0)
     assert entry["energy"] == pytest.approx(400.0)  # 800 * 0.5

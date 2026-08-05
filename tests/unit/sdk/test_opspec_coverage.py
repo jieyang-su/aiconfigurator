@@ -36,6 +36,11 @@ EXEMPT: dict[str, str] = {
     "AFDCombine": "AFD orchestration is Python-side; op-list FFI planned",
     "AFDFAllGather": "AFD orchestration is Python-side; op-list FFI planned",
     "AFDFReduceScatter": "AFD orchestration is Python-side; op-list FFI planned",
+    # Prefix-aware SGLang MLA prefill currently stays on the Python engine.
+    # Porting only these leaf ops would be unsafe: the compiled path must also
+    # gain the four-axis module table and silicon-primary-only fallback policy.
+    "ContextKVBProjGEMM": "SGLang prefix/full-K semantics await an atomic Rust MLA parity port",
+    "MLAConcatK": "SGLang prefix/full-K semantics await an atomic Rust MLA parity port",
     # Dead class: no model instantiates it (Mamba2Kernel is the live op and
     # converts). Remove the class or this entry together.
     "Mamba2": "dead code — never instantiated; Mamba2Kernel is the live op",

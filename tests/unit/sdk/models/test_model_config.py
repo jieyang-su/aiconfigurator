@@ -1168,6 +1168,55 @@ class TestDeepSeekTPAllReduce:
         assert not any(op._name == "context_tp_allreduce" for op in model.context_ops)
 
 
+class TestDeepSeekMLAPrefixSemantics:
+    @staticmethod
+    def _build(backend: str):
+        model_config = config.ModelConfig(
+            tp_size=4,
+            pp_size=1,
+            moe_tp_size=1,
+            moe_ep_size=4,
+            attention_dp_size=1,
+        )
+        return models.get_model("deepseek-ai/DeepSeek-V3", model_config, backend_name=backend)
+
+    def test_downscale_is_outside_context_and_generation_fallbacks(self):
+        model = self._build("sglang")
+        context_names = [op._name for op in model.context_ops]
+        generation_names = [op._name for op in model.generation_ops]
+        assert context_names.count("context_downscale_gemm") == 1
+        assert generation_names.count("generation_downscale_gemm") == 1
+
+        context_block = next(op for op in model.context_ops if op._name == "context_mla_block")
+        generation_block = next(op for op in model.generation_ops if op._name == "generation_mla_block")
+        assert all(op._name != "context_downscale_gemm" for op in context_block._fallback)
+        assert all(op._name != "generation_downscale_gemm" for op in generation_block._fallback)
+        assert context_block._silicon_primary_only
+        assert generation_block._silicon_primary_only
+
+    def test_sglang_granular_has_prefix_kv_projection_and_concat(self):
+        model = self._build("sglang")
+        block = next(op for op in model.context_ops if op._name == "context_mla_block")
+        names = [op._name for op in block._fallback]
+        assert names == [
+            "context_q_b_proj_gemm",
+            "context_kv_b_proj_gemm",
+            "context_mla_concat_k",
+            "context_attention",
+            "context_proj_gemm",
+        ]
+        assert isinstance(block._fallback[1], ops.ContextKVBProjGEMM)
+        assert isinstance(block._fallback[2], ops.MLAConcatK)
+
+    @pytest.mark.parametrize("backend", ["vllm", "trtllm"])
+    def test_other_backends_do_not_inherit_sglang_prefix_ops(self, backend):
+        model = self._build(backend)
+        block = next(op for op in model.context_ops if op._name == "context_mla_block")
+        names = [op._name for op in block._fallback]
+        assert "context_mla_concat_k" not in names
+        assert not isinstance(block._fallback[1], ops.ContextKVBProjGEMM)
+
+
 # ── Qwen3VL constants ──────────────────────────────────────────────────────────
 
 _QWEN3VL_ARCH = "Qwen3VLForConditionalGeneration"
@@ -1511,11 +1560,16 @@ class TestMLAModuleQueryKeys:
             fmha_quant_mode=common.FMHAQuantMode.bfloat16,
         )
         model = models.get_model("nvidia/Kimi-K2.5-NVFP4", model_config, backend_name="vllm")
-        for op in model.context_ops:
-            if getattr(op, "_name", "") == "context_mla_block":
-                assert op.get_weights() / (1 << 30) == pytest.approx(11.49, abs=0.05)
-                return
-        raise AssertionError("context_mla_block not found")
+        by_name = {op._name: op for op in model.context_ops}
+        block = by_name["context_mla_block"]
+        downscale = by_name["context_downscale_gemm"]
+
+        # qkv_a/downscale is outside the profiled-module boundary. The wrapper
+        # must exclude it, while the complete attention path still counts it
+        # exactly once.
+        assert block.get_weights() < 11.49 * (1 << 30)
+        total_weights = block.get_weights() + downscale.get_weights()
+        assert total_weights / (1 << 30) == pytest.approx(11.49, abs=0.05)
 
 
 class TestDSV32NVFP4AttentionExclusion:

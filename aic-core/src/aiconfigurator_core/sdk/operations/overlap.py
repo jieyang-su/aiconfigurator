@@ -61,7 +61,15 @@ class FallbackOp(Operation):
 
     _CP_AWARE: ClassVar[bool] = True  # wrapper: inner ops carry their own seq_split
 
-    def __init__(self, name: str, primary: Operation, fallback: list[Operation], *, seq_split: int = 1) -> None:
+    def __init__(
+        self,
+        name: str,
+        primary: Operation,
+        fallback: list[Operation],
+        *,
+        seq_split: int = 1,
+        silicon_primary_only: bool = False,
+    ) -> None:
         """
         Args:
             name: Operation name for latency breakdown reporting.
@@ -70,34 +78,44 @@ class FallbackOp(Operation):
             seq_split: Carried for API uniformity. The wrapper delegates to
                 inner ops which carry their own ``seq_split``; this one is
                 stored on the base class for completeness but not used here.
+            silicon_primary_only: Try the primary only for SILICON/HYBRID.
+                Theoretical modes use the granular sequence directly when the
+                module's SOL does not cover its complete profiled boundary.
         """
         super().__init__(name, 1.0, seq_split=seq_split)  # scale_factor handled by inner ops
         self._primary = primary
         self._fallback = fallback
+        self._silicon_primary_only = silicon_primary_only
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         from aiconfigurator_core.sdk.perf_database import PerfDataNotAvailableError, _get_configured_database_view
 
+        mode = database._default_database_mode
+        use_primary = not self._silicon_primary_only or mode in (
+            common.DatabaseMode.SILICON,
+            common.DatabaseMode.HYBRID,
+        )
         primary_database = (
             _get_configured_database_view(
                 database,
                 common.DatabaseMode.SILICON,
                 getattr(database, "transfer_policy", None),
             )
-            if database._default_database_mode == common.DatabaseMode.HYBRID
+            if mode == common.DatabaseMode.HYBRID
             else database
         )
 
-        try:
-            return self._primary.query(primary_database, **kwargs)
-        except PerfDataNotAvailableError as e:
-            logger.debug(
-                "FallbackOp '%s': primary op '%s' failed (%s: %s), using fallback ops",
-                self._name,
-                self._primary._name,
-                type(e).__name__,
-                e,
-            )
+        if use_primary:
+            try:
+                return self._primary.query(primary_database, **kwargs)
+            except PerfDataNotAvailableError as e:
+                logger.debug(
+                    "FallbackOp '%s': primary op '%s' failed (%s: %s), using fallback ops",
+                    self._name,
+                    self._primary._name,
+                    type(e).__name__,
+                    e,
+                )
 
         total = PerformanceResult(0.0, energy=0.0, source="empirical")
         for op in self._fallback:

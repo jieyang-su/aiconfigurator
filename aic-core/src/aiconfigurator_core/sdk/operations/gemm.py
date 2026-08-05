@@ -827,6 +827,22 @@ class GEMM(Operation):
         return self._weights * self._scale_factor
 
 
+class ContextKVBProjGEMM(GEMM):
+    """SGLang DeepSeek prefill KV projection over fresh and cached tokens."""
+
+    @staticmethod
+    def _prefix_tokens(kwargs: dict) -> int:
+        prefix = kwargs.get("prefix") or 0
+        if isinstance(prefix, (list, tuple)):
+            return int(sum(prefix))
+        return int(kwargs.get("batch_size", 1)) * int(prefix)
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        corrected = dict(kwargs)
+        corrected["x"] = int(corrected.get("x") or 0) + self._prefix_tokens(corrected)
+        return super().query(database, **corrected)
+
+
 # ─────────────────────────────────────────────────────────
 # CSV loaders (moved here from perf_database.py so each op family owns its data + parser)
 # ─────────────────────────────────────────────────────────

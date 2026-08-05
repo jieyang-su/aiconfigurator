@@ -163,6 +163,24 @@ class TestFallbackOp:
         assert result.source == "sol"
         assert mock_db._default_database_mode == common.DatabaseMode.SOL
 
+    @pytest.mark.parametrize("mode", [common.DatabaseMode.SOL, common.DatabaseMode.EMPIRICAL])
+    def test_silicon_only_primary_uses_granular_for_theoretical_modes(self, mode):
+        mock_db = _make_mock_db()
+        mock_db._default_database_mode = mode
+        primary = _make_mock_op(10.0, 100.0)
+        fallback = _make_mock_op(5.0, 50.0)
+
+        result = FallbackOp(
+            "test",
+            primary=primary,
+            fallback=[fallback],
+            silicon_primary_only=True,
+        ).query(mock_db)
+
+        primary.query.assert_not_called()
+        fallback.query.assert_called_once_with(mock_db)
+        assert float(result) == 5.0
+
     def test_get_weights_from_primary(self):
         """get_weights uses primary when it has nonzero weights."""
         primary = _make_mock_op(10.0, 100.0, weights=500.0)

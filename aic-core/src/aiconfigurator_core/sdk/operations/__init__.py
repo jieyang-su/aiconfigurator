@@ -36,12 +36,13 @@ from aiconfigurator_core.sdk.operations.dsv4 import (
 )
 from aiconfigurator_core.sdk.operations.elementwise import ElementWise
 from aiconfigurator_core.sdk.operations.embedding import Embedding
-from aiconfigurator_core.sdk.operations.gemm import GEMM
+from aiconfigurator_core.sdk.operations.gemm import GEMM, ContextKVBProjGEMM
 from aiconfigurator_core.sdk.operations.mamba import GDNKernel, Mamba2, Mamba2Kernel
 from aiconfigurator_core.sdk.operations.mla import (
     ContextMLA,
     GenerationMLA,
     MLABmm,
+    MLAConcatK,
     MLAModule,
     WideEPContextMLA,
     WideEPGenerationMLA,
@@ -66,6 +67,7 @@ __all__ = [
     "ContextAttention",
     "ContextDSAModule",
     "ContextDeepSeekV4AttentionModule",
+    "ContextKVBProjGEMM",
     "ContextMLA",
     "ContextMSAModule",
     "CustomAllReduce",
@@ -82,6 +84,7 @@ __all__ = [
     "GenerationMLA",
     "GenerationMSAModule",
     "MLABmm",
+    "MLAConcatK",
     "MLAModule",
     "Mamba2",
     "Mamba2Kernel",
