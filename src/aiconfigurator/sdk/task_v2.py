@@ -347,6 +347,7 @@ class Task:
     analytical_fp8_gemm_recipe: str = "sglang"
     analytical_attention_algorithm: str = "fa2"
     analytical_communication_mode: str = "empirical"
+    workload_distribution: str = "power_law"
     analytical_moe_dispatch_dtype: str = "half"
     analytical_moe_combine_dtype: str = "half"
     analytical_wideep_dispatch_dtype: str = "half"
@@ -1156,12 +1157,13 @@ class Task:
             # moe_backend / attention_backend / wideep_num_slots are shared across roles
             # (Task has no per-role variant) and fed to ModelConfig so get_model selects the
             # right MoE kernel (deepep_moe / megamoe), MLA attention perf tables (fa3 vs
-            # flashinfer), and EPLB slot count. workload_distribution remains non-configurable
-            # in v2 and ModelConfig's default matches v1's.
+            # flashinfer), EPLB slot count, and the expert-routing workload
+            # distribution used by MoE performance tables.
             moe_backend=self.moe_backend,
             # None means "unspecified" -> fall back to flashinfer (matches v1 and ModelConfig's default).
             attention_backend=self.attention_backend or "flashinfer",
             wideep_num_slots=self.wideep_num_slots,
+            workload_distribution=self.workload_distribution,
         )
 
     def build_speculative_profile(self) -> SpeculativeDecodingProfile:
@@ -1280,6 +1282,13 @@ class Task:
         silently if the DB can't be loaded or for DeepSeek-V4 in synthetic
         modes (where the supported_quant_mode table is incomplete).
         """
+        # ANALYTICAL capability is defined by KernelSim, not by silicon table
+        # presence. Individual analytical adapters fail loud on unsupported
+        # dtypes (for example MLA FP8), so a table-derived precheck would reject
+        # valid granular fallbacks before the model can run.
+        if self.database_mode == common.DatabaseMode.ANALYTICAL.name:
+            return
+
         # DeepSeek-V4 in synthetic database modes: DB's supported_quant_mode
         # list is incomplete; skip entirely (V1 parity).
         if self._model_family == "DEEPSEEKV4" and self.database_mode in (
@@ -1406,11 +1415,16 @@ class Task:
                 _check("moe", moe_mode, profile_transfer=True)
 
         # FMHA: only meaningful for context-using workers (agg, prefill).
-        if validate_context:
+        theoretical_wideep = self._role_attr(role, "enable_wideep") and self.database_mode in (
+            common.DatabaseMode.EMPIRICAL.name,
+            common.DatabaseMode.SOL.name,
+            common.DatabaseMode.SOL_FULL.name,
+        )
+        if validate_context and not theoretical_wideep:
             _check(ctx_op, self._role_attr(role, "fmha_quant_mode"))
 
         # KV cache: only meaningful for generation-using workers (agg, decode).
-        if validate_generation:
+        if validate_generation and not theoretical_wideep:
             _check(gen_op, self._role_attr(role, "kvcache_quant_mode"))
 
     # =====================================================================

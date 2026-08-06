@@ -1229,6 +1229,11 @@ class WideEPDeepSeekModel(BaseModel):
         fmha_quant_mode = self.config.fmha_quant_mode
         moe_quant_mode = self.config.moe_quant_mode
         gemm_quant_mode = self.config.gemm_quant_mode
+        mla_bmm_quant_mode = (
+            common.GEMMQuantMode.fp8
+            if gemm_quant_mode != common.GEMMQuantMode.bfloat16
+            else common.GEMMQuantMode.bfloat16
+        )
         moe_backend = self.config.moe_backend
         attn_backend = self.config.attention_backend
 
@@ -1297,14 +1302,58 @@ class WideEPDeepSeekModel(BaseModel):
                 ops.GEMM(
                     "context_downscale_gemm", self._num_layers, 2112, h, attn_downscale_gemm_quant_mode, seq_split=cp
                 ),  # on every gpu, fused_a
-                ops.WideEPContextMLA(
-                    "context_attention",
-                    self._num_layers,
-                    tp_size,
-                    kvcache_quant_mode,
-                    fmha_quant_mode,
-                    attn_backend,
-                    cp_size=cp,
+                ops.FallbackOp(
+                    "context_attention_module_or_granular",
+                    primary=ops.WideEPContextMLA(
+                        "context_attention",
+                        self._num_layers,
+                        tp_size,
+                        kvcache_quant_mode,
+                        fmha_quant_mode,
+                        attn_backend,
+                        cp_size=cp,
+                    ),
+                    fallback=[
+                        ops.GEMM(
+                            "context_q_b_proj_gemm",
+                            self._num_layers,
+                            self._num_heads * 192 // tp_size,
+                            1536,
+                            gemm_quant_mode,
+                            seq_split=cp,
+                        ),
+                        ops.ContextKVBProjGEMM(
+                            "context_kv_b_proj_gemm",
+                            self._num_layers,
+                            self._num_heads * 256 // tp_size,
+                            512,
+                            gemm_quant_mode,
+                            seq_split=cp,
+                        ),
+                        ops.MLAConcatK(
+                            "context_mla_concat_k",
+                            self._num_layers,
+                            self._num_heads // tp_size,
+                            seq_split=cp,
+                        ),
+                        ops.ContextMLA(
+                            "context_attention_core",
+                            self._num_layers,
+                            128 // tp_size,
+                            kvcache_quant_mode,
+                            fmha_quant_mode,
+                            cp_size=cp,
+                        ),
+                        ops.GEMM(
+                            "context_proj_gemm",
+                            self._num_layers,
+                            h,
+                            self._num_heads * 128 // tp_size,
+                            gemm_quant_mode,
+                            seq_split=cp,
+                        ),
+                    ],
+                    silicon_primary_only=True,
                 ),
                 *self._cp_attn_comm_ops(),
                 *(
@@ -1434,13 +1483,53 @@ class WideEPDeepSeekModel(BaseModel):
                     h,
                     attn_downscale_gemm_quant_mode,
                 ),
-                ops.WideEPGenerationMLA(
-                    "generation_attention",
-                    self._num_layers * self._mtp_scale_factor,
-                    tp_size,
-                    kvcache_quant_mode,
-                    fmha_quant_mode,
-                    attn_backend,
+                ops.FallbackOp(
+                    "generation_attention_module_or_granular",
+                    primary=ops.WideEPGenerationMLA(
+                        "generation_attention",
+                        self._num_layers * self._mtp_scale_factor,
+                        tp_size,
+                        kvcache_quant_mode,
+                        fmha_quant_mode,
+                        attn_backend,
+                    ),
+                    fallback=[
+                        ops.GEMM(
+                            "generation_q_b_proj_gemm",
+                            self._num_layers * self._mtp_scale_factor,
+                            self._num_heads * 192 // tp_size,
+                            1536,
+                            gemm_quant_mode,
+                        ),
+                        ops.MLABmm(
+                            "generation_bmm_pre",
+                            self._num_layers * self._mtp_scale_factor,
+                            self._num_heads // tp_size,
+                            mla_bmm_quant_mode,
+                            if_pre=True,
+                        ),
+                        ops.GenerationMLA(
+                            "generation_attention_core",
+                            self._num_layers * self._mtp_scale_factor,
+                            128 // tp_size,
+                            kvcache_quant_mode,
+                        ),
+                        ops.MLABmm(
+                            "generation_bmm_post",
+                            self._num_layers * self._mtp_scale_factor,
+                            self._num_heads // tp_size,
+                            mla_bmm_quant_mode,
+                            if_pre=False,
+                        ),
+                        ops.GEMM(
+                            "generation_proj_gemm",
+                            self._num_layers * self._mtp_scale_factor,
+                            h,
+                            self._num_heads * 128 // tp_size,
+                            gemm_quant_mode,
+                        ),
+                    ],
+                    silicon_primary_only=True,
                 ),
             ]
         )

@@ -271,6 +271,17 @@ def test_attention_backend_and_wideep_num_slots_reach_model_config():
     assert mc.wideep_num_slots == 288
 
 
+def test_workload_distribution_reaches_model_config():
+    task = Task(
+        serving_mode="agg",
+        model_path="deepseek-ai/DeepSeek-V3",
+        system_name="h100_sxm",
+        workload_distribution="balanced",
+    )
+
+    assert task.build_model_config(role="agg").workload_distribution == "balanced"
+
+
 def test_invalid_attention_backend_rejected():
     t = Task(
         serving_mode="agg", model_path="deepseek-ai/DeepSeek-V3", system_name="h200_sxm", attention_backend="torch"
@@ -371,6 +382,30 @@ def test_analytical_config_flows_into_database_view():
     assert config.moe_combine_dtype == "half"
     assert config.wideep_dispatch_dtype == "fp8"
     assert config.wideep_combine_dtype == "half"
+
+
+def test_analytical_wideep_bf16_mla_is_not_gated_by_silicon_module_table():
+    task = Task(
+        serving_mode="disagg",
+        prefill_model_path="deepseek-ai/DeepSeek-V3",
+        decode_model_path="deepseek-ai/DeepSeek-V3",
+        prefill_system_name="h100_sxm",
+        decode_system_name="h100_sxm",
+        prefill_backend_name="sglang",
+        decode_backend_name="sglang",
+        prefill_backend_version="0.5.10",
+        decode_backend_version="0.5.10",
+        prefill_enable_wideep=True,
+        decode_enable_wideep=True,
+        prefill_fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+        prefill_kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
+        decode_fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+        decode_kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
+        database_mode="ANALYTICAL",
+        total_gpus=32,
+    )
+
+    task.validate()
 
 
 def test_sweep_disagg_kwargs_shape():
