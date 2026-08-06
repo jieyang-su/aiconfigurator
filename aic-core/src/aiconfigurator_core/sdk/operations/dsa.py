@@ -28,6 +28,7 @@ revisits their home.
 from __future__ import annotations
 
 import logging
+import math
 from collections import defaultdict
 from typing import TYPE_CHECKING, ClassVar
 
@@ -1482,6 +1483,174 @@ class GenerationDSAModule(Operation):
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
+
+
+class DSAIndexScore(Operation):
+    """Granular FP8 Index MQA score kernel for DSA producer layers."""
+
+    _CP_AWARE: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        *,
+        layout: str,
+        index_heads: int,
+        index_head_dim: int,
+        index_topk: int,
+        cp_size: int = 1,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._layout = layout
+        self._index_heads = index_heads
+        self._index_head_dim = index_head_dim
+        self._index_topk = index_topk
+        self._cp_size = cp_size
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        batch = int(kwargs.get("batch_size"))
+        sequence = int(kwargs.get("s"))
+        prefix = int(kwargs.get("prefix", 0)) if self._layout == "ragged" else 0
+        full_context = prefix + sequence if self._layout == "ragged" else sequence
+        # SGLang prefill uses the K-only/select-all path below the sparse boundary.
+        if self._layout == "ragged" and full_context <= self._index_topk:
+            return PerformanceResult(0.0, energy=0.0, source="analytical")
+        query_length = math.ceil(sequence / self._cp_size) if self._layout == "ragged" else 1
+        from aiconfigurator_core.sdk.kernelsim.analytical import index_mqa_latency_ms
+
+        latency = index_mqa_latency_ms(
+            gpu=database.system_spec["gpu"],
+            layout=self._layout,
+            batch=batch,
+            query_length=query_length,
+            context_length=full_context,
+            index_heads=self._index_heads,
+            index_head_dim=self._index_head_dim,
+            config=database._analytical_config,
+        )
+        source = "analytical" if database._default_database_mode == common.DatabaseMode.ANALYTICAL else "estimated"
+        return PerformanceResult(latency * self._scale_factor, energy=0.0, source=source)
+
+    def get_weights(self, **kwargs):
+        return 0.0
+
+
+class DSATopKSelect(Operation):
+    """Granular FP32-score TopK and index-transform kernel."""
+
+    _CP_AWARE: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        *,
+        layout: str,
+        index_topk: int,
+        cp_size: int = 1,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._layout = layout
+        self._index_topk = index_topk
+        self._cp_size = cp_size
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        batch = int(kwargs.get("batch_size"))
+        sequence = int(kwargs.get("s"))
+        prefix = int(kwargs.get("prefix", 0)) if self._layout == "ragged" else 0
+        full_context = prefix + sequence if self._layout == "ragged" else sequence
+        if self._layout == "ragged" and full_context <= self._index_topk:
+            return PerformanceResult(0.0, energy=0.0, source="analytical")
+        query_length = math.ceil(sequence / self._cp_size) if self._layout == "ragged" else 1
+        from aiconfigurator_core.sdk.kernelsim.analytical import index_topk_latency_ms
+
+        latency = index_topk_latency_ms(
+            gpu=database.system_spec["gpu"],
+            layout=self._layout,
+            batch=batch,
+            query_length=query_length,
+            context_length=full_context,
+            index_topk=self._index_topk,
+            config=database._analytical_config,
+        )
+        source = "analytical" if database._default_database_mode == common.DatabaseMode.ANALYTICAL else "estimated"
+        return PerformanceResult(latency * self._scale_factor, energy=0.0, source=source)
+
+    def get_weights(self, **kwargs):
+        return 0.0
+
+
+class DSASparseAttention(Operation):
+    """Granular selected-KV sparse MLA core, excluding index score and TopK."""
+
+    _CP_AWARE: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        *,
+        layout: str,
+        local_heads: int,
+        index_topk: int,
+        qk_latent_dim: int = 576,
+        value_latent_dim: int = 512,
+        qk_nope_dim: int = 128,
+        output_value_dim: int = 128,
+        cp_size: int = 1,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._layout = layout
+        self._local_heads = local_heads
+        self._index_topk = index_topk
+        self._qk_latent_dim = qk_latent_dim
+        self._value_latent_dim = value_latent_dim
+        self._qk_nope_dim = qk_nope_dim
+        self._output_value_dim = output_value_dim
+        self._cp_size = cp_size
+
+    @staticmethod
+    def _causal_pairs(batch: int, query: int, prefix: int, limit: int) -> int:
+        full = prefix + query
+        if prefix >= limit:
+            return batch * query * limit
+        if full <= limit:
+            return batch * (full * (full + 1) - prefix * (prefix + 1)) // 2
+        ramp = batch * (limit * (limit + 1) - prefix * (prefix + 1)) // 2
+        return ramp + batch * (full - limit) * limit
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        batch = int(kwargs.get("batch_size"))
+        sequence = int(kwargs.get("s"))
+        if self._layout == "ragged":
+            prefix = int(kwargs.get("prefix", 0))
+            query_length = math.ceil(sequence / self._cp_size)
+            # CP shards fresh Q but each rank attends the full prefix/current K.
+            local_prefix = prefix + max(0, sequence - query_length)
+            pairs = self._causal_pairs(batch, query_length, local_prefix, self._index_topk)
+        else:
+            query_length = 1
+            pairs = batch * min(sequence, self._index_topk)
+        from aiconfigurator_core.sdk.kernelsim.analytical import dsa_sparse_attention_latency_ms
+
+        latency = dsa_sparse_attention_latency_ms(
+            gpu=database.system_spec["gpu"],
+            batch=batch,
+            query_length=query_length,
+            selected_pairs=pairs,
+            local_heads=self._local_heads,
+            qk_latent_dim=self._qk_latent_dim,
+            value_latent_dim=self._value_latent_dim,
+            qk_nope_dim=self._qk_nope_dim,
+            output_value_dim=self._output_value_dim,
+            config=database._analytical_config,
+        )
+        source = "analytical" if database._default_database_mode == common.DatabaseMode.ANALYTICAL else "estimated"
+        return PerformanceResult(latency * self._scale_factor, energy=0.0, source=source)
+
+    def get_weights(self, **kwargs):
+        return 0.0
 
 
 # ─────────────────────────────────────────────────────────

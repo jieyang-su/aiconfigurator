@@ -26,7 +26,13 @@ from aiconfigurator_core.sdk.operations.afd_transfer import (
 from aiconfigurator_core.sdk.operations.attention import ContextAttention, EncoderAttention, GenerationAttention
 from aiconfigurator_core.sdk.operations.base import Operation, clear_all_op_caches, warm_all_op_data
 from aiconfigurator_core.sdk.operations.communication import NCCL, P2P, CustomAllReduce
-from aiconfigurator_core.sdk.operations.dsa import ContextDSAModule, GenerationDSAModule
+from aiconfigurator_core.sdk.operations.dsa import (
+    ContextDSAModule,
+    DSAIndexScore,
+    DSASparseAttention,
+    DSATopKSelect,
+    GenerationDSAModule,
+)
 from aiconfigurator_core.sdk.operations.dsv4 import (
     ContextDeepSeekV4AttentionModule,
     DeepSeekV4MegaMoEModule,
@@ -71,6 +77,9 @@ __all__ = [
     "ContextMLA",
     "ContextMSAModule",
     "CustomAllReduce",
+    "DSAIndexScore",
+    "DSASparseAttention",
+    "DSATopKSelect",
     "DeepSeekV4MHCModule",
     "DeepSeekV4MegaMoEModule",
     "ElementWise",

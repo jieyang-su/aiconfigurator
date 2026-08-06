@@ -11,6 +11,12 @@ from dataclasses import dataclass
 
 from aiconfigurator_core.sdk import common
 from aiconfigurator_core.sdk.kernelsim.bmm.model import estimate_mla_bmm
+from aiconfigurator_core.sdk.kernelsim.dsa import (
+    IndexMqaShape,
+    IndexTopKShape,
+    estimate_index_mqa,
+    estimate_index_topk,
+)
 from aiconfigurator_core.sdk.kernelsim.fa import (
     AttentionShape,
     HardwareSpec,
@@ -20,6 +26,7 @@ from aiconfigurator_core.sdk.kernelsim.fa import (
     estimate_attention,
     estimate_mla,
 )
+from aiconfigurator_core.sdk.kernelsim.fa.profiles import get_reference_profile
 from aiconfigurator_core.sdk.kernelsim.gemm.model import (
     estimate_bf16_gemm,
     estimate_deepgemm_fp8,
@@ -251,6 +258,105 @@ def bmm_latency_ms(
         parameter_level=config.level,
     )
     return result.latency_us / 1000.0
+
+
+def index_mqa_latency_ms(
+    *,
+    gpu: dict,
+    layout: str,
+    batch: int,
+    query_length: int,
+    context_length: int,
+    index_heads: int,
+    index_head_dim: int,
+    config: AnalyticalConfig,
+) -> float:
+    required = {"sm_count", "clock_hz", "fp8_tc_flops", "mem_bw"}
+    missing = sorted(required - gpu.keys())
+    if missing:
+        raise ValueError(f"DSA Index MQA analytical hardware fields missing: {', '.join(missing)}")
+    result = estimate_index_mqa(
+        IndexMqaShape(
+            layout=layout,
+            batch_size=batch,
+            query_length=query_length,
+            context_length=context_length,
+            index_heads=index_heads,
+            head_dim=index_head_dim,
+        ),
+        sm_count=int(gpu["sm_count"]),
+        clock_hz=float(gpu["clock_hz"]),
+        fp8_peak_flops_s=float(gpu["fp8_tc_flops"]),
+        hbm_bandwidth_bytes_s=float(gpu["mem_bw"]),
+        parameter_level=config.level,
+    )
+    return result.latency_us / 1000.0
+
+
+def index_topk_latency_ms(
+    *,
+    gpu: dict,
+    layout: str,
+    batch: int,
+    query_length: int,
+    context_length: int,
+    index_topk: int,
+    config: AnalyticalConfig,
+) -> float:
+    result = estimate_index_topk(
+        IndexTopKShape(
+            layout=layout,
+            batch_size=batch,
+            query_length=query_length,
+            context_length=context_length,
+            topk=index_topk,
+            variant="fused",
+            score_distribution="standard",
+        ),
+        hbm_bandwidth_bytes_s=float(gpu["mem_bw"]),
+        parameter_level=config.level,
+    )
+    return result.latency_us / 1000.0
+
+
+def dsa_sparse_attention_latency_ms(
+    *,
+    gpu: dict,
+    batch: int,
+    query_length: int,
+    selected_pairs: int,
+    local_heads: int,
+    qk_latent_dim: int,
+    value_latent_dim: int,
+    qk_nope_dim: int,
+    output_value_dim: int,
+    config: AnalyticalConfig,
+) -> float:
+    """Selected-KV MLA core using FA engineering efficiencies.
+
+    Random gather, backend fusion and split scheduling remain uncalibrated; this
+    is a granular no-table fallback, not a claim of FlashMLA kernel parity.
+    """
+    profile = get_reference_profile(config.level)
+    peak_key = "bfloat16_tc_flops"
+    if peak_key not in gpu:
+        raise ValueError(f"DSA sparse attention analytical model requires gpu.{peak_key}")
+    tokens = batch * query_length
+    attention_flops = 2.0 * selected_pairs * local_heads * (qk_latent_dim + value_latent_dim)
+    absorption_flops = 2.0 * tokens * local_heads * value_latent_dim * (qk_nope_dim + output_value_dim)
+    flops = attention_flops + absorption_flops
+    # One latent KV stream is shared by all query heads. Use average selected
+    # rows per query for the unique-cache lower bound and retain output traffic.
+    average_selected = selected_pairs / max(1, tokens)
+    logical_bytes = (
+        tokens * local_heads * qk_latent_dim * 2
+        + batch * average_selected * qk_latent_dim * 2
+        + tokens * local_heads * value_latent_dim * 2
+        + local_heads * value_latent_dim * (qk_nope_dim + output_value_dim) * 2
+    )
+    compute_ms = flops / (float(gpu[peak_key]) * profile.compute_efficiency) * 1000
+    memory_ms = logical_bytes / (float(gpu["mem_bw"]) * profile.hbm_efficiency) * 1000
+    return profile.fixed_overhead_us / 1000 + max(compute_ms, memory_ms)
 
 
 def moe_latency_ms(
