@@ -41,8 +41,10 @@ class _StaticOp:
         self._latency_ms = latency_ms
         self._energy_wms = energy_wms
         self._component_latency_ms = component_latency_ms
+        self.calls = []
 
     def query(self, *args, **kwargs) -> _LatencyResult:
+        self.calls.append(kwargs)
         return _LatencyResult(
             self._latency_ms,
             self._energy_wms,
@@ -295,4 +297,44 @@ def test_run_static_rejects_negative_unique_kv_token_count(
     )
 
     with pytest.raises(ValueError, match="kv_cache_num_tokens"):
+        backend.run_static(model, database, runtime, mode="static_gen")
+
+
+def test_generation_padding_preserves_graph_shape_and_exposes_active_tokens(
+    backend: BaseBackend,
+    model,
+    database,
+) -> None:
+    runtime = RuntimeConfig(
+        batch_size=16,
+        beam_width=1,
+        isl=100,
+        osl=2,
+        generation_active_tokens=13,
+    )
+
+    backend.run_static(model, database, runtime, mode="static_gen")
+
+    expected_sequence_length = (13 * 101 + 3) / 16
+    for op in model.generation_ops:
+        assert len(op.calls) == 1
+        assert op.calls[0]["x"] == 16
+        assert op.calls[0]["active_x"] == 13
+        assert op.calls[0]["batch_size"] == 16
+        assert op.calls[0]["s"] == pytest.approx(expected_sequence_length)
+
+
+def test_generation_rejects_active_tokens_larger_than_graph_shape(
+    backend: BaseBackend,
+    model,
+    database,
+) -> None:
+    runtime = RuntimeConfig(
+        batch_size=8,
+        isl=100,
+        osl=2,
+        generation_active_tokens=9,
+    )
+
+    with pytest.raises(ValueError, match="generation_active_tokens"):
         backend.run_static(model, database, runtime, mode="static_gen")

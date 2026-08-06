@@ -224,20 +224,42 @@ class BaseBackend:
         generation_source_dict: dict[str, str] = {}
         generation_component_latency_dict: dict[str, dict[str, float]] = {}
 
-        batch_size = batch_size * (model._nextn + 1)
+        logical_batch_size = batch_size
+        active_tokens = runtime_config.generation_active_tokens
+        if active_tokens is None:
+            active_tokens = logical_batch_size
+        if active_tokens <= 0 or active_tokens > logical_batch_size:
+            raise ValueError(
+                "generation_active_tokens must be in [1, batch_size], but got "
+                f"{active_tokens} for batch_size={logical_batch_size}"
+            )
+
+        batch_size = logical_batch_size * (model._nextn + 1)
+        active_batch_size = active_tokens * (model._nextn + 1)
 
         for i in range(0, osl - 1, stride):
             latency_dict = defaultdict(float)
             energy_wms_dict = defaultdict(float)
             component_latency_dict: dict[str, dict[str, float]] = {}
 
+            # SGLang CUDA graphs retain the captured launch shape, but padded
+            # attention rows have seq_len=1 and padded TopK rows are invalid.
+            # Preserve the graph-sized ``x``/``batch_size`` for dense kernels
+            # while exposing the routed-token count and the equivalent mean
+            # attention length to operations that understand those contracts.
+            generation_sequence_length = (
+                active_batch_size * (isl + i + 1)
+                + (batch_size - active_batch_size)
+            ) / batch_size
+
             for op in model.generation_ops:
                 result = op.query(
                     database,
                     x=batch_size * beam_width,
+                    active_x=active_batch_size * beam_width,
                     batch_size=batch_size,
                     beam_width=beam_width,
-                    s=isl + i + 1,
+                    s=generation_sequence_length,
                     gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
                     mock_moe_policy=getattr(model.config, "mock_moe_policy", None),
                 )

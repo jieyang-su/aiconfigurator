@@ -176,6 +176,11 @@ class RuntimeConfig:
     # serving integrations can provide this for shared radix-cache prefixes;
     # leaving it unset preserves the historical batch_size * seq_len estimate.
     kv_cache_num_tokens: int | None = None
+    # Number of non-padding generation tokens inside ``batch_size``. CUDA graph
+    # replay can round the launch shape up while SGLang marks padded TopK rows
+    # invalid and gives their attention rows sequence length 1. Leaving this
+    # unset preserves the historical all-active behavior.
+    generation_active_tokens: int | None = None
     ttft: float = None
     tpot: Union[float, list] = None
     request_latency: float = None  # it works together with ttft. 1. <= req_lat 2. <= req_lat and <= ttft

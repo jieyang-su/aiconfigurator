@@ -53,6 +53,17 @@ def test_other_system_keeps_global_token_count():
     assert database.query_moe.call_args.kwargs["num_tokens"] == 8193
 
 
+def test_generation_moe_prefers_non_padding_token_count():
+    database = MagicMock()
+    database.system = "h20_pcie"
+    database.query_moe.return_value = PerformanceResult(3.0, energy=30.0, source="silicon")
+    op = _make_moe()
+
+    op.query(database, x=16, active_x=13)
+
+    assert database.query_moe.call_args.kwargs["num_tokens"] == 13
+
+
 def test_divisor_can_be_limited_to_balanced_distribution():
     database = MagicMock()
     database.system = "h20_pcie"

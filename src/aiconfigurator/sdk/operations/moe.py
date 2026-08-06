@@ -1324,7 +1324,10 @@ class MoE(Operation):
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query MoE latency with energy data."""
         # attention dp size will scale up the total input tokens.
-        x = kwargs.get("x") * self._attention_dp_size
+        # CUDA-graph padding keeps dense launch shapes fixed, but SGLang marks
+        # padded TopK rows invalid before routed-expert compute. Prefer the
+        # explicit active-token count when the serving integration supplies it.
+        x = kwargs.get("active_x", kwargs.get("x")) * self._attention_dp_size
         # Ordinary TP prefill can sequence-shard the routed-MoE input. Some
         # archived system tables use the rank-local token-row count, so select
         # that geometry only for explicitly calibrated systems.
