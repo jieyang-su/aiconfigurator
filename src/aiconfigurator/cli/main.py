@@ -389,6 +389,12 @@ def _add_default_mode_arguments(parser):
         "comma-separated list of kinds (xshape,xquant,xprofile,xop). "
         "Default: all kinds enabled. Ignored in SILICON mode.",
     )
+    parser.add_argument(
+        "--analytical-communication-mode",
+        choices=["empirical", "silicon"],
+        default="empirical",
+        help="Communication source in ANALYTICAL mode: empirical formula (default) or silicon table.",
+    )
     parser.add_argument("--isl", type=int, default=4000, help="Input sequence length. Default: 4000.")
     parser.add_argument("--osl", type=int, default=1000, help="Output sequence length. Default: 1000.")
     parser.add_argument(
@@ -1113,6 +1119,12 @@ def _add_estimate_mode_arguments(parser):
         "may fill missing data. A preset (off|conservative|balanced|aggressive) or a "
         "comma-separated list of kinds (xshape,xquant,xprofile,xop). "
         "Default: all kinds enabled. Ignored in SILICON mode.",
+    )
+    parser.add_argument(
+        "--analytical-communication-mode",
+        choices=["empirical", "silicon"],
+        default="empirical",
+        help="Communication source in ANALYTICAL mode: empirical formula (default) or silicon table.",
     )
     parser.add_argument(
         "--detail",
@@ -2438,6 +2450,7 @@ def _run_estimate_mode(args):
         backend_version=args.backend_version,
         database_mode=args.database_mode,
         transfer_policy=args.transfer_policy,
+        analytical_communication_mode=args.analytical_communication_mode,
         isl=args.isl,
         osl=args.osl,
         image_height=args.image_height,

@@ -473,6 +473,34 @@ class ContextAttention(Operation):
                 b, s, prefix, n, n_kv, head_size, window_size, kvcache_quant_mode, fmha_quant_mode
             )
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            import math
+
+            from aiconfigurator_core.sdk.kernelsim.analytical import attention_latency_ms
+
+            if s <= 0:
+                return PerformanceResult(0.0, energy=0.0, source="analytical")
+            full_s = s + prefix
+            kv_length = max(s, min(full_s, window_size) if window_size > 0 else full_s)
+            dtype = "fp8" if (
+                kvcache_quant_mode == common.KVCacheQuantMode.fp8 or fmha_quant_mode == common.FMHAQuantMode.fp8
+            ) else "bf16"
+            return PerformanceResult(
+                attention_latency_ms(
+                    system=database.system,
+                    gpu=database.system_spec["gpu"],
+                    batch=b,
+                    query_length=math.ceil(s),
+                    kv_length=math.ceil(kv_length),
+                    query_heads=n,
+                    kv_heads=n_kv,
+                    head_dim=head_size,
+                    dtype=dtype,
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
+            )
 
         cls.load_data(database)
         data_wrapper = database._context_attention_data
@@ -857,6 +885,27 @@ class GenerationAttention(Operation):
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             emp_latency = get_empirical(b, s, n, n_kv, head_size, window_size, kvcache_quant_mode)
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            from aiconfigurator_core.sdk.kernelsim.analytical import attention_latency_ms
+
+            kv_length = max(1, min(s, window_size) if window_size > 0 else s)
+            dtype = "fp8" if kvcache_quant_mode == common.KVCacheQuantMode.fp8 else "bf16"
+            return PerformanceResult(
+                attention_latency_ms(
+                    system=database.system,
+                    gpu=database.system_spec["gpu"],
+                    batch=b,
+                    query_length=1,
+                    kv_length=kv_length,
+                    query_heads=n,
+                    kv_heads=n_kv,
+                    head_dim=head_size,
+                    dtype=dtype,
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
+            )
 
         cls.load_data(database)
         data_wrapper = database._generation_attention_data

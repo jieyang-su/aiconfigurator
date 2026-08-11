@@ -611,6 +611,25 @@ class MoE(Operation):
                 workload_distribution,
             )
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            from aiconfigurator_core.sdk.kernelsim.analytical import moe_latency_ms
+
+            return PerformanceResult(
+                moe_latency_ms(
+                    num_tokens=num_tokens,
+                    hidden_size=hidden_size,
+                    inter_size=inter_size,
+                    topk=topk,
+                    num_experts=num_experts,
+                    moe_tp_size=moe_tp_size,
+                    moe_ep_size=moe_ep_size,
+                    quant_mode=quant_mode,
+                    gpu=database.system_spec["gpu"],
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
+            )
         else:
             # SILICON or HYBRID mode - use database
             def get_silicon():
@@ -1018,12 +1037,15 @@ class MoEDispatch(Operation):
         cls.load_data(database)
 
         def get_sol(num_tokens: int, topk: int, num_experts: int) -> tuple[float, float, float]:
-            raise NotImplementedError("WideEP deepep ll operation's sol is not implemented yet")
-            return
+            world = max(1, round(node_num * database.system_spec["node"]["num_gpus_per_node"]))
+            remote_ranks = min(topk, num_experts, max(1, world - 1))
+            elements = num_tokens * remote_ranks * hidden_size
+            bandwidth = database.system_spec["node"]["inter_node_bw" if node_num > 1 else "intra_node_bw"]
+            sol_time = elements * 4 / bandwidth * 1000
+            return sol_time, 0.0, sol_time
 
         def get_empirical(num_tokens: int, topk: int, num_experts: int) -> float:
-            raise NotImplementedError("WideEP deepep ll operation's empirical is not implemented yet")
-            return
+            return get_sol(num_tokens, topk, num_experts)[0] / 0.5
 
         if database_mode is None:
             database_mode = database._default_database_mode
@@ -1033,6 +1055,12 @@ class MoEDispatch(Operation):
             return get_sol(num_tokens, topk, num_experts)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             return PerformanceResult(get_empirical(num_tokens, topk, num_experts), energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            if database._analytical_config.communication_mode == "silicon":
+                return cls._query_wideep_deepep_ll_table(
+                    database, node_num, num_tokens, num_experts, topk, hidden_size, common.DatabaseMode.SILICON
+                )
+            return PerformanceResult(get_empirical(num_tokens, topk, num_experts), energy=0.0, source="analytical")
         else:
             _lookup_node, data, used_node1_fallback = cls._resolve_wideep_deepep_comm_node_data(
                 database._wideep_deepep_ll_data,
@@ -1081,12 +1109,14 @@ class MoEDispatch(Operation):
         cls.load_data(database)
 
         def get_sol(num_tokens: int, num_experts: int, topk: int, hidden_size: int) -> tuple[float, float, float]:
-            raise NotImplementedError("WideEP deepep normal operation's sol is not implemented yet")
-            return
+            world = max(1, round(node_num * database.system_spec["node"]["num_gpus_per_node"]))
+            remote_ranks = min(topk, num_experts, max(1, world - 1))
+            bandwidth = database.system_spec["node"]["inter_node_bw" if node_num > 1 else "intra_node_bw"]
+            sol_time = num_tokens * remote_ranks * hidden_size * 4 / bandwidth * 1000
+            return sol_time, 0.0, sol_time
 
         def get_empirical(num_tokens: int, num_experts: int, topk: int, hidden_size: int) -> float:
-            raise NotImplementedError("WideEP deepep normal operation's empirical is not implemented yet")
-            return
+            return get_sol(num_tokens, num_experts, topk, hidden_size)[0] / 0.5
 
         if database_mode is None:
             database_mode = database._default_database_mode
@@ -1097,6 +1127,14 @@ class MoEDispatch(Operation):
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             return PerformanceResult(
                 get_empirical(num_tokens, num_experts, topk, hidden_size), energy=0.0, source="empirical"
+            )
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            if database._analytical_config.communication_mode == "silicon":
+                return cls._query_wideep_deepep_normal_table(
+                    database, node_num, num_tokens, num_experts, topk, hidden_size, sms, common.DatabaseMode.SILICON
+                )
+            return PerformanceResult(
+                get_empirical(num_tokens, num_experts, topk, hidden_size), energy=0.0, source="analytical"
             )
         else:
             lookup_node, node_data, used_node1_fallback = cls._resolve_wideep_deepep_comm_node_data(

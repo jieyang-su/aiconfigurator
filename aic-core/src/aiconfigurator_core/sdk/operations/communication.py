@@ -171,12 +171,24 @@ class CustomAllReduce(Operation):
 
         if database_mode is None:
             database_mode = database._default_database_mode
+        analytical_formula = (
+            database_mode == common.DatabaseMode.ANALYTICAL
+            and database._analytical_config.communication_mode == "empirical"
+        )
+        if database_mode == common.DatabaseMode.ANALYTICAL:
+            database_mode = (
+                common.DatabaseMode.EMPIRICAL
+                if database._analytical_config.communication_mode == "empirical"
+                else common.DatabaseMode.SILICON
+            )
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(quant_mode, tp_size, size)[0]
             return PerformanceResult(sol_latency, energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(quant_mode, tp_size, size)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
+            if analytical_formula:
+                return PerformanceResult(get_sol(quant_mode, tp_size, size)[0] / 0.8, energy=0.0, source="empirical")
             emp_latency = get_empirical(quant_mode, tp_size, size)
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
 
@@ -446,11 +458,27 @@ class NCCL(Operation):
 
         if database_mode is None:
             database_mode = database._default_database_mode
+        analytical_formula = (
+            database_mode == common.DatabaseMode.ANALYTICAL
+            and database._analytical_config.communication_mode == "empirical"
+        )
+        if database_mode == common.DatabaseMode.ANALYTICAL:
+            database_mode = (
+                common.DatabaseMode.EMPIRICAL
+                if database._analytical_config.communication_mode == "empirical"
+                else common.DatabaseMode.SILICON
+            )
         if database_mode == common.DatabaseMode.SOL:
             return PerformanceResult(get_sol(dtype, num_gpus, operation, message_size)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(dtype, num_gpus, operation, message_size)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
+            if analytical_formula:
+                return PerformanceResult(
+                    get_sol(dtype, num_gpus, operation, message_size)[0] / 0.8,
+                    energy=0.0,
+                    source="empirical",
+                )
             return PerformanceResult(
                 get_empirical(dtype, num_gpus, operation, message_size), energy=0.0, source="empirical"
             )
@@ -570,11 +598,23 @@ class P2P(Operation):
 
         if database_mode is None:
             database_mode = database._default_database_mode
+        analytical_formula = (
+            database_mode == common.DatabaseMode.ANALYTICAL
+            and database._analytical_config.communication_mode == "empirical"
+        )
+        if database_mode == common.DatabaseMode.ANALYTICAL:
+            database_mode = (
+                common.DatabaseMode.EMPIRICAL
+                if database._analytical_config.communication_mode == "empirical"
+                else common.DatabaseMode.SILICON
+            )
         if database_mode == common.DatabaseMode.SOL:
             return PerformanceResult(get_sol(message_bytes)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol(message_bytes)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
+            if analytical_formula:
+                return PerformanceResult(get_sol(message_bytes)[0] / 0.8, energy=0.0, source="empirical")
             return PerformanceResult(get_empirical(message_bytes), energy=0.0, source="empirical")
         # No silicon table for P2P — even SILICON/HYBRID modes use the
         # empirical formula here, so tag the source accordingly.

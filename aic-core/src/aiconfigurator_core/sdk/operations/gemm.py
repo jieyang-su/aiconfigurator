@@ -569,6 +569,14 @@ class GEMM(Operation):
             return get_sol(m, n, k, quant_mode)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             return PerformanceResult(get_empirical(m, n, k, quant_mode), energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            from aiconfigurator_core.sdk.kernelsim.analytical import gemm_latency_ms
+
+            return PerformanceResult(
+                gemm_latency_ms(m, n, k, quant_mode, database.system_spec["gpu"], database._analytical_config),
+                energy=0.0,
+                source="analytical",
+            )
 
         # SILICON or HYBRID mode — use database. ``load_data`` is idempotent;
         # it populates the class cache and binds the instance attrs only when
@@ -676,6 +684,8 @@ class GEMM(Operation):
             return get_sol(m, k)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             return PerformanceResult(get_empirical(m, k), energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            return PerformanceResult(get_sol(m, k)[0] / 0.8, energy=0.0, source="analytical")
 
         cls.load_data(database)
         compute_scale_wrapper = database._compute_scale_data
@@ -768,6 +778,8 @@ class GEMM(Operation):
             return get_sol(m, k)
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             return PerformanceResult(get_empirical(m, k), energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            return PerformanceResult(get_sol(m, k)[0] / 0.8, energy=0.0, source="analytical")
 
         cls.load_data(database)
         scale_matrix_wrapper = database._scale_matrix_data

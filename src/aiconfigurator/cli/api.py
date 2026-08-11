@@ -200,6 +200,8 @@ def cli_default(
         backend_version: Backend database version. Default is latest.
         database_mode: Database mode for performance estimation
             ('SILICON', 'HYBRID', 'EMPIRICAL', 'SOL'). Default is 'SILICON'.
+        analytical_communication_mode: Communication source when
+            ``database_mode='ANALYTICAL'``: empirical formula or silicon table.
         isl: Input sequence length. Default is 4000.
         osl: Output sequence length. Default is 1000.
         enable_encoder_dp: Model the vision encoder data-parallel (default True;
@@ -921,6 +923,7 @@ def cli_estimate(
     backend_version: str | None = None,
     database_mode: str = "SILICON",
     transfer_policy: str | list | None = None,
+    analytical_communication_mode: str = "empirical",
     isl: int = 1024,
     osl: int = 1024,
     image_height: int = 0,
@@ -1154,6 +1157,8 @@ def cli_estimate(
             "database_mode": database_mode,
             "transfer_policy": transfer_policy,
         }
+        if database_mode == "ANALYTICAL":
+            database_kwargs["analytical_config"] = {"communication_mode": analytical_communication_mode}
         if active_systems_paths is not None:
             database_kwargs["systems_paths"] = active_systems_paths
         db = get_database_view(

@@ -288,7 +288,9 @@ def should_use_rust_engine_step(runtime_config: RuntimeConfig, database: Any = N
             )
             return False
     if database is not None:
-        mode = getattr(database, "get_default_database_mode", lambda: None)()
+        mode = getattr(database, "_requested_database_mode", None) or getattr(
+            database, "get_default_database_mode", lambda: None
+        )()
         if mode is not None and getattr(mode, "name", str(mode)) not in _RUST_SUPPORTED_DATABASE_MODES:
             logger.debug(
                 "engine-step backend 'rust' requested but database_mode=%s; "
@@ -749,7 +751,7 @@ def _engine_config_json(model: Any, database: Any) -> str:
 
 
 def _database_mode_key(database: Any) -> str:
-    mode = getattr(database, "get_default_database_mode", lambda: None)()
+    mode = getattr(database, "_requested_database_mode", None) or getattr(database, "get_default_database_mode", lambda: None)()
     return getattr(mode, "name", str(mode)) if mode is not None else "SILICON"
 
 

@@ -1032,12 +1032,15 @@ def _cached_configured_database_view(
     root_template: PerfDatabase,
     mode: common.DatabaseMode,
     policy: frozenset[common.TransferKind],
+    analytical_config,
 ) -> PerfDatabase:
     """Build one lightweight immutable query view per normalized configuration."""
     view = copy.copy(root_template)
     view._root_database_template = root_template
+    view._requested_database_mode = mode
     view._default_database_mode = mode
     view._transfer_policy = policy
+    view._analytical_config = analytical_config
     view._is_query_view = True
 
     # Lazy support resolution binds loaded op tables onto its database. Rebind
@@ -1059,6 +1062,7 @@ def _get_configured_database_view(
     mode: str | common.DatabaseMode | None,
     transfer_policy=None,
     shared_layer: bool | None = None,
+    analytical_config=None,
 ) -> PerfDatabase:
     """Return a cached configured copy rooted at the original data template."""
     normalized_mode = _normalize_database_mode(mode)
@@ -1073,7 +1077,15 @@ def _get_configured_database_view(
             "so the correct data template is selected."
         )
 
-    return _cached_configured_database_view(root_template, normalized_mode, policy)
+    from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig, warn_backend_compatibility
+
+    config = analytical_config or AnalyticalConfig()
+    if not isinstance(config, AnalyticalConfig):
+        config = AnalyticalConfig(**config)
+    view = _cached_configured_database_view(root_template, normalized_mode, policy, config)
+    if normalized_mode == common.DatabaseMode.ANALYTICAL:
+        warn_backend_compatibility(view.backend)
+    return view
 
 
 def get_database_view(
@@ -1086,6 +1098,7 @@ def get_database_view(
     transfer_policy=None,
     shared_layer: bool | None = None,
     strict_provenance: bool | None = None,
+    analytical_config=None,
 ) -> PerfDatabase | None:
     """Return an isolated, lightweight query view over a cached database.
 
@@ -1102,13 +1115,20 @@ def get_database_view(
     its docstring); ``None`` resolves from the ``AIC_STRICT_PROVENANCE`` env var.
     """
     mode = _normalize_database_mode(database_mode)
+    resolved_shared_layer = shared_layer
+    if mode == common.DatabaseMode.ANALYTICAL and shared_layer is None:
+        communication_mode = analytical_config.get("communication_mode") if isinstance(analytical_config, dict) else getattr(analytical_config, "communication_mode", None)
+        if str(communication_mode or "").lower() == "silicon":
+            # Analytical compute remains formula-based, but communication=silicon
+            # must inherit the measured collective tables from older versions.
+            resolved_shared_layer = True
     database_kwargs = {
         "system": system,
         "backend": backend,
         "version": version,
         "allow_missing_data": allow_missing_data,
         "database_mode": mode.name,
-        "shared_layer": shared_layer,
+        "shared_layer": resolved_shared_layer,
         "strict_provenance": strict_provenance,
     }
     if systems_paths is not None:
@@ -1116,7 +1136,13 @@ def get_database_view(
     database = get_database(**database_kwargs)
     if database is None:
         return None
-    return _get_configured_database_view(database, mode, transfer_policy, shared_layer=shared_layer)
+    return _get_configured_database_view(
+        database,
+        mode,
+        transfer_policy,
+        shared_layer=resolved_shared_layer,
+        analytical_config=analytical_config,
+    )
 
 
 DatabaseRef = tuple[str, str, str, str]
@@ -2041,6 +2067,9 @@ class PerfDatabase:
         with open(os.path.join(systems_root, system + ".yaml")) as f:
             self.system_spec = SystemSpec(yaml.load(f, Loader=yaml.SafeLoader))
         self._default_database_mode = common.DatabaseMode.SILICON  # default mode is SILICON
+        from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig
+
+        self._analytical_config = AnalyticalConfig()
 
         # Manifest entries grouped by op_file. Used by ``_build_op_sources``
         # (lazy-load path inside each op class) to discover which sibling

@@ -631,6 +631,25 @@ class KDAKernel(GDNKernel):
         """Query KDA kernel table. Context and verify are 2-axis (batch, seq);
         generation is 1-axis (batch). SOL fallback uses a memory-bound byte
         model with the KDA fp32 recurrent state."""
+        if getattr(database, "_requested_database_mode", database._default_database_mode) == common.DatabaseMode.ANALYTICAL:
+            from aiconfigurator_core.sdk.kernelsim.kda import estimate_kernel
+
+            estimate = estimate_kernel(
+                system=database.system,
+                gpu=database.system_spec["gpu"],
+                backend=database.backend,
+                kernel_source=kernel_source,
+                phase=phase,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                num_v_heads=num_v_heads,
+                head_k_dim=head_k_dim,
+                head_v_dim=head_v_dim,
+                d_conv=d_conv,
+                level=database._analytical_config.level,
+            )
+            return PerformanceResult(estimate.central_us / 1000.0, energy=0.0, source="analytical")
+
         cls.load_data(database)
         kda_data = database._kda_data
         if not getattr(kda_data, "loaded", False):

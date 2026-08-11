@@ -16,6 +16,8 @@ import pytest
 
 from aiconfigurator_core.sdk.operations.mamba import KDAKernel
 from aiconfigurator_core.sdk.performance_result import PerformanceResult
+from aiconfigurator_core.sdk import common
+from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig
 
 pytestmark = pytest.mark.unit
 
@@ -36,8 +38,13 @@ class _LoadedTable(dict):
 
 class _StubDatabase:
     def __init__(self, kda_data):
-        self.system_spec = {"gpu": {"mem_bw": 8000}}
+        self.system = "b200_sxm"
+        self.backend = "sglang"
+        self.system_spec = {"gpu": {"mem_bw": 7.7e12, "bfloat16_tc_flops": 2.25e15}}
         self._kda_data = _LoadedTable(kda_data)
+        self._default_database_mode = common.DatabaseMode.SILICON
+        self._requested_database_mode = common.DatabaseMode.SILICON
+        self._analytical_config = AnalyticalConfig()
 
     @staticmethod
     def _interp_pr(latency, energy=0.0):
@@ -92,6 +99,21 @@ def test_vllm_verify_kernel_is_never_rerouted():
     db = _StubDatabase({"fused_kda_decode_mtp_dspark": {"verify": _verify_grid(0.5)}})
     result = _query(db, "fused_recurrent_kda")
     assert result.source == "sol"
+
+
+def test_analytical_kda_bypasses_perf_table_and_selects_v4_prefill():
+    db = _StubDatabase({})
+    db._requested_database_mode = common.DatabaseMode.ANALYTICAL
+    result = KDAKernel._query_kda_table(
+        db,
+        phase="context",
+        kernel_source="chunk_kda",
+        batch_size=8,
+        seq_len=4096,
+        **SHARD,
+    )
+    assert result.source == "analytical"
+    assert float(result) > 0
 
 
 def _generation_grid(latency):
