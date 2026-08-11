@@ -1500,6 +1500,7 @@ class DSAIndexScore(Operation):
         index_head_dim: int,
         index_topk: int,
         cp_size: int = 1,
+        context_stride: int = 1,
     ) -> None:
         super().__init__(name, scale_factor)
         self._layout = layout
@@ -1507,28 +1508,44 @@ class DSAIndexScore(Operation):
         self._index_head_dim = index_head_dim
         self._index_topk = index_topk
         self._cp_size = cp_size
+        self._context_stride = context_stride
+        if context_stride <= 0:
+            raise ValueError("context_stride must be positive")
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         batch = int(kwargs.get("batch_size"))
         sequence = int(kwargs.get("s"))
         prefix = int(kwargs.get("prefix", 0)) if self._layout == "ragged" else 0
         full_context = prefix + sequence if self._layout == "ragged" else sequence
+        indexed_context = max(1, full_context // self._context_stride)
         # SGLang prefill uses the K-only/select-all path below the sparse boundary.
-        if self._layout == "ragged" and full_context <= self._index_topk:
+        if self._layout == "ragged" and indexed_context <= self._index_topk:
             return PerformanceResult(0.0, energy=0.0, source="analytical")
         query_length = math.ceil(sequence / self._cp_size) if self._layout == "ragged" else 1
         from aiconfigurator_core.sdk.kernelsim.analytical import index_mqa_latency_ms
 
-        latency = index_mqa_latency_ms(
-            gpu=database.system_spec["gpu"],
-            layout=self._layout,
-            batch=batch,
-            query_length=query_length,
-            context_length=full_context,
-            index_heads=self._index_heads,
-            index_head_dim=self._index_head_dim,
-            config=database._analytical_config,
-        )
+        def _estimate(q: int) -> float:
+            return index_mqa_latency_ms(
+                gpu=database.system_spec["gpu"],
+                layout=self._layout,
+                batch=batch,
+                query_length=q,
+                context_length=indexed_context,
+                index_heads=self._index_heads,
+                index_head_dim=self._index_head_dim,
+                config=database._analytical_config,
+            )
+
+        if self._layout == "ragged" and query_length > indexed_context:
+            # V4 CSA scores fresh Q against a c4-compressed K cache, so Q may
+            # exceed K. The calibrated DSA ragged shape is causal Q<=K; tile
+            # the Q rows into legal launches while retaining the real K extent.
+            full_chunks, remainder = divmod(query_length, indexed_context)
+            latency = full_chunks * _estimate(indexed_context)
+            if remainder:
+                latency += _estimate(remainder)
+        else:
+            latency = _estimate(query_length)
         source = "analytical" if database._default_database_mode == common.DatabaseMode.ANALYTICAL else "estimated"
         return PerformanceResult(latency * self._scale_factor, energy=0.0, source=source)
 
@@ -1549,31 +1566,62 @@ class DSATopKSelect(Operation):
         layout: str,
         index_topk: int,
         cp_size: int = 1,
+        context_stride: int = 1,
+        kernel_recipe: str = "dsa",
     ) -> None:
         super().__init__(name, scale_factor)
         self._layout = layout
         self._index_topk = index_topk
         self._cp_size = cp_size
+        self._context_stride = context_stride
+        self._kernel_recipe = kernel_recipe.strip().lower()
+        if context_stride <= 0:
+            raise ValueError("context_stride must be positive")
+        if self._kernel_recipe not in {"dsa", "dsv4"}:
+            raise ValueError("kernel_recipe must be dsa or dsv4")
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         batch = int(kwargs.get("batch_size"))
         sequence = int(kwargs.get("s"))
         prefix = int(kwargs.get("prefix", 0)) if self._layout == "ragged" else 0
         full_context = prefix + sequence if self._layout == "ragged" else sequence
-        if self._layout == "ragged" and full_context <= self._index_topk:
+        indexed_context = max(1, full_context // self._context_stride)
+        if self._layout == "ragged" and indexed_context <= self._index_topk:
             return PerformanceResult(0.0, energy=0.0, source="analytical")
         query_length = math.ceil(sequence / self._cp_size) if self._layout == "ragged" else 1
-        from aiconfigurator_core.sdk.kernelsim.analytical import index_topk_latency_ms
+        if self._kernel_recipe == "dsv4":
+            from aiconfigurator_core.sdk.kernelsim.analytical import dsv4_topk_latency_ms
 
-        latency = index_topk_latency_ms(
-            gpu=database.system_spec["gpu"],
-            layout=self._layout,
-            batch=batch,
-            query_length=query_length,
-            context_length=full_context,
-            index_topk=self._index_topk,
-            config=database._analytical_config,
-        )
+            if self._layout == "ragged":
+                local_fresh = query_length
+                local_prefix = prefix + max(0, sequence - query_length)
+                variant = "v1"
+            else:
+                local_fresh = 1
+                local_prefix = max(0, sequence - 1)
+                variant = "v2"
+            latency = dsv4_topk_latency_ms(
+                gpu=database.system_spec["gpu"],
+                variant=variant,
+                batch=batch,
+                fresh_tokens=local_fresh,
+                prefix_tokens=local_prefix,
+                index_topk=self._index_topk,
+                compression_ratio=self._context_stride,
+                config=database._analytical_config,
+            )
+        else:
+            from aiconfigurator_core.sdk.kernelsim.analytical import index_topk_latency_ms
+
+            latency = index_topk_latency_ms(
+                gpu=database.system_spec["gpu"],
+                layout=self._layout,
+                batch=batch,
+                query_length=query_length,
+                context_length=indexed_context,
+                index_topk=self._index_topk,
+                config=database._analytical_config,
+            )
         source = "analytical" if database._default_database_mode == common.DatabaseMode.ANALYTICAL else "estimated"
         return PerformanceResult(latency * self._scale_factor, energy=0.0, source=source)
 

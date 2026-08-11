@@ -169,7 +169,7 @@ class AttentionShape:
             "head_dim",
         ):
             _positive_integer(name, getattr(self, name))
-        if self.kv_length_total < self.query_length:
+        if self.causal and self.kv_length_total < self.query_length:
             raise ValueError("kv_length_total must be >= query_length")
         if self.query_heads % self.kv_heads:
             raise ValueError("query_heads must be divisible by kv_heads")

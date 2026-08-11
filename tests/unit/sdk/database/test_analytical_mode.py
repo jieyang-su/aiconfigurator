@@ -24,11 +24,18 @@ def analytical_db():
 
 def test_config_validation_and_normalization():
     assert AnalyticalConfig().level == "standard"
+    assert AnalyticalConfig().sparse_attention_head_quantum is None
     assert AnalyticalConfig(fp8_gemm_recipe="deepgemm_hopper").fp8_gemm_recipe == "deepgemm-hopper"
+    assert AnalyticalConfig(sparse_attention_head_quantum=64).sparse_attention_executed_heads(16) == 64
+    assert AnalyticalConfig(sparse_attention_head_quantum=128).sparse_attention_executed_heads(64) == 128
     with pytest.raises(ValueError, match="standard, low, or high"):
         AnalyticalConfig(level="precise")
     with pytest.raises(ValueError, match="communication mode"):
         AnalyticalConfig(communication_mode="guess")
+    with pytest.raises(ValueError, match="head quantum"):
+        AnalyticalConfig(sparse_attention_head_quantum=32)
+    with pytest.raises(ValueError, match="incompatible"):
+        AnalyticalConfig(sparse_attention_head_quantum=128).sparse_attention_executed_heads(96)
 
 
 def test_views_are_isolated_by_analytical_config():

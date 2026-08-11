@@ -12,6 +12,7 @@ import pytest
 
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.task_v2 import Task
+from aiconfigurator.sdk.utils import enumerate_parallel_config
 
 pytestmark = pytest.mark.unit
 
@@ -365,6 +366,7 @@ def test_analytical_config_flows_into_database_view():
         analytical_level="high",
         analytical_fp8_gemm_recipe="deepgemm-hopper",
         analytical_attention_algorithm="fa3",
+        analytical_sparse_attention_head_quantum=64,
         analytical_communication_mode="silicon",
         analytical_moe_dispatch_dtype="fp8",
         analytical_moe_combine_dtype="half",
@@ -377,6 +379,7 @@ def test_analytical_config_flows_into_database_view():
     assert config.level == "high"
     assert config.fp8_gemm_recipe == "deepgemm-hopper"
     assert config.attention_algorithm == "fa3"
+    assert config.sparse_attention_head_quantum == 64
     assert config.communication_mode == "silicon"
     assert config.moe_dispatch_dtype == "fp8"
     assert config.moe_combine_dtype == "half"
@@ -429,6 +432,14 @@ def test_sweep_disagg_kwargs_shape():
     assert kwargs["rate_matching_prefill_degradation"] == 0.9
     assert kwargs["rate_matching_decode_degradation"] == 0.92
     assert kwargs["autoscale_ttft_correction_factor"] == 1.8
+
+
+def test_pareto_algorithm_validation_and_default():
+    assert Task().pareto_algorithm == "v1"
+    with pytest.raises(ValueError, match="pareto_algorithm"):
+        Task(pareto_algorithm="invalid").validate()
+    with pytest.raises(ValueError, match="only for disagg"):
+        Task(serving_mode="agg", pareto_algorithm="v2").validate()
 
 
 def test_sweep_disagg_require_same_tp_sglang_non_wideep():
@@ -996,6 +1007,41 @@ def test_large_pipeline_parallel_augments_dsv32_blackwell_defaults():
     assert t4.agg_pp_candidates == [1]
 
 
+def test_large_pipeline_parallel_augments_dsv32_h100_defaults():
+    """H100 can form multi-node workers; 80-GiB cards need PP candidates for
+    V3.2-class models that cannot fit the historical 8-GPU/PP=1 template."""
+    task = Task(
+        serving_mode="disagg",
+        prefill_model_path="deepseek-ai/DeepSeek-V3.2",
+        prefill_system_name="h100_sxm",
+        prefill_backend_name="sglang",
+        decode_model_path="deepseek-ai/DeepSeek-V3.2",
+        decode_system_name="h100_sxm",
+        decode_backend_name="sglang",
+        total_gpus=32,
+    )
+    for role in ("prefill", "decode"):
+        assert getattr(task, f"{role}_num_gpu_candidates") == [1, 2, 4, 8, 16, 32]
+        assert getattr(task, f"{role}_pp_candidates") == [1, 2, 4]
+        assert [8, 2, 1, 2, 4, 1] in list(task.iter_parallel(role))
+
+
+def test_sglang_parallel_enumeration_filters_cp_with_attention_tp_or_dp():
+    choices = enumerate_parallel_config(
+        num_gpu_list=[1, 2, 4],
+        tp_list=[1, 2],
+        pp_list=[1],
+        dp_list=[1, 2],
+        moe_tp_list=[1, 2],
+        moe_ep_list=[1, 2, 4],
+        cp_list=[1, 2, 4],
+        is_moe=True,
+        backend=common.BackendName.sglang,
+    )
+    assert choices
+    assert all(cp == 1 or (tp == 1 and dp == 1) for tp, _pp, dp, _mtp, _mep, cp in choices)
+
+
 def test_megamoe_sglang_parallel_lists_and_validation():
     """SGLang MegaMoE (initial support): DeepSeek-V4-Pro on Blackwell gets EP-only parallel
     lists; non-sglang / non-DeepSeek-V4 are rejected (v1 _validate_megamoe_backend_support)."""
@@ -1310,6 +1356,29 @@ def test_run_dispatches_to_sweep_disagg_with_two_dbs(monkeypatch):
     assert "h200_sxm" in systems and "h100_sxm" in systems
     # autoscale defaults to False
     assert captured["disagg_kwargs"]["autoscale"] is False
+
+
+def test_run_dispatches_pareto_v2_without_changing_v1(monkeypatch):
+    from aiconfigurator.sdk import pareto_v2, sweep
+
+    calls = []
+    monkeypatch.setattr("aiconfigurator.sdk.perf_database.get_database_view", lambda *args, **kwargs: "db")
+    monkeypatch.setattr(sweep, "sweep_disagg", lambda **kwargs: calls.append("v1") or "v1-result")
+    monkeypatch.setattr(
+        pareto_v2,
+        "sweep_disagg_pareto_v2",
+        lambda **kwargs: calls.append("v2") or "v2-result",
+    )
+    common_kwargs = dict(
+        serving_mode="disagg",
+        prefill_model_path="deepseek-ai/DeepSeek-V3",
+        prefill_system_name="h200_sxm",
+        decode_model_path="deepseek-ai/DeepSeek-V3",
+        decode_system_name="h200_sxm",
+    )
+    assert Task(**common_kwargs).run(validate=False) == "v1-result"
+    assert Task(**common_kwargs, pareto_algorithm="v2").run(validate=False) == "v2-result"
+    assert calls == ["v1", "v2"]
 
 
 def test_run_passes_autoscale_flag(monkeypatch):

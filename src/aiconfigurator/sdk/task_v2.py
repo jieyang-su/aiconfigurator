@@ -80,9 +80,9 @@ def _default_cp_list_for(model_family: str, backend_name: str) -> list[int]:
 # Pareto frontier. Used when ``pareto_sweep=True`` (the default) so v2 matches v1.
 _LEGACY_TPOT_SWEEP: list[int] = list(range(1, 20, 1)) + list(range(20, 300, 5))
 
-# DeepSeek-V3.2 / V4 MoE on Blackwell get extra large-pipeline-parallel configs
-# (PP=2/TP=8/16-GPU). Mirrors v1 _LARGE_PIPELINE_PARALLEL_MODEL_FAMILIES (backends were
-# all three, i.e. unrestricted).
+# DeepSeek-V3.2 / V4-family MoE models need large pipeline-parallel candidates
+# on systems where the conservative 8-GPU/PP=1 template can exclude every
+# memory-feasible deployment. GLM-5.2 resolves to the DEEPSEEKV32 family.
 _LARGE_PIPELINE_PARALLEL_MODEL_FAMILIES = {"DEEPSEEKV32", "DEEPSEEKV4"}
 
 _QUANT_ENUM_TABLES: dict[str, type] = {
@@ -340,12 +340,16 @@ class Task:
     # frontier (matches v1). Set False to evaluate only the single ``tpot`` target --
     # used by the Planner, where Pareto selection happens elsewhere.
     pareto_sweep: bool = True
+    # Keep the historical heuristic search as the default. ``v2`` selects the
+    # parallel, dominance-preserving PD-disaggregated Pareto implementation.
+    pareto_algorithm: Literal["v1", "v2"] = "v1"
     request_latency: float | None = None
     total_gpus: int | None = None
     database_mode: str | None = None
     analytical_level: str = "standard"
     analytical_fp8_gemm_recipe: str = "sglang"
     analytical_attention_algorithm: str = "fa2"
+    analytical_sparse_attention_head_quantum: int | None = None
     analytical_communication_mode: str = "empirical"
     workload_distribution: str = "power_law"
     analytical_moe_dispatch_dtype: str = "half"
@@ -928,8 +932,7 @@ class Task:
         self._apply_total_gpus_budget()
 
     def _large_pipeline_parallel_applies(self) -> bool:
-        """v1 _large_pipeline_parallel_worker_defaults_apply: DeepSeek-V3.2/V4 MoE on
-        Blackwell, non-wideep, total_gpus>=16 get extra PP=2 / TP=8 / 16-GPU configs."""
+        """Whether at least one role needs large pipeline-parallel defaults."""
         if not self._is_moe or self._model_family not in _LARGE_PIPELINE_PARALLEL_MODEL_FAMILIES:
             return False
         if self.serving_mode == "agg":
@@ -942,8 +945,18 @@ class Task:
             return False
         if self.total_gpus is None or self.total_gpus < 16:
             return False
+        return any(self._large_pipeline_system_supported(system) for system in systems)
+
+    @staticmethod
+    def _large_pipeline_system_supported(system: str) -> bool:
+        # H100's 80-GiB memory requires PP for V3.2-class models. A worker may
+        # span multiple 8-GPU nodes: the system spec and communication ops
+        # already model inter-node bandwidth/latency. H200 remains on the
+        # compact defaults because its 141-GiB memory has feasible PP=1 points.
+        if system == "h100_sxm":
+            return True
         try:
-            return all(is_blackwell_system(s) for s in systems)
+            return is_blackwell_system(system)
         except Exception:
             return False
 
@@ -951,15 +964,19 @@ class Task:
         if not self._large_pipeline_parallel_applies():
             return
         roles = ["agg"] if self.serving_mode == "agg" else ["prefill", "decode"]
-        merges = {
-            "num_gpu": [16],
-            "tp": [8],
-            "pp": [2],
-            "dp": [1],
-            "moe_tp": [1, 2, 4, 8],
-            "moe_ep": [1, 2, 4, 8],
-        }
         for role in roles:
+            system = self._role_attr(role, "system_name")
+            if not self._large_pipeline_system_supported(system):
+                continue
+            h100 = system == "h100_sxm"
+            merges = {
+                "num_gpu": [16, 32] if h100 else [16],
+                "tp": [8],
+                "pp": [2, 4] if h100 else [2],
+                "dp": [1],
+                "moe_tp": [1, 2, 4, 8],
+                "moe_ep": [1, 2, 4, 8],
+            }
             for dim, add in merges.items():
                 attr = f"{role}_{dim}_candidates"
                 if attr not in defaulted:
@@ -1238,6 +1255,11 @@ class Task:
             raise ValueError(f"attention_backend must be 'flashinfer' or 'fa3', got {self.attention_backend!r}.")
         if self.wideep_num_slots is not None and self.wideep_num_slots <= 0:
             raise ValueError(f"wideep_num_slots must be a positive integer, got {self.wideep_num_slots!r}.")
+        if self.pareto_algorithm not in {"v1", "v2"}:
+            raise ValueError("pareto_algorithm must be 'v1' or 'v2'")
+        if self.pareto_algorithm == "v2" and self.serving_mode != "disagg":
+            raise ValueError("pareto_algorithm='v2' is currently supported only for disagg serving")
+
         if self.serving_mode == "agg":
             self._validate_agg()
         elif self.serving_mode == "disagg":
@@ -1579,6 +1601,7 @@ class Task:
                 "level": self.analytical_level,
                 "fp8_gemm_recipe": self.analytical_fp8_gemm_recipe,
                 "attention_algorithm": self.analytical_attention_algorithm,
+                "sparse_attention_head_quantum": self.analytical_sparse_attention_head_quantum,
                 "communication_mode": self.analytical_communication_mode,
                 "moe_dispatch_dtype": self.analytical_moe_dispatch_dtype,
                 "moe_combine_dtype": self.analytical_moe_combine_dtype,
@@ -1639,7 +1662,12 @@ class Task:
             decode_database = self._load_database(
                 self.decode_system_name, self.decode_backend_name, self.decode_backend_version
             )
-            return sweep_disagg(
+            sweep_fn = sweep_disagg
+            if self.pareto_algorithm == "v2":
+                from aiconfigurator.sdk.pareto_v2 import sweep_disagg_pareto_v2
+
+                sweep_fn = sweep_disagg_pareto_v2
+            return sweep_fn(
                 **self.sweep_disagg_kwargs(prefill_database=prefill_database, decode_database=decode_database),
                 autoscale=autoscale,
                 predictor=self.predictor,

@@ -35,8 +35,10 @@ from aiconfigurator_core.sdk.operations.dsa import (
 )
 from aiconfigurator_core.sdk.operations.dsv4 import (
     ContextDeepSeekV4AttentionModule,
+    DeepSeekV4KVAllGather,
     DeepSeekV4MegaMoEModule,
     DeepSeekV4MHCModule,
+    DeepSeekV4SparseAttention,
     GenerationDeepSeekV4AttentionModule,
     _BaseDeepSeekV4AttentionModule,
 )
@@ -80,8 +82,10 @@ __all__ = [
     "DSAIndexScore",
     "DSASparseAttention",
     "DSATopKSelect",
+    "DeepSeekV4KVAllGather",
     "DeepSeekV4MHCModule",
     "DeepSeekV4MegaMoEModule",
+    "DeepSeekV4SparseAttention",
     "ElementWise",
     "Embedding",
     "EncoderAttention",

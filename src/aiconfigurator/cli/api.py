@@ -161,10 +161,12 @@ def cli_default(
     backend: str = "trtllm",
     backend_version: str | None = None,
     database_mode: str = "SILICON",
+    pareto_algorithm: str = "v1",
     transfer_policy: str | list | None = None,
     analytical_level: str = "standard",
     analytical_fp8_gemm_recipe: str = "sglang",
     analytical_attention_algorithm: str = "fa2",
+    analytical_sparse_attention_head_quantum: int | None = None,
     analytical_communication_mode: str = "empirical",
     analytical_moe_dispatch_dtype: str = "half",
     analytical_moe_combine_dtype: str = "half",
@@ -208,6 +210,9 @@ def cli_default(
         backend_version: Backend database version. Default is latest.
         database_mode: Database mode for performance estimation
             ('SILICON', 'HYBRID', 'EMPIRICAL', 'SOL'). Default is 'SILICON'.
+        pareto_algorithm: PD-disaggregated Pareto search implementation. ``v1``
+            preserves the historical heuristic; ``v2`` retains the complete
+            two-objective frontier. Aggregated serving remains on v1.
         isl: Input sequence length. Default is 4000.
         osl: Output sequence length. Default is 1000.
         enable_encoder_dp: Model the vision encoder data-parallel (default True;
@@ -293,10 +298,12 @@ def cli_default(
         backend=backend,
         backend_version=backend_version,
         database_mode=database_mode,
+        pareto_algorithm=pareto_algorithm,
         transfer_policy=transfer_policy,
         analytical_level=analytical_level,
         analytical_fp8_gemm_recipe=analytical_fp8_gemm_recipe,
         analytical_attention_algorithm=analytical_attention_algorithm,
+        analytical_sparse_attention_head_quantum=analytical_sparse_attention_head_quantum,
         analytical_communication_mode=analytical_communication_mode,
         analytical_moe_dispatch_dtype=analytical_moe_dispatch_dtype,
         analytical_moe_combine_dtype=analytical_moe_combine_dtype,
@@ -399,6 +406,7 @@ def cli_recommend(
     analytical_level: str = "standard",
     analytical_fp8_gemm_recipe: str = "sglang",
     analytical_attention_algorithm: str = "fa2",
+    analytical_sparse_attention_head_quantum: int | None = None,
     analytical_communication_mode: str = "empirical",
     analytical_moe_dispatch_dtype: str = "half",
     analytical_moe_combine_dtype: str = "half",
@@ -522,6 +530,7 @@ def cli_recommend(
         analytical_level=analytical_level,
         analytical_fp8_gemm_recipe=analytical_fp8_gemm_recipe,
         analytical_attention_algorithm=analytical_attention_algorithm,
+        analytical_sparse_attention_head_quantum=analytical_sparse_attention_head_quantum,
         analytical_communication_mode=analytical_communication_mode,
         analytical_moe_dispatch_dtype=analytical_moe_dispatch_dtype,
         analytical_moe_combine_dtype=analytical_moe_combine_dtype,
@@ -955,6 +964,7 @@ def cli_estimate(
     analytical_level: str = "standard",
     analytical_fp8_gemm_recipe: str = "sglang",
     analytical_attention_algorithm: str = "fa2",
+    analytical_sparse_attention_head_quantum: int | None = None,
     analytical_communication_mode: str = "empirical",
     analytical_moe_dispatch_dtype: str = "half",
     analytical_moe_combine_dtype: str = "half",
@@ -1198,6 +1208,7 @@ def cli_estimate(
                 "level": analytical_level,
                 "fp8_gemm_recipe": analytical_fp8_gemm_recipe,
                 "attention_algorithm": analytical_attention_algorithm,
+                "sparse_attention_head_quantum": analytical_sparse_attention_head_quantum,
                 "communication_mode": analytical_communication_mode,
                 "moe_dispatch_dtype": analytical_moe_dispatch_dtype,
                 "moe_combine_dtype": analytical_moe_combine_dtype,

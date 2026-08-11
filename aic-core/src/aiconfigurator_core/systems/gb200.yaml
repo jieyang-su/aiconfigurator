@@ -15,6 +15,12 @@ gpu:
   fp4_tc_flops: 10000000000000000 # 10PFLOPS
   power: 1200  # Watt
   sm_version: 100
+  sm_count: 148
+  clock_hz: 1830000000
+  shared_memory_per_sm_bytes: 233472
+  l2_capacity_bytes: 132120576
+  l2_bandwidth_bytes_s: 10500000000000
+  vector_peak_flops: 69319680000000
 
 node:
   num_gpus_per_node: 4  # 4 GPUs per physical node (2 Grace CPUs x 2 GPUs each)

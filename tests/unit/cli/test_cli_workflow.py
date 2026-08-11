@@ -74,34 +74,37 @@ class TestCLIIntegration:
     @pytest.mark.parametrize("command", ["default", "recommend", "estimate"])
     def test_analytical_arguments_are_exposed(self, cli_parser, command):
         argv = [
-                command,
-                "--model-path",
-                "meta-llama/Meta-Llama-3.1-8B",
-                "--system",
-                "h100_sxm",
-                "--analytical-level",
-                "high",
-                "--analytical-fp8-gemm-recipe",
-                "deepgemm-hopper",
-                "--analytical-attention-algorithm",
-                "fa3",
-                "--analytical-communication-mode",
-                "silicon",
-                "--analytical-moe-dispatch-dtype",
-                "fp8",
-                "--analytical-moe-combine-dtype",
-                "half",
-                "--analytical-wideep-dispatch-dtype",
-                "fp8",
-                "--analytical-wideep-combine-dtype",
-                "half",
-            ]
+            command,
+            "--model-path",
+            "meta-llama/Meta-Llama-3.1-8B",
+            "--system",
+            "h100_sxm",
+            "--analytical-level",
+            "high",
+            "--analytical-fp8-gemm-recipe",
+            "deepgemm-hopper",
+            "--analytical-attention-algorithm",
+            "fa3",
+            "--analytical-sparse-attention-head-quantum",
+            "64",
+            "--analytical-communication-mode",
+            "silicon",
+            "--analytical-moe-dispatch-dtype",
+            "fp8",
+            "--analytical-moe-combine-dtype",
+            "half",
+            "--analytical-wideep-dispatch-dtype",
+            "fp8",
+            "--analytical-wideep-combine-dtype",
+            "half",
+        ]
         if command == "recommend":
             argv.extend(["--target-request-rate", "1"])
         args = cli_parser.parse_args(argv)
         assert args.analytical_level == "high"
         assert args.analytical_fp8_gemm_recipe == "deepgemm-hopper"
         assert args.analytical_attention_algorithm == "fa3"
+        assert args.analytical_sparse_attention_head_quantum == 64
         assert args.analytical_communication_mode == "silicon"
         assert args.analytical_moe_dispatch_dtype == "fp8"
         assert args.analytical_moe_combine_dtype == "half"

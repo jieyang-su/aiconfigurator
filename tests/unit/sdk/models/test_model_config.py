@@ -135,6 +135,10 @@ class TestMOEParallelismResolution:
         ctx = {op._name: op for op in model.context_ops}
         assert "context_attention" in ctx and "context_moe" in ctx
         assert isinstance(ctx["context_attention"], ContextMSAModule)  # MSA, not plain attention
+        assert ctx["context_attention"]._scale_factor == 57
+        assert ctx["context_moe"]._scale_factor == 57
+        assert ctx["context_dense_attention"]._scale_factor == 3
+        assert ctx["context_dense_gate_up_gemm"]._n == 2 * 12288
 
     def test_nemotron_h_mtp_scales_generation_only(self):
         """Nemotron-3 ships num_nextn_predict_layers=1; MTP must build (no assert) and
@@ -460,9 +464,11 @@ class TestHFModelSupport:
         for op in model.context_ops:
             if op._name == "context_attention":
                 op_ratio_counts[op._compress_ratio] += op._scale_factor
-        assert op_ratio_counts[0] == 0
+        # Granular ANALYTICAL preserves true SWA (ratio=0); the wrapper's
+        # silicon primary still uses the historical HCA approximation.
+        assert op_ratio_counts[0] == expected_ratio_counts.get(0, 0)
         assert op_ratio_counts[4] == expected_ratio_counts.get(4, 0)
-        assert op_ratio_counts[128] == expected_ratio_counts.get(128, 0) + expected_ratio_counts.get(0, 0)
+        assert op_ratio_counts[128] == expected_ratio_counts.get(128, 0)
 
     def test_deepseek_v4_kvcache_bytes_include_csa_indexer_cache_and_decode_buffers(self):
         model_config = config.ModelConfig(

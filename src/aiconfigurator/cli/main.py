@@ -257,6 +257,13 @@ def _add_analytical_arguments(parser):
         default="sglang",
     )
     parser.add_argument("--analytical-attention-algorithm", choices=["fa2", "fa3"], default="fa2")
+    parser.add_argument(
+        "--analytical-sparse-attention-head-quantum",
+        type=int,
+        choices=[64, 128],
+        default=None,
+        help="Optional SGLang sparse-attention execution-head quantum; omit to disable padding.",
+    )
     parser.add_argument("--analytical-communication-mode", choices=["empirical", "silicon"], default="empirical")
     for phase in ("moe-dispatch", "moe-combine", "wideep-dispatch", "wideep-combine"):
         parser.add_argument(f"--analytical-{phase}-dtype", choices=["half", "fp8", "int8"], default="half")
@@ -272,6 +279,14 @@ def _add_default_mode_arguments(parser):
         required=True,
         help="Model path: HuggingFace model path (e.g., 'Qwen/Qwen3-32B') or "
         "local path to directory containing config.json.",
+    )
+    parser.add_argument(
+        "--pareto-algorithm",
+        choices=["v1", "v2"],
+        default="v1",
+        help="Pareto search for PD-disaggregated serving. v1 keeps the historical "
+        "GPU-efficiency Top-K heuristic; v2 retains the complete two-objective frontier. "
+        "Aggregated serving continues to use v1. Default: v1.",
     )
     parser.add_argument(
         "--total-gpus",
@@ -1437,10 +1452,12 @@ def build_default_tasks(
     backend: str = "trtllm",
     backend_version: str | None = None,
     database_mode: str = "SILICON",
+    pareto_algorithm: str = "v1",
     transfer_policy: str | list | None = None,
     analytical_level: str = "standard",
     analytical_fp8_gemm_recipe: str = "sglang",
     analytical_attention_algorithm: str = "fa2",
+    analytical_sparse_attention_head_quantum: int | None = None,
     analytical_communication_mode: str = "empirical",
     analytical_moe_dispatch_dtype: str = "half",
     analytical_moe_combine_dtype: str = "half",
@@ -1610,6 +1627,7 @@ def build_default_tasks(
         "analytical_level": analytical_level,
         "analytical_fp8_gemm_recipe": analytical_fp8_gemm_recipe,
         "analytical_attention_algorithm": analytical_attention_algorithm,
+        "analytical_sparse_attention_head_quantum": analytical_sparse_attention_head_quantum,
         "analytical_communication_mode": analytical_communication_mode,
         "analytical_moe_dispatch_dtype": analytical_moe_dispatch_dtype,
         "analytical_moe_combine_dtype": analytical_moe_combine_dtype,
@@ -1653,6 +1671,7 @@ def build_default_tasks(
         # Fan out the shared worker spec to both roles (v2 disagg forbids top-level worker fields).
         return Task(
             serving_mode="disagg",
+            pareto_algorithm=pareto_algorithm,
             prefill_model_path=model_path,
             decode_model_path=model_path,
             prefill_system_name=system,
@@ -2355,6 +2374,7 @@ def _run_estimate_mode(args):
         analytical_level=args.analytical_level,
         analytical_fp8_gemm_recipe=args.analytical_fp8_gemm_recipe,
         analytical_attention_algorithm=args.analytical_attention_algorithm,
+        analytical_sparse_attention_head_quantum=args.analytical_sparse_attention_head_quantum,
         analytical_communication_mode=args.analytical_communication_mode,
         analytical_moe_dispatch_dtype=args.analytical_moe_dispatch_dtype,
         analytical_moe_combine_dtype=args.analytical_moe_combine_dtype,
@@ -2664,6 +2684,7 @@ def _run_recommend(args) -> None:
             analytical_level=args.analytical_level,
             analytical_fp8_gemm_recipe=args.analytical_fp8_gemm_recipe,
             analytical_attention_algorithm=args.analytical_attention_algorithm,
+            analytical_sparse_attention_head_quantum=args.analytical_sparse_attention_head_quantum,
             analytical_communication_mode=args.analytical_communication_mode,
             analytical_moe_dispatch_dtype=args.analytical_moe_dispatch_dtype,
             analytical_moe_combine_dtype=args.analytical_moe_combine_dtype,
@@ -2821,10 +2842,12 @@ def main(args):
             backend=args.backend,
             backend_version=args.backend_version,
             database_mode=args.database_mode,
+            pareto_algorithm=args.pareto_algorithm,
             transfer_policy=args.transfer_policy,
             analytical_level=args.analytical_level,
             analytical_fp8_gemm_recipe=args.analytical_fp8_gemm_recipe,
             analytical_attention_algorithm=args.analytical_attention_algorithm,
+            analytical_sparse_attention_head_quantum=args.analytical_sparse_attention_head_quantum,
             analytical_communication_mode=args.analytical_communication_mode,
             analytical_moe_dispatch_dtype=args.analytical_moe_dispatch_dtype,
             analytical_moe_combine_dtype=args.analytical_moe_combine_dtype,

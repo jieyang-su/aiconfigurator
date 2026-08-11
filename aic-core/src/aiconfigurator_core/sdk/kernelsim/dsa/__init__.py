@@ -1,6 +1,7 @@
 """Provisional analytical models for sparse-attention index kernels."""
 
 from .model import (
+    CALIBRATED_TOPK,
     DSA_INDEX_MODEL_VERSION,
     LIMITED_SCOPE_MESSAGE,
     DsaIndexModelWarning,
@@ -17,6 +18,7 @@ from .model import (
 )
 
 __all__ = [
+    "CALIBRATED_TOPK",
     "DSA_INDEX_MODEL_VERSION",
     "LIMITED_SCOPE_MESSAGE",
     "DsaIndexModelWarning",

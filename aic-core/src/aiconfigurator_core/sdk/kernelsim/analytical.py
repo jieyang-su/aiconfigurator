@@ -17,6 +17,7 @@ from aiconfigurator_core.sdk.kernelsim.dsa import (
     estimate_index_mqa,
     estimate_index_topk,
 )
+from aiconfigurator_core.sdk.kernelsim.dsv4_topk import Dsv4TopKShape, estimate_dsv4_topk
 from aiconfigurator_core.sdk.kernelsim.fa import (
     AttentionShape,
     HardwareSpec,
@@ -33,6 +34,7 @@ from aiconfigurator_core.sdk.kernelsim.gemm.model import (
     estimate_sglang_fp8,
 )
 from aiconfigurator_core.sdk.kernelsim.moe.model import estimate_sglang_moe
+from aiconfigurator_core.sdk.kernelsim.msa import MsaIndexShape, estimate_msa_index
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ class AnalyticalConfig:
     level: str = "standard"
     fp8_gemm_recipe: str = "sglang"
     attention_algorithm: str = "fa2"
+    sparse_attention_head_quantum: int | None = None
     communication_mode: str = "empirical"
     moe_dispatch_dtype: str = "half"
     moe_combine_dtype: str = "half"
@@ -71,6 +74,8 @@ class AnalyticalConfig:
             raise ValueError("FP8 GEMM recipe must be sglang, deepgemm-hopper, or deepgemm-blackwell")
         if algorithm not in {"fa2", "fa3"}:
             raise ValueError("attention algorithm must be fa2 or fa3")
+        if self.sparse_attention_head_quantum not in {None, 64, 128}:
+            raise ValueError("sparse attention head quantum must be omitted, 64, or 128")
         if communication_mode not in {"empirical", "silicon"}:
             raise ValueError("analytical communication mode must be empirical or silicon")
         for name, dtype in communication_dtypes.items():
@@ -82,6 +87,22 @@ class AnalyticalConfig:
         object.__setattr__(self, "communication_mode", communication_mode)
         for name, dtype in communication_dtypes.items():
             object.__setattr__(self, name, dtype)
+
+    def sparse_attention_executed_heads(self, logical_heads: int) -> int:
+        """Apply an explicitly selected sparse-kernel head contract."""
+        heads = int(logical_heads)
+        if heads <= 0:
+            raise ValueError("logical sparse attention heads must be positive")
+        quantum = self.sparse_attention_head_quantum
+        if quantum is None or heads % quantum == 0:
+            return heads
+        if quantum % heads == 0:
+            return quantum
+        raise ValueError(
+            f"sparse attention heads={heads} are incompatible with the configured "
+            f"head quantum={quantum}; the SGLang padding policy only pads divisors "
+            "to one execution quantum"
+        )
 
     def moe_communication_dtype(self, *, wideep: bool, dispatch: bool) -> common.CommQuantMode:
         """Return the configured dtype for analytical/SOL/empirical MoE communication."""
@@ -186,6 +207,7 @@ def attention_latency_ms(
     head_dim: int,
     dtype: str,
     config: AnalyticalConfig,
+    causal: bool = True,
 ) -> float:
     result = estimate_attention(
         fa_hardware(system, gpu),
@@ -197,6 +219,7 @@ def attention_latency_ms(
             kv_heads=kv_heads,
             head_dim=head_dim,
             dtype=dtype,
+            causal=causal,
         ),
         ModelOptions(
             algorithm=config.attention_algorithm,
@@ -311,12 +334,75 @@ def index_topk_latency_ms(
             context_length=context_length,
             topk=index_topk,
             variant="fused",
-            score_distribution="standard",
+            # Production DSA consumes the natural score emitted by Index MQA.
+            # flat/top_last are collector diagnostics, not serving defaults.
+            score_distribution="natural",
         ),
         hbm_bandwidth_bytes_s=float(gpu["mem_bw"]),
         parameter_level=config.level,
     )
     return result.latency_us / 1000.0
+
+
+def dsv4_topk_latency_ms(
+    *,
+    gpu: dict,
+    variant: str,
+    batch: int,
+    fresh_tokens: int,
+    prefix_tokens: int,
+    index_topk: int,
+    compression_ratio: int,
+    config: AnalyticalConfig,
+) -> float:
+    result = estimate_dsv4_topk(
+        Dsv4TopKShape(
+            variant=variant,
+            batch_size=batch,
+            fresh_tokens=fresh_tokens,
+            prefix_tokens=prefix_tokens,
+            topk=index_topk,
+            compression_ratio=compression_ratio,
+        ),
+        sm_count=int(gpu["sm_count"]),
+        parameter_level=config.level,
+    )
+    return result.latency_us / 1000.0
+
+
+def msa_index_latency_ms(*, gpu: dict, phase: str, batch: int, query_length: int,
+                         context_length: int, index_heads: int, index_head_dim: int,
+                         config: AnalyticalConfig) -> float:
+    """Estimate M3's BF16 Triton block-score kernel, including block max."""
+    required = {"sm_count", "mem_bw"}
+    missing = sorted(required - gpu.keys())
+    if missing:
+        raise ValueError(f"MSA index analytical hardware fields missing: {', '.join(missing)}")
+    result = estimate_msa_index(
+        MsaIndexShape(phase, batch, query_length, context_length, index_heads, index_head_dim),
+        sm_count=int(gpu["sm_count"]),
+        hbm_bandwidth_bytes_s=float(gpu["mem_bw"]),
+        parameter_level=config.level,
+    )
+    return result.latency_us / 1000.0
+
+
+def msa_topk_elementwise_latency_ms(*, gpu: dict, rows: int, candidate_blocks: int,
+                                    topk_blocks: int, config: AnalyticalConfig) -> float:
+    """Small conservative MSA TopK approximation.
+
+    The production TopK is a sorting/reduction kernel, but its measured cost is
+    small relative to index and main attention. Keep it as a launch-aware
+    memory recipe until a dedicated MSA TopK calibration is justified.
+    """
+    if rows <= 0 or candidate_blocks <= 0 or topk_blocks <= 0:
+        raise ValueError("MSA TopK shape values must be positive")
+    bytes_moved = rows * (candidate_blocks * 4 + min(candidate_blocks, topk_blocks) * 4)
+    # A small launch floor prevents the bytes-only estimate from collapsing to
+    # zero for batch-one decode, without pretending this is a fitted TopK model.
+    floor_us = 1.5
+    memory_us = bytes_moved / float(gpu["mem_bw"]) * 1e6 / 0.35
+    return (floor_us + memory_us) * {"low": 0.85, "standard": 1.0, "high": 1.25}[config.level] / 1000.0
 
 
 def dsa_sparse_attention_latency_ms(
@@ -342,17 +428,18 @@ def dsa_sparse_attention_latency_ms(
     if peak_key not in gpu:
         raise ValueError(f"DSA sparse attention analytical model requires gpu.{peak_key}")
     tokens = batch * query_length
-    attention_flops = 2.0 * selected_pairs * local_heads * (qk_latent_dim + value_latent_dim)
-    absorption_flops = 2.0 * tokens * local_heads * value_latent_dim * (qk_nope_dim + output_value_dim)
+    executed_heads = config.sparse_attention_executed_heads(local_heads)
+    attention_flops = 2.0 * selected_pairs * executed_heads * (qk_latent_dim + value_latent_dim)
+    absorption_flops = 2.0 * tokens * executed_heads * value_latent_dim * (qk_nope_dim + output_value_dim)
     flops = attention_flops + absorption_flops
     # One latent KV stream is shared by all query heads. Use average selected
     # rows per query for the unique-cache lower bound and retain output traffic.
     average_selected = selected_pairs / max(1, tokens)
     logical_bytes = (
-        tokens * local_heads * qk_latent_dim * 2
+        tokens * executed_heads * qk_latent_dim * 2
         + batch * average_selected * qk_latent_dim * 2
-        + tokens * local_heads * value_latent_dim * 2
-        + local_heads * value_latent_dim * (qk_nope_dim + output_value_dim) * 2
+        + tokens * executed_heads * value_latent_dim * 2
+        + executed_heads * value_latent_dim * (qk_nope_dim + output_value_dim) * 2
     )
     compute_ms = flops / (float(gpu[peak_key]) * profile.compute_efficiency) * 1000
     memory_ms = logical_bytes / (float(gpu["mem_bw"]) * profile.hbm_efficiency) * 1000

@@ -5,6 +5,7 @@ import warnings
 import pytest
 
 from aiconfigurator_core.sdk import common, config
+from aiconfigurator_core.sdk.kernelsim.analytical import dsa_sparse_attention_latency_ms
 from aiconfigurator_core.sdk.kernelsim.dsa import DsaIndexModelWarning
 from aiconfigurator_core.sdk.models import get_model
 from aiconfigurator_core.sdk.operations import (
@@ -92,3 +93,30 @@ def test_context_select_all_skips_index_score_and_topk():
     topk = next(op for op in fallback if isinstance(op, DSATopKSelect))
     assert float(score.query(database, batch_size=1, s=1024, prefix=1024)) == 0
     assert float(topk.query(database, batch_size=1, s=1024, prefix=1024)) == 0
+
+
+def test_sparse_attention_head_quantum_is_explicit_and_changes_only_kernel_work():
+    from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig
+
+    gpu = get_database_view(
+        "h100_sxm", "sglang", "estimate", allow_missing_data=True, database_mode="ANALYTICAL"
+    ).system_spec["gpu"]
+    kwargs = dict(
+        gpu=gpu,
+        batch=1,
+        query_length=8192,
+        selected_pairs=8192 * 2048,
+        local_heads=16,
+        qk_latent_dim=576,
+        value_latent_dim=512,
+        qk_nope_dim=128,
+        output_value_dim=128,
+    )
+    default = dsa_sparse_attention_latency_ms(**kwargs, config=AnalyticalConfig())
+    hopper = dsa_sparse_attention_latency_ms(
+        **kwargs, config=AnalyticalConfig(sparse_attention_head_quantum=64)
+    )
+    blackwell = dsa_sparse_attention_latency_ms(
+        **kwargs, config=AnalyticalConfig(sparse_attention_head_quantum=128)
+    )
+    assert default < hopper < blackwell

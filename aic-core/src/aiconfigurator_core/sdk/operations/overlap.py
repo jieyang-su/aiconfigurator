@@ -69,6 +69,7 @@ class FallbackOp(Operation):
         *,
         seq_split: int = 1,
         silicon_primary_only: bool = False,
+        primary_excluded_modes: tuple[common.DatabaseMode, ...] = (),
     ) -> None:
         """
         Args:
@@ -81,11 +82,15 @@ class FallbackOp(Operation):
             silicon_primary_only: Try the primary only for SILICON/HYBRID.
                 Theoretical modes use the granular sequence directly when the
                 module's SOL does not cover its complete profiled boundary.
+            primary_excluded_modes: Additional modes that must execute the
+                granular sequence. This allows a module to retain its existing
+                SOL/EMPIRICAL behavior while adding a no-table ANALYTICAL path.
         """
         super().__init__(name, 1.0, seq_split=seq_split)  # scale_factor handled by inner ops
         self._primary = primary
         self._fallback = fallback
         self._silicon_primary_only = silicon_primary_only
+        self._primary_excluded_modes = frozenset(primary_excluded_modes)
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         from aiconfigurator_core.sdk.perf_database import PerfDataNotAvailableError, _get_configured_database_view
@@ -95,6 +100,7 @@ class FallbackOp(Operation):
             common.DatabaseMode.SILICON,
             common.DatabaseMode.HYBRID,
         )
+        use_primary = use_primary and mode not in self._primary_excluded_modes
         primary_database = (
             _get_configured_database_view(
                 database,
