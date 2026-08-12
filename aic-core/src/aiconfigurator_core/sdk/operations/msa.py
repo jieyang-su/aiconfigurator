@@ -21,6 +21,8 @@ pulls the absolute level. Falls back to a constant when DSA data is absent.
 from __future__ import annotations
 
 import logging
+import math
+import warnings
 from typing import TYPE_CHECKING
 
 from aiconfigurator_core.sdk import common
@@ -33,6 +35,10 @@ if TYPE_CHECKING:
     from aiconfigurator_core.sdk.perf_database import PerfDatabase
 
 logger = logging.getLogger(__name__)
+
+
+class MsaAnalyticalApproximationWarning(UserWarning):
+    """Warning for deliberately approximate non-index MSA granular recipes."""
 
 
 def _msa_attention_sol(
@@ -250,6 +256,88 @@ class _BaseMSAModule(Operation):
             gemm_quant_mode=self._gemm_quant_mode,
         )[0]
 
+    def _analytical(self, database, *, b: int, s: int, prefix: int, is_context: bool) -> float:
+        """Granular no-table MSA recipe used only by ANALYTICAL mode."""
+        from aiconfigurator_core.sdk.kernelsim.analytical import (
+            attention_latency_ms,
+            gemm_latency_ms,
+            msa_index_latency_ms,
+            msa_topk_elementwise_latency_ms,
+        )
+
+        gpu = database.system_spec["gpu"]
+        config = database._analytical_config
+        tokens = b * s if is_context else b
+        full_context = prefix + s if is_context else s
+        query_length = s if is_context else 1
+
+        # SGLang produces main Q/K/V and index Q/K from one fused projection.
+        fused_n = (
+            self._num_heads * self._head_dim
+            + 2 * self._num_kv_heads * self._head_dim
+            + self._index_n_heads * self._index_head_dim
+            + self._index_head_dim
+        )
+        latency = gemm_latency_ms(tokens, fused_n, self._hidden_size, self._gemm_quant_mode, gpu, config)
+
+        selected_tokens = min(full_context, self._index_topk)
+        dtype = "fp8" if self._fmha_quant_mode in (common.FMHAQuantMode.fp8, common.FMHAQuantMode.fp8_block) else "bf16"
+        latency += attention_latency_ms(
+            system=database.system,
+            gpu=gpu,
+            batch=b,
+            query_length=query_length,
+            # FA schema requires kv >= fresh query length. For prefill the
+            # selected-block adapter therefore retains the causal query span;
+            # the sparse reduction is represented by the capped KV axis.
+            kv_length=max(query_length, selected_tokens),
+            query_heads=self._num_heads,
+            kv_heads=self._num_kv_heads,
+            head_dim=self._head_dim,
+            dtype=dtype,
+            config=config,
+        )
+        latency += gemm_latency_ms(
+            tokens,
+            self._hidden_size,
+            self._num_heads * self._v_head_dim,
+            self._gemm_quant_mode,
+            gpu,
+            config,
+        )
+
+        # At <= topk selected tokens every block is retained, so production
+        # skips score materialization and TopK selection.
+        if full_context > self._index_topk:
+            latency += msa_index_latency_ms(
+                gpu=gpu,
+                phase="prefill" if is_context else "decode",
+                batch=b,
+                query_length=query_length,
+                context_length=full_context,
+                index_heads=self._index_n_heads,
+                index_head_dim=self._index_head_dim,
+                config=config,
+            )
+            rows = b * self._index_n_heads * (math.ceil(query_length / 128) if is_context else 1)
+            latency += msa_topk_elementwise_latency_ms(
+                gpu=gpu,
+                rows=rows,
+                candidate_blocks=math.ceil(full_context / self._block_size),
+                topk_blocks=math.ceil(self._index_topk / self._block_size),
+                config=config,
+            )
+
+        warnings.warn(
+            "MiniMax MSA ANALYTICAL uses a provisional single-H100 BF16 Triton index fit, "
+            "a launch-aware ElementWise approximation for block TopK/page transform, and "
+            "the dense FA model as a selected-block GQA proxy. Cross-GPU/backend/dtype "
+            "transfer and random block-gather effects are not calibrated.",
+            MsaAnalyticalApproximationWarning,
+            stacklevel=3,
+        )
+        return latency
+
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
 
@@ -262,6 +350,9 @@ class ContextMSAModule(_BaseMSAModule):
         s = kwargs.get("s")
         prefix = kwargs.get("prefix", 0)
         mode = database._default_database_mode
+        if mode == common.DatabaseMode.ANALYTICAL:
+            latency = self._analytical(database, b=int(b), s=int(s), prefix=int(prefix), is_context=True)
+            return PerformanceResult(latency * self._scale_factor, energy=0.0, source="analytical")
         sol = self._sol(database, b, s, prefix, is_context=True)
         if mode in (common.DatabaseMode.SOL, common.DatabaseMode.SOL_FULL):
             return PerformanceResult(sol * self._scale_factor, energy=0.0, source="sol")
@@ -305,6 +396,9 @@ class GenerationMSAModule(_BaseMSAModule):
         b = kwargs.get("batch_size")
         s = kwargs.get("s")
         mode = database._default_database_mode
+        if mode == common.DatabaseMode.ANALYTICAL:
+            latency = self._analytical(database, b=int(b), s=int(s), prefix=0, is_context=False)
+            return PerformanceResult(latency * self._scale_factor, energy=0.0, source="analytical")
         sol = self._sol(database, b, s, 0, is_context=False)
         if mode in (common.DatabaseMode.SOL, common.DatabaseMode.SOL_FULL):
             return PerformanceResult(sol * self._scale_factor, energy=0.0, source="sol")

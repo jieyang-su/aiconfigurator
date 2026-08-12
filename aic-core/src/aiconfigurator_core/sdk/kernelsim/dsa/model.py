@@ -1,10 +1,9 @@
 """KernelSim models for DSA Index MQA and TopK/index-transform kernels.
 
-The production recipes in this module are the v2 graph-replay fits from one
+The production recipes in this module are graph-replay fits from one
 H100 SXM running SGLang 0.5.12.  Index MQA is modeled as a task-service kernel;
-TopK is modeled as a piecewise kernel-regime operation.  FLOPs and bytes are
-returned for diagnostics only and are deliberately not used as the latency
-prediction for the selected recipes.
+production-natural TopK uses the v3 short/long query-wave model, while the
+synthetic flat/top-last diagnostics retain the v2 kernel-regime formula.
 
 This is an engineering model for sparse-attention architecture studies, not a
 cross-GPU silicon model.  Every estimate carries the calibration limitation in
@@ -17,8 +16,7 @@ import math
 import warnings as python_warnings
 from dataclasses import dataclass
 
-
-DSA_INDEX_MODEL_VERSION = "2026-08-07.aic-dsa-index-v2"
+DSA_INDEX_MODEL_VERSION = "2026-08-11.aic-dsa-index-v3"
 CALIBRATED_TOPK = 2048
 CALIBRATED_HEADS = (32, 64)
 CALIBRATED_HEAD_DIM = 128
@@ -26,12 +24,15 @@ CALIBRATED_PAGE_SIZE = 64
 CALIBRATED_SCORE_CHUNK_SLOTS = 8_000_000
 CALIBRATED_TAIL_THRESHOLD = 32_768
 CALIBRATED_ROW_SATURATION = 166.11336514650998
+CALIBRATED_NATURAL_MAX_CONTEXT = 524_288
+CALIBRATED_NATURAL_MAX_ROWS = 8_192
 
 LIMITED_SCOPE_MESSAGE = (
     "The DSA Index MQA/TopK KernelSim model is provisional: it was calibrated "
     "from CUDA-graph-replay measurements on one H100 SXM with SGLang 0.5.12. "
     "Index MQA covers the recorded FP8 DeepGEMM-style paged/ragged recipes; "
-    "TopK covers the FP32-score fused transform recipe. It is not validated "
+    "TopK natural covers the FP32-score fused transform through 524K context "
+    "and 8192 query rows; flat/top-last remain v2 diagnostics. It is not validated "
     "across GPUs, backends, dtypes, layouts, or sparse-attention variants."
 )
 
@@ -274,8 +275,7 @@ def estimate_index_mqa(
         service_atoms = shape.batch_size * math.ceil(shape.context_length / shape.page_size)
         critical_blocks = 0.0
         valid_pairs = shape.batch_size * (
-            shape.query_length * shape.context_length
-            + shape.query_length * (shape.query_length - 1) // 2
+            shape.query_length * shape.context_length + shape.query_length * (shape.query_length - 1) // 2
         )
         aligned = math.ceil((shape.context_length + shape.query_length - 1) / shape.page_size) * shape.page_size
         score_slots = shape.batch_size * shape.query_length * aligned
@@ -303,9 +303,7 @@ def estimate_index_mqa(
     task_us = service_atoms * cycles / clock * 1e6
     floor_us = floor * (chunks if not paged else 1) * params.latency_scale
     task_us *= params.latency_scale
-    warning_messages.append(
-        "FLOPs/bytes are diagnostic lower bounds; task-service terms determine latency"
-    )
+    warning_messages.append("FLOPs/bytes are diagnostic lower bounds; task-service terms determine latency")
     return IndexMqaEstimate(
         latency_us=floor_us + task_us,
         parameter_level=level,
@@ -343,8 +341,6 @@ class IndexTopKShape:
         object.__setattr__(self, "layout", _layout(self.layout))
         for name in ("batch_size", "query_length", "context_length", "topk"):
             object.__setattr__(self, name, _positive_int(name, getattr(self, name)))
-        if self.query_length > self.context_length:
-            raise ValueError("query_length must not exceed context_length")
         variant = self.variant.strip().lower()
         if variant == "fused":
             variant = f"{self.layout}_fused"
@@ -375,6 +371,19 @@ class IndexTopKParameters:
     row_flat_ms: float
     row_top_last_ms: float
     row_saturation: float
+    natural_short_floor_paged_us: float
+    natural_short_floor_ragged_us: float
+    natural_long_floor_paged_us: float
+    natural_long_floor_ragged_us: float
+    natural_short_inverse_efficiency_paged: float
+    natural_short_inverse_efficiency_ragged: float
+    natural_long_inverse_efficiency_paged: float
+    natural_long_inverse_efficiency_ragged: float
+    natural_tail_inverse_efficiency_paged: float
+    natural_tail_inverse_efficiency_ragged: float
+    natural_short_query_tile: int = 256
+    natural_long_query_tile: int = 128
+    natural_tail_start_waves: int = 4
     latency_scale: float = 1.0
     tail_threshold: int = CALIBRATED_TAIL_THRESHOLD
 
@@ -394,15 +403,31 @@ _TOPK_STANDARD = IndexTopKParameters(
     row_flat_ms=0.009409707852940298,
     row_top_last_ms=0.005859134754325899,
     row_saturation=CALIBRATED_ROW_SATURATION,
+    natural_short_floor_paged_us=3.223162275792814,
+    natural_short_floor_ragged_us=2.1849641735464873,
+    natural_long_floor_paged_us=6.885035995748586,
+    natural_long_floor_ragged_us=7.00554041693735,
+    natural_short_inverse_efficiency_paged=2.0177496158220974e-06,
+    natural_short_inverse_efficiency_ragged=1.2788940003724325,
+    natural_long_inverse_efficiency_paged=2.404003100179183,
+    natural_long_inverse_efficiency_ragged=2.9601479014257794,
+    natural_tail_inverse_efficiency_paged=0.0,
+    natural_tail_inverse_efficiency_ragged=2.620612297666048,
 )
 _TOPK_PROFILES = {
     "standard": _TOPK_STANDARD,
-    "high": IndexTopKParameters(**{
-        **_TOPK_STANDARD.__dict__, "latency_scale": 1.35,
-    }),
-    "low": IndexTopKParameters(**{
-        **_TOPK_STANDARD.__dict__, "latency_scale": 0.75,
-    }),
+    "high": IndexTopKParameters(
+        **{
+            **_TOPK_STANDARD.__dict__,
+            "latency_scale": 1.35,
+        }
+    ),
+    "low": IndexTopKParameters(
+        **{
+            **_TOPK_STANDARD.__dict__,
+            "latency_scale": 0.75,
+        }
+    ),
 }
 
 
@@ -433,6 +458,11 @@ class IndexTopKEstimate:
     row_penalty_us: float = 0.0
     threshold: int = CALIBRATED_TOPK
     tail_threshold: int = CALIBRATED_TAIL_THRESHOLD
+    query_tile: int = 0
+    waves: int = 0
+    tail_waves: int = 0
+    executed_score_bytes: float = 0.0
+    model_recipe: str = "v2_kernel_regime"
 
 
 def estimate_index_topk(
@@ -468,15 +498,67 @@ def estimate_index_topk(
         warnings.append("plain TopK variant was not the production fused calibration boundary")
     if shape.score_distribution == "top_last":
         warnings.append("top_last score distribution has high validation error and is diagnostic only")
-    if shape.context_length > 65_536:
-        warnings.append("context exceeds the calibrated 65536-token range")
-
     distribution = "natural" if shape.score_distribution == "standard" else shape.score_distribution
     rows = shape.batch_size * shape.query_length
     width = shape.context_length if shape.layout == "paged" else shape.batch_size * shape.context_length
     score_slots = rows * width
     output_indices = rows * min(shape.topk, width)
     short = shape.context_length <= shape.topk
+
+    if distribution == "natural":
+        if shape.context_length > CALIBRATED_NATURAL_MAX_CONTEXT:
+            warnings.append(f"natural TopK context exceeds the calibrated {CALIBRATED_NATURAL_MAX_CONTEXT}-token range")
+        if rows > CALIBRATED_NATURAL_MAX_ROWS:
+            warnings.append(f"natural TopK query rows exceed the calibrated {CALIBRATED_NATURAL_MAX_ROWS}-row range")
+        if shape.layout == "paged" and shape.query_length != 1:
+            warnings.append("natural paged TopK was calibrated only for the production Q=1 recipe")
+
+        branch = "short" if short else "long"
+        tile = params.natural_short_query_tile if short else params.natural_long_query_tile
+        waves = math.ceil(rows / tile)
+        tail_waves = 0 if short else max(0, waves - params.natural_tail_start_waves)
+        floor_us = getattr(params, f"natural_{branch}_floor_{shape.layout}_us")
+        inverse_efficiency = getattr(params, f"natural_{branch}_inverse_efficiency_{shape.layout}")
+        executed_score_bytes = float(waves * tile * shape.context_length * 4)
+        main_scan_us = executed_score_bytes / bandwidth * inverse_efficiency * 1e6
+        tail_inverse_efficiency = getattr(params, f"natural_tail_inverse_efficiency_{shape.layout}")
+        tail_score_bytes = float(tail_waves * tile * shape.context_length * 4)
+        tail_us = tail_score_bytes / bandwidth * tail_inverse_efficiency * 1e6
+        scale = params.latency_scale
+        floor_us *= scale
+        main_scan_us *= scale
+        tail_us *= scale
+        scan_us = main_scan_us + tail_us
+        raw_scan_us = (score_slots * 4 + output_indices * 4) / bandwidth * 1e6
+        return IndexTopKEstimate(
+            latency_us=floor_us + scan_us,
+            parameter_level=level,
+            layout=shape.layout,
+            variant=shape.variant,
+            score_distribution=shape.score_distribution,
+            scope="single_h100_sglang_0.5.12_graph_replay_natural_v3",
+            warnings=tuple(warnings),
+            floor_us=floor_us,
+            scan_us=scan_us,
+            score_slots=score_slots,
+            output_indices=output_indices,
+            query_rows=rows,
+            row_parallel_efficiency=min(1.0, rows / tile),
+            effective_pass_factor=(scan_us / raw_scan_us if raw_scan_us > 0 else 0.0),
+            row_saturation=float(tile),
+            long_path=not short,
+            tail_us=tail_us,
+            threshold=shape.topk,
+            tail_threshold=params.natural_tail_start_waves,
+            query_tile=tile,
+            waves=waves,
+            tail_waves=tail_waves,
+            executed_score_bytes=executed_score_bytes,
+            model_recipe="natural_wave_v3",
+        )
+
+    if shape.context_length > 65_536:
+        warnings.append("diagnostic distribution context exceeds the calibrated 65536-token range")
     short_floor = params.short_floor_paged_us if shape.layout == "paged" else params.short_floor_ragged_us
     if short:
         floor_us = short_floor * params.latency_scale

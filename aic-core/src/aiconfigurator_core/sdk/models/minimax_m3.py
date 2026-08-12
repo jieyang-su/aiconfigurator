@@ -155,25 +155,53 @@ class MiniMaxM3Model(BaseModel):
             )
 
         nl = self._num_layers
+        dense_layers = int(self.extra_params.get("first_k_dense_replace", 3))
+        sparse_layers = nl - dense_layers
+        dense_inter = int(self.extra_params.get("dense_intermediate_size", 12288))
+        if not 0 <= dense_layers <= nl:
+            raise ValueError("first_k_dense_replace must be within the model layer count")
         self.context_ops.extend(
             [
                 ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3),
                 ops.ElementWise("context_add_norm_1", nl, 2 * h, 2 * h, 0.8),
-                _msa(ops.ContextMSAModule, "context_attention", nl),
+                ops.GEMM(
+                    "context_dense_qkv_gemm",
+                    dense_layers,
+                    local_heads * self._head_size + 2 * local_kv_heads * self._head_size,
+                    h,
+                    gemm_quant_mode,
+                ),
+                ops.ContextAttention(
+                    "context_dense_attention",
+                    dense_layers,
+                    local_heads,
+                    local_kv_heads,
+                    kvcache_quant_mode,
+                    fmha_quant_mode,
+                    head_size=self._head_size,
+                    use_qk_norm=True,
+                ),
+                ops.GEMM("context_dense_proj_gemm", dense_layers, h, local_heads * self._head_size, gemm_quant_mode),
+                _msa(ops.ContextMSAModule, "context_attention", sparse_layers),
                 ops.ElementWise("context_add_norm_2", nl, 2 * h, 2 * h, 0.8),
-                _shared_gate_up("context_shared_gate_up_gemm", nl),
+                ops.GEMM("context_dense_gate_up_gemm", dense_layers, 2 * dense_inter // tp_size, h, gemm_quant_mode),
+                ops.ElementWise(
+                    "context_dense_act_gate", dense_layers, 2 * dense_inter // tp_size, dense_inter // tp_size, 0.8
+                ),
+                ops.GEMM("context_dense_ffn2_gemm", dense_layers, h, dense_inter // tp_size, gemm_quant_mode),
+                _shared_gate_up("context_shared_gate_up_gemm", sparse_layers),
                 ops.ElementWise(
                     "context_shared_act_gate",
-                    nl,
+                    sparse_layers,
                     2 * self._moe_inter_size // tp_size,
                     self._moe_inter_size // tp_size,
                     0.8,
                 ),
-                _shared_ffn2("context_shared_ffn2_gemm", nl),
-                _router("context_router_gemm", nl),
-                _dispatch("context_moe_pre_dispatch", nl, True),
-                _moe("context_moe", nl),
-                _dispatch("context_moe_post_dispatch", nl, False),
+                _shared_ffn2("context_shared_ffn2_gemm", sparse_layers),
+                _router("context_router_gemm", sparse_layers),
+                _dispatch("context_moe_pre_dispatch", sparse_layers, True),
+                _moe("context_moe", sparse_layers),
+                _dispatch("context_moe_post_dispatch", sparse_layers, False),
                 ops.GEMM("context_logits_gemm", 1, self._vocab_size // tp_size, h, common.GEMMQuantMode.bfloat16),
             ]
         )
@@ -183,26 +211,56 @@ class MiniMaxM3Model(BaseModel):
             [
                 ops.Embedding("generation_embedding", 1 * mtp, self._vocab_size, h, 0.3),
                 ops.ElementWise("generation_add_norm_1", nl * mtp, 2 * h, 2 * h, 0.8),
-                _msa(ops.GenerationMSAModule, "generation_attention", nl * mtp),
+                ops.GEMM(
+                    "generation_dense_qkv_gemm",
+                    dense_layers * mtp,
+                    local_heads * self._head_size + 2 * local_kv_heads * self._head_size,
+                    h,
+                    gemm_quant_mode,
+                ),
+                ops.GenerationAttention(
+                    "generation_dense_attention",
+                    dense_layers * mtp,
+                    local_heads,
+                    local_kv_heads,
+                    kvcache_quant_mode,
+                    head_size=self._head_size,
+                    use_qk_norm=True,
+                ),
+                ops.GEMM(
+                    "generation_dense_proj_gemm", dense_layers * mtp, h, local_heads * self._head_size, gemm_quant_mode
+                ),
+                _msa(ops.GenerationMSAModule, "generation_attention", sparse_layers * mtp),
                 ops.ElementWise("generation_add_norm_2", nl * mtp, 2 * h, 2 * h, 0.8),
+                ops.GEMM(
+                    "generation_dense_gate_up_gemm", dense_layers * mtp, 2 * dense_inter // tp_size, h, gemm_quant_mode
+                ),
+                ops.ElementWise(
+                    "generation_dense_act_gate",
+                    dense_layers * mtp,
+                    2 * dense_inter // tp_size,
+                    dense_inter // tp_size,
+                    0.8,
+                ),
+                ops.GEMM("generation_dense_ffn2_gemm", dense_layers * mtp, h, dense_inter // tp_size, gemm_quant_mode),
             ]
         )
         gen_shared_ops = [
-            _shared_gate_up("generation_shared_gate_up_gemm", nl * mtp),
+            _shared_gate_up("generation_shared_gate_up_gemm", sparse_layers * mtp),
             ops.ElementWise(
                 "generation_shared_act_gate",
-                nl * mtp,
+                sparse_layers * mtp,
                 2 * self._moe_inter_size // tp_size,
                 self._moe_inter_size // tp_size,
                 0.8,
             ),
-            _shared_ffn2("generation_shared_ffn2_gemm", nl * mtp),
+            _shared_ffn2("generation_shared_ffn2_gemm", sparse_layers * mtp),
         ]
         gen_routed_ops = [
-            _router("generation_router_gemm", nl * mtp),
-            _dispatch("generation_moe_pre_dispatch", nl * mtp, True),
-            _moe("generation_moe", nl * mtp),
-            _dispatch("generation_moe_post_dispatch", nl * mtp, False),
+            _router("generation_router_gemm", sparse_layers * mtp),
+            _dispatch("generation_moe_pre_dispatch", sparse_layers * mtp, True),
+            _moe("generation_moe", sparse_layers * mtp),
+            _dispatch("generation_moe_post_dispatch", sparse_layers * mtp, False),
         ]
         self.generation_ops.append(
             ops.OverlapOp("generation_moe_overlap", group_a=gen_routed_ops, group_b=gen_shared_ops)

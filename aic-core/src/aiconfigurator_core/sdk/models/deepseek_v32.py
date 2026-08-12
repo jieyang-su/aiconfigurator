@@ -14,6 +14,7 @@ from aiconfigurator_core.sdk.models.helpers import (
     mtp_scale_factor,
     quant_exclude_patterns,
 )
+from aiconfigurator_core.sdk.operations.dsa import DSA_MODEL_DIMS
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,263 @@ def _dsa_shared_expert_quant_mode(extra_params: object, fallback: common.GEMMQua
     if isinstance(extra_params, dict):
         return extra_params.get("dsa_shared_expert_quant_mode", fallback)
     return fallback
+
+
+def _dsa_dims(architecture: str, extra_params: object) -> dict:
+    dims = dict(DSA_MODEL_DIMS.get(architecture, DSA_MODEL_DIMS["DeepseekV32ForCausalLM"]))
+    if isinstance(extra_params, dict):
+        for key in (
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_nope_head_dim",
+            "qk_rope_head_dim",
+            "v_head_dim",
+            "index_head_dim",
+            "index_n_heads",
+            "index_topk",
+        ):
+            if extra_params.get(key):
+                dims[key] = int(extra_params[key])
+    return dims
+
+
+def _dsa_granular_ops(
+    *,
+    phase: str,
+    scale_factor: float,
+    local_heads: int,
+    architecture: str,
+    extra_params: object,
+    projection_modes: dict,
+    cp_size: int = 1,
+) -> list:
+    """Build a DSA recipe from existing ops plus three sparse primitives."""
+    dims = _dsa_dims(architecture, extra_params)
+    h = dims["hidden_size"]
+    q_lora = dims["q_lora_rank"]
+    kv_lora = dims["kv_lora_rank"]
+    rope = dims["qk_rope_head_dim"]
+    qk_nope = dims["qk_nope_head_dim"]
+    value_dim = dims["v_head_dim"]
+    index_heads = dims["index_n_heads"]
+    index_dim = dims["index_head_dim"]
+    index_topk = dims["index_topk"]
+    full_fraction = float(extra_params.get("dsa_full_layer_fraction", 1.0)) if isinstance(extra_params, dict) else 1.0
+    producer_scale = scale_factor * full_fraction
+    is_context = phase == "context"
+    layout = "ragged" if is_context else "paged"
+    seq_split = cp_size if is_context else 1
+
+    result = [
+        ops.GEMM(f"{phase}_dsa_q_a_proj", scale_factor, q_lora, h, projection_modes["q"], seq_split=seq_split),
+        ops.GEMM(
+            f"{phase}_dsa_kv_a_proj",
+            scale_factor,
+            kv_lora + rope,
+            h,
+            projection_modes["kv"],
+            seq_split=seq_split,
+        ),
+        ops.ElementWise(
+            f"{phase}_dsa_q_kv_norm",
+            scale_factor,
+            q_lora + kv_lora,
+            q_lora + kv_lora,
+            0.8,
+            seq_split=seq_split,
+        ),
+        ops.GEMM(
+            f"{phase}_dsa_q_b_proj",
+            scale_factor,
+            local_heads * (qk_nope + rope),
+            q_lora,
+            projection_modes["q"],
+            seq_split=seq_split,
+        ),
+        # Producer-only index projections. GLM shared layers reuse the previous
+        # TopK and are represented by the exact full-layer fraction.
+        ops.GEMM(
+            f"{phase}_dsa_index_k_proj",
+            producer_scale,
+            index_dim,
+            h,
+            projection_modes["indexer"],
+            seq_split=seq_split,
+        ),
+        ops.GEMM(
+            f"{phase}_dsa_index_q_proj",
+            producer_scale,
+            index_heads * index_dim,
+            q_lora,
+            projection_modes["indexer"],
+            seq_split=seq_split,
+        ),
+        ops.GEMM(
+            f"{phase}_dsa_index_gate_proj",
+            producer_scale,
+            index_heads,
+            h,
+            projection_modes["indexer"],
+            seq_split=seq_split,
+        ),
+        ops.ElementWise(
+            f"{phase}_dsa_index_norm_rope_quant",
+            producer_scale,
+            index_heads * index_dim + index_dim,
+            index_heads * index_dim + common.indexer_cache_entry_bytes(index_dim),
+            0.8,
+            seq_split=seq_split,
+        ),
+        *(
+            [
+                ops.NCCL(
+                    f"{phase}_dsa_index_k_all_gather",
+                    producer_scale,
+                    "all_gather",
+                    index_dim,
+                    cp_size,
+                    common.CommQuantMode.half,
+                    seq_split=cp_size,
+                )
+            ]
+            if is_context and cp_size > 1
+            else []
+        ),
+        ops.DSAIndexScore(
+            f"{phase}_dsa_index_score",
+            producer_scale,
+            layout=layout,
+            index_heads=index_heads,
+            index_head_dim=index_dim,
+            index_topk=index_topk,
+            cp_size=cp_size,
+        ),
+        ops.DSATopKSelect(
+            f"{phase}_dsa_topk",
+            producer_scale,
+            layout=layout,
+            index_topk=index_topk,
+            cp_size=cp_size,
+        ),
+        *(
+            [
+                ops.NCCL(
+                    f"{phase}_dsa_latent_kv_all_gather",
+                    scale_factor,
+                    "all_gather",
+                    kv_lora + rope,
+                    cp_size,
+                    common.CommQuantMode.half,
+                    seq_split=cp_size,
+                )
+            ]
+            if is_context and cp_size > 1
+            else []
+        ),
+        ops.DSASparseAttention(
+            f"{phase}_dsa_sparse_attention",
+            scale_factor,
+            layout=layout,
+            local_heads=local_heads,
+            index_topk=index_topk,
+            qk_latent_dim=kv_lora + rope,
+            value_latent_dim=kv_lora,
+            qk_nope_dim=qk_nope,
+            output_value_dim=value_dim,
+            cp_size=cp_size,
+        ),
+        ops.GEMM(
+            f"{phase}_dsa_o_proj",
+            scale_factor,
+            h,
+            local_heads * value_dim,
+            projection_modes["o"],
+            seq_split=seq_split,
+        ),
+    ]
+    return result
+
+
+def _context_dsa_with_granular(
+    *,
+    name: str,
+    scale_factor: float,
+    local_heads: int,
+    kvcache_quant_mode,
+    fmha_quant_mode,
+    module_gemm_mode,
+    architecture: str,
+    cp_size: int,
+    extra_params: object,
+    projection_modes: dict,
+):
+    wrapper = ops.FallbackOp(
+        name,
+        primary=ops.ContextDSAModule(
+            name,
+            scale_factor,
+            local_heads,
+            kvcache_quant_mode,
+            fmha_quant_mode,
+            module_gemm_mode,
+            architecture=architecture,
+            cp_size=cp_size,
+            index_topk_freq=extra_params.get("index_topk_freq", 1),
+            dsa_full_layer_fraction=extra_params.get("dsa_full_layer_fraction"),
+            attn_projection_quant_modes=projection_modes,
+        ),
+        fallback=_dsa_granular_ops(
+            phase="context",
+            scale_factor=scale_factor,
+            local_heads=local_heads,
+            architecture=architecture,
+            extra_params=extra_params,
+            projection_modes=projection_modes,
+            cp_size=cp_size,
+        ),
+        silicon_primary_only=True,
+    )
+    # Preserve metadata inspected by SDK callers before DSA became composite.
+    wrapper._gemm_quant_mode = module_gemm_mode
+    return wrapper
+
+
+def _generation_dsa_with_granular(
+    *,
+    name: str,
+    scale_factor: float,
+    local_heads: int,
+    kvcache_quant_mode,
+    module_gemm_mode,
+    architecture: str,
+    extra_params: object,
+    projection_modes: dict,
+):
+    wrapper = ops.FallbackOp(
+        name,
+        primary=ops.GenerationDSAModule(
+            name,
+            scale_factor,
+            local_heads,
+            kvcache_quant_mode,
+            module_gemm_mode,
+            architecture=architecture,
+            index_topk_freq=extra_params.get("index_topk_freq", 1),
+            dsa_full_layer_fraction=extra_params.get("dsa_full_layer_fraction"),
+            attn_projection_quant_modes=projection_modes,
+        ),
+        fallback=_dsa_granular_ops(
+            phase="generation",
+            scale_factor=scale_factor,
+            local_heads=local_heads,
+            architecture=architecture,
+            extra_params=extra_params,
+            projection_modes=projection_modes,
+        ),
+        silicon_primary_only=True,
+    )
+    wrapper._gemm_quant_mode = module_gemm_mode
+    return wrapper
 
 
 @register_model("DEEPSEEKV32")
@@ -227,18 +485,17 @@ class DeepSeekV32Model(BaseModel):
             [
                 ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3),
                 ops.ElementWise("context_add_norm_1", self._num_layers, 2 * h, 2 * h, 0.8, scale_num_tokens=cp_size),
-                ops.ContextDSAModule(
-                    "context_attention",
-                    self._num_layers,
-                    local_heads,
-                    kvcache_quant_mode,
-                    fmha_quant_mode,
-                    dsa_gemm_quant_mode,
+                _context_dsa_with_granular(
+                    name="context_attention",
+                    scale_factor=self._num_layers,
+                    local_heads=local_heads,
+                    kvcache_quant_mode=kvcache_quant_mode,
+                    fmha_quant_mode=fmha_quant_mode,
+                    module_gemm_mode=dsa_gemm_quant_mode,
                     architecture=self.architecture,
-                    cp_size=self.config.cp_size,
-                    index_topk_freq=self.extra_params.get("index_topk_freq", 1),
-                    dsa_full_layer_fraction=self.extra_params.get("dsa_full_layer_fraction"),
-                    attn_projection_quant_modes=dsa_attn_quant_modes,
+                    cp_size=cp_size,
+                    extra_params=self.extra_params,
+                    projection_modes=dsa_attn_quant_modes,
                 ),
                 ops.ElementWise("context_add_norm_2", self._num_layers, 2 * h, 2 * h, 0.8, scale_num_tokens=cp_size),
                 ops.GEMM(
@@ -328,16 +585,15 @@ class DeepSeekV32Model(BaseModel):
                     2 * h,
                     0.8,
                 ),
-                ops.GenerationDSAModule(
-                    "generation_attention",
-                    self._num_layers * self._mtp_scale_factor,
-                    local_heads,
-                    kvcache_quant_mode,
-                    dsa_gemm_quant_mode,
+                _generation_dsa_with_granular(
+                    name="generation_attention",
+                    scale_factor=self._num_layers * self._mtp_scale_factor,
+                    local_heads=local_heads,
+                    kvcache_quant_mode=kvcache_quant_mode,
+                    module_gemm_mode=dsa_gemm_quant_mode,
                     architecture=self.architecture,
-                    index_topk_freq=self.extra_params.get("index_topk_freq", 1),
-                    dsa_full_layer_fraction=self.extra_params.get("dsa_full_layer_fraction"),
-                    attn_projection_quant_modes=dsa_attn_quant_modes,
+                    extra_params=self.extra_params,
+                    projection_modes=dsa_attn_quant_modes,
                 ),
                 ops.ElementWise(
                     "generation_add_norm_2",
@@ -537,18 +793,17 @@ class TrtllmWideEPDeepSeekV32Model(BaseModel):
             [
                 ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3),
                 ops.ElementWise("context_add_norm_1", self._num_layers, 2 * h, 2 * h, 0.8),
-                ops.ContextDSAModule(
-                    "context_attention",
-                    self._num_layers,
-                    local_heads,
-                    kvcache_quant_mode,
-                    fmha_quant_mode,
-                    dsa_gemm_quant_mode,
+                _context_dsa_with_granular(
+                    name="context_attention",
+                    scale_factor=self._num_layers,
+                    local_heads=local_heads,
+                    kvcache_quant_mode=kvcache_quant_mode,
+                    fmha_quant_mode=fmha_quant_mode,
+                    module_gemm_mode=dsa_gemm_quant_mode,
                     architecture=self.architecture,
                     cp_size=self.config.cp_size,
-                    index_topk_freq=self.extra_params.get("index_topk_freq", 1),
-                    dsa_full_layer_fraction=self.extra_params.get("dsa_full_layer_fraction"),
-                    attn_projection_quant_modes=dsa_attn_quant_modes,
+                    extra_params=self.extra_params,
+                    projection_modes=dsa_attn_quant_modes,
                 ),
                 ops.ElementWise("context_add_norm_2", self._num_layers, 2 * h, 2 * h, 0.8),
                 ops.GEMM(
@@ -633,16 +888,15 @@ class TrtllmWideEPDeepSeekV32Model(BaseModel):
             [
                 ops.Embedding("generation_embedding", 1 * self._mtp_scale_factor, self._vocab_size, h, 0.3),
                 ops.ElementWise("generation_add_norm_1", generation_scale, 2 * h, 2 * h, 0.8),
-                ops.GenerationDSAModule(
-                    "generation_attention",
-                    generation_scale,
-                    local_heads,
-                    kvcache_quant_mode,
-                    dsa_gemm_quant_mode,
+                _generation_dsa_with_granular(
+                    name="generation_attention",
+                    scale_factor=generation_scale,
+                    local_heads=local_heads,
+                    kvcache_quant_mode=kvcache_quant_mode,
+                    module_gemm_mode=dsa_gemm_quant_mode,
                     architecture=self.architecture,
-                    index_topk_freq=self.extra_params.get("index_topk_freq", 1),
-                    dsa_full_layer_fraction=self.extra_params.get("dsa_full_layer_fraction"),
-                    attn_projection_quant_modes=dsa_attn_quant_modes,
+                    extra_params=self.extra_params,
+                    projection_modes=dsa_attn_quant_modes,
                 ),
                 ops.ElementWise("generation_add_norm_2", generation_scale, 2 * h, 2 * h, 0.8),
             ]
@@ -787,18 +1041,17 @@ class WideEPDeepSeekV32Model(BaseModel):
                     if tp_size > 1
                     else []
                 ),
-                ops.ContextDSAModule(
-                    "context_attention",
-                    self._num_layers,
-                    local_heads,
-                    kvcache_quant_mode,
-                    fmha_quant_mode,
-                    dsa_gemm_quant_mode,
+                _context_dsa_with_granular(
+                    name="context_attention",
+                    scale_factor=self._num_layers,
+                    local_heads=local_heads,
+                    kvcache_quant_mode=kvcache_quant_mode,
+                    fmha_quant_mode=fmha_quant_mode,
+                    module_gemm_mode=dsa_gemm_quant_mode,
                     architecture=self.architecture,
                     cp_size=self.config.cp_size,
-                    index_topk_freq=self.extra_params.get("index_topk_freq", 1),
-                    dsa_full_layer_fraction=self.extra_params.get("dsa_full_layer_fraction"),
-                    attn_projection_quant_modes=dsa_attn_quant_modes,
+                    extra_params=self.extra_params,
+                    projection_modes=dsa_attn_quant_modes,
                 ),
                 *(
                     [
@@ -877,16 +1130,15 @@ class WideEPDeepSeekV32Model(BaseModel):
         generation_scale = self._num_layers * self._mtp_scale_factor
         self.generation_ops.extend(
             [
-                ops.GenerationDSAModule(
-                    "generation_attention",
-                    generation_scale,
-                    local_heads,
-                    kvcache_quant_mode,
-                    dsa_gemm_quant_mode,
+                _generation_dsa_with_granular(
+                    name="generation_attention",
+                    scale_factor=generation_scale,
+                    local_heads=local_heads,
+                    kvcache_quant_mode=kvcache_quant_mode,
+                    module_gemm_mode=dsa_gemm_quant_mode,
                     architecture=self.architecture,
-                    index_topk_freq=self.extra_params.get("index_topk_freq", 1),
-                    dsa_full_layer_fraction=self.extra_params.get("dsa_full_layer_fraction"),
-                    attn_projection_quant_modes=dsa_attn_quant_modes,
+                    extra_params=self.extra_params,
+                    projection_modes=dsa_attn_quant_modes,
                 ),
                 ops.GEMM(
                     "generation_gate_ffn1_gemm",

@@ -135,6 +135,10 @@ class TestMOEParallelismResolution:
         ctx = {op._name: op for op in model.context_ops}
         assert "context_attention" in ctx and "context_moe" in ctx
         assert isinstance(ctx["context_attention"], ContextMSAModule)  # MSA, not plain attention
+        assert ctx["context_attention"]._scale_factor == 57
+        assert ctx["context_moe"]._scale_factor == 57
+        assert ctx["context_dense_attention"]._scale_factor == 3
+        assert ctx["context_dense_gate_up_gemm"]._n == 2 * 12288
 
     def test_nemotron_h_mtp_scales_generation_only(self):
         """Nemotron-3 ships num_nextn_predict_layers=1; MTP must build (no assert) and
@@ -460,9 +464,11 @@ class TestHFModelSupport:
         for op in model.context_ops:
             if op._name == "context_attention":
                 op_ratio_counts[op._compress_ratio] += op._scale_factor
-        assert op_ratio_counts[0] == 0
+        # Granular ANALYTICAL preserves true SWA (ratio=0); the wrapper's
+        # silicon primary still uses the historical HCA approximation.
+        assert op_ratio_counts[0] == expected_ratio_counts.get(0, 0)
         assert op_ratio_counts[4] == expected_ratio_counts.get(4, 0)
-        assert op_ratio_counts[128] == expected_ratio_counts.get(128, 0) + expected_ratio_counts.get(0, 0)
+        assert op_ratio_counts[128] == expected_ratio_counts.get(128, 0)
 
     def test_deepseek_v4_kvcache_bytes_include_csa_indexer_cache_and_decode_buffers(self):
         model_config = config.ModelConfig(
@@ -1495,10 +1501,13 @@ class TestMLAModuleQueryKeys:
         assert module._gemm_quant_mode == common.GEMMQuantMode.nvfp4
 
     def test_kimik25_attention_weights_counted_at_bf16(self):
-        """Attention fallback GEMM weights follow the checkpoint dtype and the
-        model head count. Kimi-K2.5-NVFP4 keeps attention in BF16; per rank at
-        tp1: (q_a+kv_a 15.1M replicated + q_b 18.9M + kv_b 8.4M + o 58.7M)
-        x 61 layers x 2 bytes = 11.49 GiB (matches the vLLM load ledger)."""
+        """Attention weights follow the checkpoint dtype and model head count.
+
+        The collector receives prebuilt latent QKV, so q_a+kv_a/downscale is
+        outside ``context_mla_block``. Together the external downscale and the
+        block still account for (15.1M + 18.9M + 8.4M + 58.7M) x 61 x 2 bytes
+        = 11.49 GiB per TP1 rank, matching the vLLM load ledger.
+        """
         model_config = config.ModelConfig(
             tp_size=1,
             pp_size=1,
@@ -1511,11 +1520,11 @@ class TestMLAModuleQueryKeys:
             fmha_quant_mode=common.FMHAQuantMode.bfloat16,
         )
         model = models.get_model("nvidia/Kimi-K2.5-NVFP4", model_config, backend_name="vllm")
-        for op in model.context_ops:
-            if getattr(op, "_name", "") == "context_mla_block":
-                assert op.get_weights() / (1 << 30) == pytest.approx(11.49, abs=0.05)
-                return
-        raise AssertionError("context_mla_block not found")
+        by_name = {getattr(op, "_name", ""): op for op in model.context_ops}
+        block = by_name["context_mla_block"]
+        downscale = by_name["context_downscale_gemm"]
+        assert all(getattr(op, "_name", "") != "context_downscale_gemm" for op in block._fallback)
+        assert (block.get_weights() + downscale.get_weights()) / (1 << 30) == pytest.approx(11.49, abs=0.05)
 
 
 class TestDSV32NVFP4AttentionExclusion:

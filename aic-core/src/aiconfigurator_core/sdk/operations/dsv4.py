@@ -32,6 +32,7 @@ Cache key matches every other migrated op:
 from __future__ import annotations
 
 import logging
+import math
 import os
 from collections import defaultdict
 from typing import TYPE_CHECKING, ClassVar, Optional
@@ -448,6 +449,8 @@ class DeepSeekV4MHCModule(Operation):
             database_mode = database._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
+        if database_mode == common.DatabaseMode.ANALYTICAL:
+            return PerformanceResult(get_sol()[0], energy=0.0, source="analytical")
         if database_mode == common.DatabaseMode.SOL_FULL:
             return get_sol()
         if database_mode == common.DatabaseMode.EMPIRICAL:
@@ -1458,6 +1461,172 @@ class GenerationDeepSeekV4AttentionModule(_BaseDeepSeekV4AttentionModule):
             energy=result.energy * self._scale_factor,
             source=getattr(result, "source", "silicon"),
         )
+
+
+class DeepSeekV4KVAllGather(Operation):
+    """V4 CP all-gather with window/compression-aware message sizing."""
+
+    _CP_AWARE: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        *,
+        kind: str,
+        width: int,
+        cp_size: int,
+        window_size: int = 0,
+        compress_ratio: int = 1,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        if kind not in {"window", "compressed", "index"}:
+            raise ValueError("V4 KV all-gather kind must be window, compressed, or index")
+        self._kind = kind
+        self._width = width
+        self._cp_size = cp_size
+        self._window_size = window_size
+        self._compress_ratio = compress_ratio
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        batch = int(kwargs.get("batch_size"))
+        sequence = int(kwargs.get("s"))
+        if self._kind == "window":
+            entries = min(sequence, self._window_size)
+        elif self._kind == "compressed":
+            entries = sequence // self._compress_ratio
+        else:
+            entries = sequence
+        result = database.query_nccl(
+            common.CommQuantMode.half,
+            self._cp_size,
+            "all_gather",
+            batch * entries * self._width,
+        )
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", "estimated"),
+        )
+
+    def get_weights(self, **kwargs):
+        return 0.0
+
+
+class DeepSeekV4SparseAttention(Operation):
+    """No-table V4 SWA/CSA/HCA attention core for ANALYTICAL granular paths.
+
+    The logical sparse/window pair count is converted to an average effective
+    MQA KV length and evaluated by the existing FA KernelSim model. Projection,
+    compression, index scoring and TopK are intentionally outside this boundary.
+    """
+
+    _CP_AWARE: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        *,
+        layout: str,
+        local_heads: int,
+        head_dim: int,
+        window_size: int,
+        compress_ratio: int,
+        index_topk: int,
+        kvcache_quant_mode: common.KVCacheQuantMode,
+        fmha_quant_mode: common.FMHAQuantMode,
+        cp_size: int = 1,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        if layout not in {"ragged", "paged"}:
+            raise ValueError("DeepSeek-V4 sparse attention layout must be ragged or paged")
+        if compress_ratio not in {0, 4, 128}:
+            raise ValueError("DeepSeek-V4 compress_ratio must be 0, 4, or 128")
+        self._layout = layout
+        self._local_heads = local_heads
+        self._head_dim = head_dim
+        self._window_size = window_size
+        self._compress_ratio = compress_ratio
+        self._index_topk = index_topk
+        self._kvcache_quant_mode = kvcache_quant_mode
+        self._fmha_quant_mode = fmha_quant_mode
+        self._cp_size = cp_size
+
+    @staticmethod
+    def _causal_limited_pairs(batch: int, query: int, prefix: int, limit: int) -> int:
+        full = prefix + query
+        if prefix >= limit:
+            return batch * query * limit
+        if full <= limit:
+            return batch * (full * (full + 1) - prefix * (prefix + 1)) // 2
+        ramp = batch * (limit * (limit + 1) - prefix * (prefix + 1)) // 2
+        return ramp + batch * (full - limit) * limit
+
+    @staticmethod
+    def _floor_sum(n: int, divisor: int) -> int:
+        """Return sum(floor(i/divisor), i=1..n) in O(1)."""
+        if n <= 0:
+            return 0
+        groups = n // divisor
+        return divisor * groups * (groups - 1) // 2 + groups * (n - groups * divisor + 1)
+
+    @classmethod
+    def _compressed_causal_pairs(cls, batch: int, query: int, prefix: int, ratio: int, limit: int) -> int:
+        # Each fresh query sees floor(position / ratio) completed compressed
+        # entries. Clamp at CSA top-k; HCA passes an effectively unbounded limit.
+        unclamped_queries = min(query, max(0, ratio * limit - 1 - prefix))
+        unclamped = cls._floor_sum(prefix + unclamped_queries, ratio) - cls._floor_sum(prefix, ratio)
+        return batch * (unclamped + (query - unclamped_queries) * limit)
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        batch = int(kwargs.get("batch_size"))
+        sequence = int(kwargs.get("s"))
+        if batch <= 0 or sequence <= 0:
+            return PerformanceResult(0.0, energy=0.0, source="analytical")
+
+        if self._layout == "ragged":
+            query = math.ceil(sequence / self._cp_size)
+            prefix = int(kwargs.get("prefix", 0)) + max(0, sequence - query)
+            pairs = self._causal_limited_pairs(batch, query, prefix, self._window_size)
+            if self._compress_ratio:
+                compressed_limit = self._index_topk if self._compress_ratio == 4 else 2**62
+                pairs += self._compressed_causal_pairs(batch, query, prefix, self._compress_ratio, compressed_limit)
+        else:
+            query = 1
+            pairs = batch * min(sequence, self._window_size)
+            if self._compress_ratio:
+                compressed = sequence // self._compress_ratio
+                if self._compress_ratio == 4:
+                    compressed = min(compressed, self._index_topk)
+                pairs += batch * compressed
+
+        effective_kv = max(1, math.ceil(pairs / (batch * query)))
+        effective_fp8 = (
+            self._kvcache_quant_mode == common.KVCacheQuantMode.fp8 or self._fmha_quant_mode == common.FMHAQuantMode.fp8
+        )
+        from aiconfigurator_core.sdk.kernelsim.analytical import attention_latency_ms
+
+        latency = attention_latency_ms(
+            system=database.system,
+            gpu=database.system_spec["gpu"],
+            batch=batch,
+            query_length=query,
+            kv_length=effective_kv,
+            query_heads=database._analytical_config.sparse_attention_executed_heads(self._local_heads),
+            kv_heads=1,
+            head_dim=self._head_dim,
+            dtype="fp8" if effective_fp8 else "bf16",
+            config=database._analytical_config,
+            # Pair-count reduction above already includes causal/window/sparse
+            # masking; use an equivalent rectangular workload here.
+            causal=False,
+        )
+        source = "analytical" if database._default_database_mode == common.DatabaseMode.ANALYTICAL else "estimated"
+        return PerformanceResult(latency * self._scale_factor, energy=0.0, source=source)
+
+    def get_weights(self, **kwargs):
+        return 0.0
 
 
 class DeepSeekV4MegaMoEModule(Operation):
