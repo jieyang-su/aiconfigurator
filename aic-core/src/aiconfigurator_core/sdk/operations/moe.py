@@ -1031,6 +1031,8 @@ class MoEDispatch(Operation):
         num_experts: int,
         topk: int,
         hidden_size: int,
+        dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
+        combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
         database_mode: common.DatabaseMode | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Verbatim port of legacy ``PerfDatabase.query_wideep_deepep_ll``."""
@@ -1040,8 +1042,9 @@ class MoEDispatch(Operation):
             world = max(1, round(node_num * database.system_spec["node"]["num_gpus_per_node"]))
             remote_ranks = min(topk, num_experts, max(1, world - 1))
             elements = num_tokens * remote_ranks * hidden_size
+            data_bytes = elements * (dispatch_dtype.value.memory + combine_dtype.value.memory)
             bandwidth = database.system_spec["node"]["inter_node_bw" if node_num > 1 else "intra_node_bw"]
-            sol_time = elements * 4 / bandwidth * 1000
+            sol_time = data_bytes / bandwidth * 1000
             return sol_time, 0.0, sol_time
 
         def get_empirical(num_tokens: int, topk: int, num_experts: int) -> float:
@@ -1058,9 +1061,17 @@ class MoEDispatch(Operation):
         elif database_mode == common.DatabaseMode.ANALYTICAL:
             if database._analytical_config.communication_mode == "silicon":
                 return cls._query_wideep_deepep_ll_table(
-                    database, node_num, num_tokens, num_experts, topk, hidden_size, common.DatabaseMode.SILICON
+                    database,
+                    node_num,
+                    num_tokens,
+                    num_experts,
+                    topk,
+                    hidden_size,
+                    dispatch_dtype,
+                    combine_dtype,
+                    common.DatabaseMode.SILICON,
                 )
-            return PerformanceResult(get_empirical(num_tokens, topk, num_experts), energy=0.0, source="analytical")
+            return PerformanceResult(get_empirical(num_tokens, topk, num_experts), energy=0.0, source="empirical")
         else:
             _lookup_node, data, used_node1_fallback = cls._resolve_wideep_deepep_comm_node_data(
                 database._wideep_deepep_ll_data,
@@ -1103,6 +1114,8 @@ class MoEDispatch(Operation):
         topk: int,
         hidden_size: int,
         sms: int,
+        dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
+        combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
         database_mode: common.DatabaseMode | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Verbatim port of legacy ``PerfDatabase.query_wideep_deepep_normal``."""
@@ -1111,8 +1124,10 @@ class MoEDispatch(Operation):
         def get_sol(num_tokens: int, num_experts: int, topk: int, hidden_size: int) -> tuple[float, float, float]:
             world = max(1, round(node_num * database.system_spec["node"]["num_gpus_per_node"]))
             remote_ranks = min(topk, num_experts, max(1, world - 1))
+            elements = num_tokens * remote_ranks * hidden_size
+            data_bytes = elements * (dispatch_dtype.value.memory + combine_dtype.value.memory)
             bandwidth = database.system_spec["node"]["inter_node_bw" if node_num > 1 else "intra_node_bw"]
-            sol_time = num_tokens * remote_ranks * hidden_size * 4 / bandwidth * 1000
+            sol_time = data_bytes / bandwidth * 1000
             return sol_time, 0.0, sol_time
 
         def get_empirical(num_tokens: int, num_experts: int, topk: int, hidden_size: int) -> float:
@@ -1131,10 +1146,19 @@ class MoEDispatch(Operation):
         elif database_mode == common.DatabaseMode.ANALYTICAL:
             if database._analytical_config.communication_mode == "silicon":
                 return cls._query_wideep_deepep_normal_table(
-                    database, node_num, num_tokens, num_experts, topk, hidden_size, sms, common.DatabaseMode.SILICON
+                    database,
+                    node_num,
+                    num_tokens,
+                    num_experts,
+                    topk,
+                    hidden_size,
+                    sms,
+                    dispatch_dtype,
+                    combine_dtype,
+                    common.DatabaseMode.SILICON,
                 )
             return PerformanceResult(
-                get_empirical(num_tokens, num_experts, topk, hidden_size), energy=0.0, source="analytical"
+                get_empirical(num_tokens, num_experts, topk, hidden_size), energy=0.0, source="empirical"
             )
         else:
             lookup_node, node_data, used_node1_fallback = cls._resolve_wideep_deepep_comm_node_data(
@@ -1188,6 +1212,16 @@ class MoEDispatch(Operation):
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         num_tokens = kwargs.get("x")
         volume = num_tokens * self._hidden_size
+        # Measured communication tables are collected at fixed dtypes. Only
+        # formula-driven ANALYTICAL communication consumes these explicit
+        # dispatch/combine settings.
+        comm_dtype = common.CommQuantMode.half
+        wideep_dispatch_dtype = common.CommQuantMode.half
+        wideep_combine_dtype = common.CommQuantMode.half
+        if database.get_default_database_mode() == common.DatabaseMode.ANALYTICAL:
+            comm_dtype = database._analytical_config.moe_communication_dtype(wideep=False, dispatch=self._pre_dispatch)
+            wideep_dispatch_dtype = database._analytical_config.moe_communication_dtype(wideep=True, dispatch=True)
+            wideep_combine_dtype = database._analytical_config.moe_communication_dtype(wideep=True, dispatch=False)
         _sm_version = database.system_spec["gpu"].get("sm_version", -1)
         _num_gpus_per_node = database.system_spec["node"]["num_gpus_per_node"]
         _node_num = self.num_gpus / _num_gpus_per_node
@@ -1245,19 +1279,13 @@ class MoEDispatch(Operation):
                         comm_latency = float(dispatch_result)
                     elif self._attention_dp_size > 1:
                         all_gather_volume = (dispatch_x_volume + dispatch_sf_volume) * self._attention_dp_size
-                        comm_latency = database.query_nccl(
-                            common.CommQuantMode.half, self.num_gpus, "all_gather", all_gather_volume
-                        )
+                        comm_latency = database.query_nccl(comm_dtype, self.num_gpus, "all_gather", all_gather_volume)
                     elif self._attention_tp_size > 1:
                         if self._reduce_results:
                             if _num_gpus_per_node == 72 and self.num_gpus > 4:
-                                comm_latency = database.query_nccl(
-                                    common.CommQuantMode.half, self.num_gpus, "all_reduce", volume
-                                )
+                                comm_latency = database.query_nccl(comm_dtype, self.num_gpus, "all_reduce", volume)
                             else:
-                                comm_latency = database.query_custom_allreduce(
-                                    common.CommQuantMode.half, self.num_gpus, volume
-                                )
+                                comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
                         else:
                             comm_latency = 0
                     else:
@@ -1277,7 +1305,7 @@ class MoEDispatch(Operation):
                         comm_latency = float(combine_result)
                     elif self._attention_dp_size > 1:
                         comm_latency = database.query_nccl(
-                            common.CommQuantMode.half,
+                            comm_dtype,
                             self.num_gpus,
                             "reduce_scatter",
                             volume * self._attention_dp_size,
@@ -1285,13 +1313,9 @@ class MoEDispatch(Operation):
                     elif self._attention_tp_size > 1:
                         if self._reduce_results:
                             if _num_gpus_per_node == 72 and self.num_gpus > 4:
-                                comm_latency = database.query_nccl(
-                                    common.CommQuantMode.half, self.num_gpus, "all_reduce", volume
-                                )
+                                comm_latency = database.query_nccl(comm_dtype, self.num_gpus, "all_reduce", volume)
                             else:
-                                comm_latency = database.query_custom_allreduce(
-                                    common.CommQuantMode.half, self.num_gpus, volume
-                                )
+                                comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
                         else:
                             comm_latency = 0
                     else:
@@ -1301,10 +1325,10 @@ class MoEDispatch(Operation):
                 if self._pre_dispatch:
                     if self._attention_tp_size > 1:  # tp>1, use allreduce
                         # to do: custom allreduce
-                        comm_latency = database.query_custom_allreduce(common.CommQuantMode.half, self.num_gpus, volume)
+                        comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
                     elif self._attention_dp_size > 1:
                         comm_latency = database.query_nccl(
-                            common.CommQuantMode.half,
+                            comm_dtype,
                             self.num_gpus,
                             "all_gather",
                             volume * self._attention_dp_size,
@@ -1314,10 +1338,10 @@ class MoEDispatch(Operation):
                 else:
                     if self._attention_tp_size > 1:  # tp>1, use allreduce
                         # to do: custom allreduce
-                        comm_latency = database.query_custom_allreduce(common.CommQuantMode.half, self.num_gpus, volume)
+                        comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
                     elif self._attention_dp_size > 1:
                         comm_latency = database.query_nccl(
-                            common.CommQuantMode.half,
+                            comm_dtype,
                             self.num_gpus,
                             "reduce_scatter",
                             volume * self._attention_dp_size,
@@ -1333,11 +1357,11 @@ class MoEDispatch(Operation):
 
             # Add allreduce latency when TP > 1
             if self._attention_tp_size > 1:
-                comm_latency += database.query_custom_allreduce(common.CommQuantMode.half, self.num_gpus, volume)
+                comm_latency += database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
 
             if self._attention_dp_size > 1:
                 comm_latency += database.query_nccl(
-                    common.CommQuantMode.half,
+                    comm_dtype,
                     self.num_gpus,
                     "all_gather" if self._pre_dispatch else "reduce_scatter",
                     volume * self._attention_dp_size,
@@ -1354,6 +1378,8 @@ class MoEDispatch(Operation):
                         topk=self._topk,
                         hidden_size=self._hidden_size,
                         sms=self._sms,
+                        dispatch_dtype=wideep_dispatch_dtype,
+                        combine_dtype=wideep_combine_dtype,
                     )
                 else:
                     comm_latency = database.query_wideep_deepep_ll(
@@ -1362,6 +1388,8 @@ class MoEDispatch(Operation):
                         num_experts=self._num_experts,
                         topk=self._topk,
                         hidden_size=self._hidden_size,
+                        dispatch_dtype=wideep_dispatch_dtype,
+                        combine_dtype=wideep_combine_dtype,
                     )
             else:
                 logger.debug("MoEDispatch: In SGLang non-DeepEP execution path")
@@ -1370,13 +1398,13 @@ class MoEDispatch(Operation):
                     if combined_attention_tpdp:
                         # Matches SGLang DP attention: shard across attention TP, then gather across the full TP world.
                         comm_latency = database.query_nccl(
-                            common.CommQuantMode.half,
+                            comm_dtype,
                             self._attention_tp_size,
                             "reduce_scatter",
                             volume,
                         )
                         comm_latency += database.query_nccl(
-                            common.CommQuantMode.half,
+                            comm_dtype,
                             self.num_gpus,
                             "all_gather",
                             volume * self._attention_dp_size,
@@ -1385,9 +1413,7 @@ class MoEDispatch(Operation):
                         if self._is_context:
                             # prefill: tokens are CP-sharded across ranks -> all_gather
                             # to assemble the full token set for expert routing.
-                            comm_latency = database.query_nccl(
-                                common.CommQuantMode.half, self.num_gpus, "all_gather", volume
-                            )
+                            comm_latency = database.query_nccl(comm_dtype, self.num_gpus, "all_gather", volume)
                         else:
                             # decode: CP does not run; attention is replicated across the
                             # CP ranks so every rank already holds all tokens -> the
@@ -1395,10 +1421,10 @@ class MoEDispatch(Operation):
                             comm_latency = 0
                     elif self._attention_tp_size > 1:  # tp>1, use allreduce
                         # to do: custom allreduce
-                        comm_latency = database.query_custom_allreduce(common.CommQuantMode.half, self.num_gpus, volume)
+                        comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
                     elif self._attention_dp_size > 1:
                         comm_latency = database.query_nccl(
-                            common.CommQuantMode.half,
+                            comm_dtype,
                             self.num_gpus,
                             "all_gather",
                             volume * self._attention_dp_size,
@@ -1409,13 +1435,13 @@ class MoEDispatch(Operation):
                     if combined_attention_tpdp:
                         # Reverse path: reduce-scatter across the full TP world, then rebuild each attention TP group.
                         comm_latency = database.query_nccl(
-                            common.CommQuantMode.half,
+                            comm_dtype,
                             self.num_gpus,
                             "reduce_scatter",
                             volume * self._attention_dp_size,
                         )
                         comm_latency += database.query_nccl(
-                            common.CommQuantMode.half,
+                            comm_dtype,
                             self._attention_tp_size,
                             "all_gather",
                             volume,
@@ -1423,22 +1449,18 @@ class MoEDispatch(Operation):
                     elif self._attn_cp_size > 1:
                         if self._is_context:
                             # prefill: scatter results back to the CP-sharded layout.
-                            comm_latency = database.query_nccl(
-                                common.CommQuantMode.half, self.num_gpus, "reduce_scatter", volume
-                            )
+                            comm_latency = database.query_nccl(comm_dtype, self.num_gpus, "reduce_scatter", volume)
                         else:
                             # decode: each rank computed its owned experts' partial outputs
                             # for all (replicated) tokens; combine into the full per-token
                             # sum every rank needs (next layer re-replicates) -> all_reduce.
-                            comm_latency = database.query_custom_allreduce(
-                                common.CommQuantMode.half, self.num_gpus, volume
-                            )
+                            comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
                     elif self._attention_tp_size > 1:  # tp>1, use allreduce
                         # to do: custom allreduce
-                        comm_latency = database.query_custom_allreduce(common.CommQuantMode.half, self.num_gpus, volume)
+                        comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
                     elif self._attention_dp_size > 1:
                         comm_latency = database.query_nccl(
-                            common.CommQuantMode.half,
+                            comm_dtype,
                             self.num_gpus,
                             "reduce_scatter",
                             volume * self._attention_dp_size,

@@ -1117,7 +1117,11 @@ def get_database_view(
     mode = _normalize_database_mode(database_mode)
     resolved_shared_layer = shared_layer
     if mode == common.DatabaseMode.ANALYTICAL and shared_layer is None:
-        communication_mode = analytical_config.get("communication_mode") if isinstance(analytical_config, dict) else getattr(analytical_config, "communication_mode", None)
+        communication_mode = (
+            analytical_config.get("communication_mode")
+            if isinstance(analytical_config, dict)
+            else getattr(analytical_config, "communication_mode", None)
+        )
         if str(communication_mode or "").lower() == "silicon":
             # Analytical compute remains formula-based, but communication=silicon
             # must inherit the measured collective tables from older versions.
@@ -3091,6 +3095,8 @@ class PerfDatabase:
         num_experts: int,
         topk: int,
         hidden_size: int,
+        dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
+        combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
         database_mode: common.DatabaseMode | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Delegates to ``MoEDispatch``; see
@@ -3104,6 +3110,8 @@ class PerfDatabase:
             num_experts=num_experts,
             topk=topk,
             hidden_size=hidden_size,
+            dispatch_dtype=dispatch_dtype,
+            combine_dtype=combine_dtype,
             database_mode=database_mode,
         )
 
@@ -3116,6 +3124,8 @@ class PerfDatabase:
         topk: int,
         hidden_size: int,
         sms: int,
+        dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
+        combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
         database_mode: common.DatabaseMode | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Delegates to ``MoEDispatch``; see
@@ -3130,6 +3140,8 @@ class PerfDatabase:
             topk=topk,
             hidden_size=hidden_size,
             sms=sms,
+            dispatch_dtype=dispatch_dtype,
+            combine_dtype=combine_dtype,
             database_mode=database_mode,
         )
 

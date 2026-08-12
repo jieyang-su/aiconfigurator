@@ -217,6 +217,12 @@ def enumerate_parallel_config(
                                     continue
                                 # sglang
                                 elif backend == common.BackendName.sglang:
+                                    # SGLang context parallelism shards the sequence axis
+                                    # and is mutually exclusive with attention TP/DP.
+                                    # Filter these combinations before model construction
+                                    # instead of reporting them as per-point failures.
+                                    if cp > 1 and (tp > 1 or dp > 1):
+                                        continue
                                     if (enable_wideep or moe_backend in {"deepep_moe", "megamoe"}) and moe_tp > 1:
                                         continue  # SGLang EP-only MoE backends require moe_tp=1.
                                 elif backend == common.BackendName.vllm:  # noqa: SIM102

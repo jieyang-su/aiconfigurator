@@ -10,6 +10,7 @@ import torch
 
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.operations import MoEDispatch, PerformanceResult
+from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig
 
 pytestmark = pytest.mark.unit
 
@@ -62,6 +63,19 @@ def _make_dispatch(
     )
 
 
+def test_analytical_dispatch_and_combine_use_explicit_communication_dtypes():
+    db = _make_mock_db(sm_version=90, backend="sglang")
+    db.get_default_database_mode.return_value = common.DatabaseMode.ANALYTICAL
+    db._analytical_config = AnalyticalConfig(moe_dispatch_dtype="fp8", moe_combine_dtype="half")
+
+    _make_dispatch(attention_dp_size=1, pre_dispatch=True).query(db, x=16)
+    assert db.query_custom_allreduce.call_args.args[0] is common.CommQuantMode.fp8
+
+    db.query_custom_allreduce.reset_mock()
+    _make_dispatch(attention_dp_size=1, pre_dispatch=False).query(db, x=16)
+    assert db.query_custom_allreduce.call_args.args[0] is common.CommQuantMode.half
+
+
 # ===================================================================
 # SM == 100 path tests
 # ===================================================================
@@ -73,7 +87,7 @@ class TestEnableAlltoallConditions:
 
     def test_alltoall_enabled_default_backend(self):
         """alltoall enabled when moe_backend=None, dp>1, moe_tp=1, quant_mode set."""
-        db = _make_mock_db(sm_version=100)
+        db = _make_mock_db(sm_version=100, num_gpus_per_node=72)
         dispatch = _make_dispatch(
             moe_tp_size=1,
             moe_ep_size=8,
@@ -86,14 +100,14 @@ class TestEnableAlltoallConditions:
 
     def test_alltoall_enabled_cutlass_backend(self):
         """alltoall enabled when moe_backend='CUTLASS' and quant_mode set."""
-        db = _make_mock_db(sm_version=100)
+        db = _make_mock_db(sm_version=100, num_gpus_per_node=72)
         dispatch = _make_dispatch(moe_backend="CUTLASS", pre_dispatch=True, quant_mode=common.MoEQuantMode.fp8)
         dispatch.query(db, x=16)
         db.query_trtllm_alltoall.assert_called_once()
 
     def test_alltoall_requires_quant_mode_when_enabled(self):
         """TRTLLM alltoall path fails fast when quant_mode is missing."""
-        db = _make_mock_db(sm_version=100)
+        db = _make_mock_db(sm_version=100, num_gpus_per_node=72)
         dispatch = _make_dispatch(moe_tp_size=1, moe_ep_size=8, attention_dp_size=8, pre_dispatch=True, quant_mode=None)
         with pytest.raises(ValueError, match="requires quant_mode"):
             dispatch.query(db, x=16)
@@ -129,7 +143,7 @@ class TestSm100AlltoallPath:
 
     def test_pre_dispatch_calls_alltoall_dispatch(self):
         """Pre-dispatch uses alltoall_dispatch op."""
-        db = _make_mock_db(sm_version=100)
+        db = _make_mock_db(sm_version=100, num_gpus_per_node=72)
         dispatch = _make_dispatch(pre_dispatch=True, quant_mode=common.MoEQuantMode.fp8)
         result = dispatch.query(db, x=16)
 
@@ -141,7 +155,7 @@ class TestSm100AlltoallPath:
 
     def test_post_dispatch_calls_alltoall_combine(self):
         """Post-dispatch uses alltoall_combine op."""
-        db = _make_mock_db(sm_version=100)
+        db = _make_mock_db(sm_version=100, num_gpus_per_node=72)
         dispatch = _make_dispatch(pre_dispatch=False, quant_mode=common.MoEQuantMode.fp8)
         result = dispatch.query(db, x=16)
 
@@ -152,7 +166,7 @@ class TestSm100AlltoallPath:
 
     def test_nvfp4_quant_mode_forwarded(self):
         """nvfp4 quant_mode is correctly forwarded to alltoall (not replaced by default)."""
-        db = _make_mock_db(sm_version=100)
+        db = _make_mock_db(sm_version=100, num_gpus_per_node=72)
         dispatch = _make_dispatch(pre_dispatch=True, quant_mode=common.MoEQuantMode.nvfp4)
         dispatch.query(db, x=16)
 
@@ -161,7 +175,7 @@ class TestSm100AlltoallPath:
 
     def test_moe_backend_forwarded_to_alltoall(self):
         """moe_backend is forwarded to query_trtllm_alltoall."""
-        db = _make_mock_db(sm_version=100)
+        db = _make_mock_db(sm_version=100, num_gpus_per_node=72)
         dispatch = _make_dispatch(pre_dispatch=True, moe_backend="CUTLASS", quant_mode=common.MoEQuantMode.fp8)
         dispatch.query(db, x=16)
 

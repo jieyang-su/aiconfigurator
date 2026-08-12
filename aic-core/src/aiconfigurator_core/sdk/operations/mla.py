@@ -37,7 +37,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, ClassVar
 
 from aiconfigurator_core.sdk import common, perf_interp
-from aiconfigurator_core.sdk.errors import PerfDataNotAvailableError
+from aiconfigurator_core.sdk.errors import InterpolationDataNotAvailableError, PerfDataNotAvailableError
 from aiconfigurator_core.sdk.operations import util_empirical
 from aiconfigurator_core.sdk.operations.attention import generation_attn_flops, generation_attn_mode
 from aiconfigurator_core.sdk.operations.base import Operation, _read_filtered_rows, resolve_op_data_path
@@ -157,6 +157,17 @@ def _require_native_bucket(mla_dict: dict, native_heads: int | None, phase: str)
     return mla_dict[native_key]
 
 
+def _prefix_axis_supports(data: dict, prefix: int) -> bool:
+    """Require an exact prefix or an interpolation bracket; never extrapolate it."""
+    keys: set[int] = set()
+    for per_head in data.values():
+        if isinstance(per_head, dict):
+            keys.update(int(key) for key in per_head)
+    if prefix in keys:
+        return True
+    return len(keys) >= 2 and min(keys) < prefix < max(keys)
+
+
 # fmt: on
 
 
@@ -272,7 +283,7 @@ class ContextMLA(Operation):
             kvcache_quant_mode: common.KVCacheQuantMode,
             fmha_quant_mode: common.FMHAQuantMode,
         ) -> float:
-            # SOL / util from own (num_heads, full_s, b) grid; raises if no data.
+            # SOL / util from the measured prefix-aware module grid.
             sol_time = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
 
             def _slice():
@@ -311,6 +322,7 @@ class ContextMLA(Operation):
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         elif database_mode == common.DatabaseMode.ANALYTICAL:
             import math
+
             from aiconfigurator_core.sdk.kernelsim.analytical import mla_latency_ms
 
             if kvcache_quant_mode == common.KVCacheQuantMode.fp8 or fmha_quant_mode == common.FMHAQuantMode.fp8:
@@ -319,10 +331,18 @@ class ContextMLA(Operation):
                 return PerformanceResult(0.0, energy=0.0, source="analytical")
             return PerformanceResult(
                 mla_latency_ms(
-                    system=database.system, gpu=database.system_spec["gpu"], phase="prefill", batch=b,
-                    query_length=math.ceil(s), sequence_length=math.ceil(s + prefix), local_heads=num_heads,
-                    dtype="bf16", config=database._analytical_config,
-                ), energy=0.0, source="analytical"
+                    system=database.system,
+                    gpu=database.system_spec["gpu"],
+                    phase="prefill",
+                    batch=b,
+                    query_length=math.ceil(s),
+                    sequence_length=math.ceil(s + prefix),
+                    local_heads=num_heads,
+                    dtype="bf16",
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
             )
 
         cls.load_data(database)
@@ -386,6 +406,41 @@ class ContextMLA(Operation):
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
+
+
+class MLAConcatK(Operation):
+    """SGLang DeepSeek prefill K assembly between KV projection and MHA."""
+
+    _CP_AWARE: ClassVar[bool] = True
+
+    def __init__(self, name: str, scale_factor: float, num_heads: int, *, seq_split: int = 1) -> None:
+        super().__init__(name, scale_factor, seq_split=seq_split)
+        self._num_heads = num_heads
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        batch_size = int(kwargs.get("batch_size") or 0)
+        fresh = int(kwargs.get("s") or 0)
+        prefix = kwargs.get("prefix") or 0
+        prefix_tokens = int(sum(prefix)) if isinstance(prefix, (list, tuple)) else batch_size * int(prefix)
+        fresh_tokens = batch_size * fresh
+        num_tokens = -(-(fresh_tokens + prefix_tokens) // self._seq_split)
+        if num_tokens <= 0:
+            raise ValueError("MLAConcatK requires positive batch_size and sequence length")
+
+        # Read K-nope and shared K-rope, then write the assembled 192-wide K.
+        read_nope = num_tokens * self._num_heads * 128 * 2
+        read_rope = num_tokens * 64 * 2
+        write_k = num_tokens * self._num_heads * 192 * 2
+        result = database.query_mem_op(read_nope + read_rope + write_k)
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", "empirical"),
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights
 
 
 class GenerationMLA(Operation):
@@ -509,16 +564,25 @@ class GenerationMLA(Operation):
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
         elif database_mode == common.DatabaseMode.ANALYTICAL:
             import math
+
             from aiconfigurator_core.sdk.kernelsim.analytical import mla_latency_ms
 
             if kvcache_quant_mode == common.KVCacheQuantMode.fp8:
                 raise ValueError("ANALYTICAL MLA supports BF16 only; FP8 MLA is intentionally unsupported")
             return PerformanceResult(
                 mla_latency_ms(
-                    system=database.system, gpu=database.system_spec["gpu"], phase="decode", batch=b,
-                    query_length=1, sequence_length=max(1, math.ceil(s)), local_heads=num_heads,
-                    dtype="bf16", config=database._analytical_config,
-                ), energy=0.0, source="analytical"
+                    system=database.system,
+                    gpu=database.system_spec["gpu"],
+                    phase="decode",
+                    batch=b,
+                    query_length=1,
+                    sequence_length=max(1, math.ceil(s)),
+                    local_heads=num_heads,
+                    dtype="bf16",
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
             )
 
         cls.load_data(database)
@@ -727,10 +791,16 @@ class MLABmm(Operation):
             peak = gpu["fp8_tc_flops"] if is_fp8 else gpu["bfloat16_tc_flops"]
             return PerformanceResult(
                 bmm_latency_ms(
-                    num_tokens=num_tokens, num_heads=num_heads, if_pre=if_pre,
-                    dtype="fp8" if is_fp8 else "bf16", peak_flops_s=peak,
-                    mem_bandwidth_bytes_s=gpu["mem_bw"], config=database._analytical_config,
-                ), energy=0.0, source="analytical"
+                    num_tokens=num_tokens,
+                    num_heads=num_heads,
+                    if_pre=if_pre,
+                    dtype="fp8" if is_fp8 else "bf16",
+                    peak_flops_s=peak,
+                    mem_bandwidth_bytes_s=gpu["mem_bw"],
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
             )
 
         # Exact-head-first routing with a data-presence fallback: query the
@@ -959,7 +1029,12 @@ class MLAModule(Operation):
                     kvcache_quant_mode,
                     gemm_quant_mode,
                 )
-                return _require_native_bucket(sliced, native_num_heads, "context")
+                table = _require_native_bucket(sliced, native_num_heads, "context")
+                if not _prefix_axis_supports(table, prefix):
+                    raise PerfDataNotAvailableError(
+                        f"Context MLA module has no reliable prefix bracket for prefix={prefix}."
+                    )
+                return table
 
             grid = util_empirical.grid_for(
                 (
@@ -973,12 +1048,10 @@ class MLAModule(Operation):
                     native_num_heads,
                 ),
                 _slice,
-                lambda c: get_sol(c[2], c[1], 0, c[0], kvcache_quant_mode, fmha_quant_mode)[
-                    0
-                ],  # c=(num_heads, full_s, b)
-                depth=3,
+                lambda c: get_sol(c[3], c[2], c[1], c[0], kvcache_quant_mode, fmha_quant_mode)[0],
+                depth=4,
             )
-            latency, _ = util_empirical.estimate(sol_time, (num_heads, s + prefix, b), grid)
+            latency, _ = util_empirical.estimate(sol_time, (num_heads, prefix, s, b), grid)
             return latency
 
         if database_mode is None:
@@ -997,8 +1070,6 @@ class MLAModule(Operation):
 
         def get_silicon():
             data_wrapper.raise_if_not_loaded()
-            full_s = s + prefix
-            prefix_correction = (full_s * full_s - prefix * prefix) / (full_s * full_s)
             mla_dict = util_empirical.require_data_slice(
                 data_wrapper,
                 fmha_quant_mode,
@@ -1006,13 +1077,25 @@ class MLAModule(Operation):
                 gemm_quant_mode,
             )
             mla_dict = _require_native_bucket(mla_dict, native_num_heads, "context")
-            # Context MLA module ~ seq^2 -> context grid (sqrt on seq only); samples are prefix=0.
-            config = perf_interp.context_grid_config(
-                sol_fn=lambda n_v, s_v, b_v: get_sol(b_v, s_v, 0, n_v, kvcache_quant_mode, fmha_quant_mode)[0]
+            if not _prefix_axis_supports(mla_dict, prefix):
+                raise PerfDataNotAvailableError(
+                    "Context MLA module has no reliable prefix bracket for "
+                    f"prefix={prefix}, system='{database.system}', backend='{database.backend}', "
+                    f"version='{database.version}'."
+                )
+            config = perf_interp.OpInterpConfig(
+                axes=("num_heads", "prefix", "fresh_seq_len", "batch"),
+                resolver=perf_interp.Grid(),
+                sol_fn=lambda n_v, p_v, s_v, b_v: get_sol(b_v, s_v, p_v, n_v, kvcache_quant_mode, fmha_quant_mode)[0],
             )
-            result = perf_interp.query(config, mla_dict, num_heads, full_s, b)
-            latency = perf_interp.get_value(result, "latency") * prefix_correction
-            energy = perf_interp.get_value(result, "energy") * prefix_correction
+            try:
+                result = perf_interp.query(config, mla_dict, num_heads, prefix, s, b)
+            except InterpolationDataNotAvailableError as exc:
+                raise PerfDataNotAvailableError(
+                    f"Context MLA module data cannot resolve {num_heads=}, {prefix=}, {s=}, {b=}."
+                ) from exc
+            latency = perf_interp.get_value(result, "latency")
+            energy = perf_interp.get_value(result, "energy")
             return database._interp_pr(latency, energy=energy)
 
         return database._query_silicon_or_hybrid(
@@ -2105,7 +2188,7 @@ def load_context_mla_module_data(mla_module_file: str):
     Dict structure (#1458 — native level between quant keys and the local
     head-sweep axis; native is the model identity from ``model`` via
     ``_MLA_MODULE_NATIVE_HEADS``, num_heads stays the rank-local interp axis):
-        data[fmha_quant_mode][kv_cache_quant_mode][gemm_quant_mode][native][num_heads][s][b]
+        data[fmha][kv][gemm][native][num_heads][prefix][fresh_s][batch]
     """
     rows = _read_filtered_rows(mla_module_file)
     if rows is None:
@@ -2114,7 +2197,11 @@ def load_context_mla_module_data(mla_module_file: str):
 
     mla_data = defaultdict(
         lambda: defaultdict(
-            lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict()))))
+            lambda: defaultdict(
+                lambda: defaultdict(
+                    lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))
+                )
+            )
         )
     )
 
@@ -2125,6 +2212,7 @@ def load_context_mla_module_data(mla_module_file: str):
         native_heads = _mla_module_native_heads(row, mla_module_file, num_heads)
         b = int(row["batch_size"])
         s = int(row["isl"])
+        prefix = int(row.get("step", 0))
         latency = float(row["latency"])
         power = float(row.get("power", 0.0)) if has_power else 0.0
         energy = power * latency
@@ -2136,13 +2224,13 @@ def load_context_mla_module_data(mla_module_file: str):
         try:
             # Check for conflict: first source wins (shared-layer contract,
             # _read_filtered_rows orders primary before sibling fallbacks).
-            mla_data[fmha_mode][kv_dtype][gemm_mode][native_heads][num_heads][s][b]
+            mla_data[fmha_mode][kv_dtype][gemm_mode][native_heads][num_heads][prefix][s][b]
             logger.debug(
                 f"value conflict in context mla module data: {fmha_mode} {kv_dtype} {gemm_mode} "
-                f"{native_heads} {num_heads} {s} {b}"
+                f"{native_heads} {num_heads} {prefix} {s} {b}"
             )
         except KeyError:
-            mla_data[fmha_mode][kv_dtype][gemm_mode][native_heads][num_heads][s][b] = {
+            mla_data[fmha_mode][kv_dtype][gemm_mode][native_heads][num_heads][prefix][s][b] = {
                 "latency": latency,
                 "power": power,
                 "energy": energy,

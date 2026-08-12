@@ -131,9 +131,16 @@ class CustomAllReduce(Operation):
             if tp_size == 1:
                 return 0, 0, 0
             p2p_bw = database._get_p2p_bandwidth(tp_size)
+            # ``size`` is an element count. Keep accepting the legacy string
+            # inputs used by the public SOL API while honoring explicit FP8/
+            # INT8 communication dtypes from Analytical MoE paths.
+            if isinstance(quant_mode, common.CommQuantMode):
+                type_bytes = quant_mode.value.memory
+            else:
+                type_bytes = 1 if str(quant_mode).lower() in {"fp8", "int8"} else 2
             # assume all are ring allreduce, ignore constant latency
-            # (~1us for hopper, ~2us for two-die blackwell). assume bfloat16.
-            sol_time = 2 * size * 2 / tp_size * (tp_size - 1) / p2p_bw
+            # (~1us for hopper, ~2us for two-die blackwell).
+            sol_time = 2 * size * type_bytes / tp_size * (tp_size - 1) / p2p_bw
             return sol_time * 1000, 0, 0
 
         def get_empirical(quant_mode: common.CommQuantMode, tp_size: int, size: int) -> float:

@@ -74,7 +74,7 @@ def test_load_context_mla_module_keys_by_native_then_local(tmp_path):
     by_native = data[fmha][kv][gemm]
     assert set(by_native.keys()) == {128}
     assert set(by_native[128].keys()) == {16, 128}
-    assert by_native[128][16][2048][4]["latency"] == pytest.approx(1.6)
+    assert by_native[128][16][0][2048][4]["latency"] == pytest.approx(1.6)
 
 
 def test_load_generation_mla_module_keys_by_native_then_local(tmp_path):
@@ -106,7 +106,24 @@ def test_module_aliases_collapse_into_one_native_bucket(tmp_path):
     gemm = next(iter(data[fmha][kv]))
     by_native = data[fmha][kv][gemm]
     assert set(by_native.keys()) == {128}
-    assert by_native[128][16][1024][1]["latency"] == pytest.approx(0.4)
+    assert by_native[128][16][0][1024][1]["latency"] == pytest.approx(0.4)
+
+
+def test_context_module_loader_preserves_prefix_axis(tmp_path):
+    rows = [
+        _module_row(num_heads=16, bs=2, isl=64, step=0, lat=0.1),
+        _module_row(num_heads=16, bs=2, isl=64, step=128, lat=0.3),
+    ]
+    path = _write_csv(tmp_path / "ctx_prefix.txt", _MODULE_HEADER, rows)
+    data = load_context_mla_module_data(path)
+    fmha = next(iter(data))
+    kv = next(iter(data[fmha]))
+    gemm = next(iter(data[fmha][kv]))
+    by_prefix = data[fmha][kv][gemm][128][16]
+
+    assert set(by_prefix) == {0, 128}
+    assert by_prefix[0][64][2]["latency"] == pytest.approx(0.1)
+    assert by_prefix[128][64][2]["latency"] == pytest.approx(0.3)
 
 
 def test_load_mla_module_rejects_unpinned_model(tmp_path):

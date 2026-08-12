@@ -808,6 +808,7 @@ def test_sol_database_modes_fall_back_to_python_step():
         EMPIRICAL = "EMPIRICAL"
         SOL = "SOL"
         SOL_FULL = "SOL_FULL"
+        ANALYTICAL = "ANALYTICAL"
 
     class _DB:
         def __init__(self, mode):
@@ -822,4 +823,5 @@ def test_sol_database_modes_fall_back_to_python_step():
     assert should_use_rust_engine_step(rc, _DB(_Mode.EMPIRICAL))
     assert not should_use_rust_engine_step(rc, _DB(_Mode.SOL))
     assert not should_use_rust_engine_step(rc, _DB(_Mode.SOL_FULL))
+    assert not should_use_rust_engine_step(rc, _DB(_Mode.ANALYTICAL))
     assert should_use_rust_engine_step(rc)  # no database context -> unchanged

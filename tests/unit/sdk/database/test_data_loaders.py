@@ -1021,8 +1021,8 @@ def test_load_context_mla_module_data_nonexistent(tmp_path):
 def test_load_context_mla_module_data_basic(tmp_path):
     """
     Test loading context MLA module data.
-    Structure (#1458): data[fmha][kv][gemm][native][num_heads][s][b] — native
-    resolves from the model column via _MLA_MODULE_NATIVE_HEADS.
+    Structure (#1458): data[fmha][kv][gemm][native][num_heads][prefix][s][b]
+    — native resolves from the model column via _MLA_MODULE_NATIVE_HEADS.
     """
     csv_file = tmp_path / "mla_context_module_perf.txt"
     headers = (
@@ -1046,9 +1046,10 @@ def test_load_context_mla_module_data_basic(tmp_path):
     assert gemm in data[fmha][kv]
     assert 128 in data[fmha][kv][gemm]  # native (DeepSeek-V3 pin)
     assert 16 in data[fmha][kv][gemm][128]  # num_heads (rank-local sweep axis)
-    assert 4000 in data[fmha][kv][gemm][128][16]  # s = isl (step=0)
-    assert 2 in data[fmha][kv][gemm][128][16][4000]  # b
-    assert data[fmha][kv][gemm][128][16][4000][2]["latency"] == pytest.approx(1.5)
+    assert 0 in data[fmha][kv][gemm][128][16]  # prefix = step
+    assert 4000 in data[fmha][kv][gemm][128][16][0]  # s = fresh isl
+    assert 2 in data[fmha][kv][gemm][128][16][0][4000]  # b
+    assert data[fmha][kv][gemm][128][16][0][4000][2]["latency"] == pytest.approx(1.5)
 
 
 def test_load_context_mla_module_data_with_power(tmp_path):
@@ -1065,7 +1066,7 @@ def test_load_context_mla_module_data_with_power(tmp_path):
     csv_file.write_text(headers + row)
 
     data = load_context_mla_module_data(str(csv_file))
-    entry = data[FMHAQuantMode.bfloat16][KVCacheQuantMode.bfloat16][GEMMQuantMode.bfloat16][128][128][1024][1]
+    entry = data[FMHAQuantMode.bfloat16][KVCacheQuantMode.bfloat16][GEMMQuantMode.bfloat16][128][128][0][1024][1]
     assert entry["latency"] == pytest.approx(0.5)
     assert entry["power"] == pytest.approx(800.0)
     assert entry["energy"] == pytest.approx(400.0)  # 800 * 0.5
