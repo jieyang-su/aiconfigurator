@@ -52,10 +52,17 @@ def _frontier_mask_2d(x: np.ndarray, y: np.ndarray, *, maximize_x: bool, maximiz
     best_y = -np.inf
     previous_x = None
     previous_y = None
+    previous_kept = False
     for pos in order:
         current_x = xv[pos]
         current_y = yv[pos]
-        if current_y > best_y or (current_x == previous_x and current_y == previous_y):
+        # Preserve equivalent configurations only when the first copy was
+        # itself non-dominated. Otherwise a second copy of a dominated point
+        # would be reintroduced, making the frontier operation non-idempotent.
+        previous_kept = current_y > best_y or (
+            previous_kept and current_x == previous_x and current_y == previous_y
+        )
+        if previous_kept:
             mask[indices[pos]] = True
             best_y = max(best_y, current_y)
         previous_x = current_x
@@ -85,15 +92,10 @@ def _worker_envelope(df: pd.DataFrame, *, role: str, require_same_tp: bool) -> p
 
     if df.empty:
         return df.copy()
-    # Rate matching constrains StaticSummary.num_total_gpus, while the legacy
-    # result builder reports pp*tp*dp. They differ for MoE EP configurations.
-    # Both dimensions affect the current objective and must be preserved until
-    # that legacy accounting discrepancy is resolved centrally.
-    working = df.assign(_reported_gpus=df["pp"] * df["tp"] * df["dp"])
-    group_cols = ["num_total_gpus", "_reported_gpus"] + (["tp"] if require_same_tp else [])
+    group_cols = ["num_total_gpus"] + (["tp"] if require_same_tp else [])
     x_col = "ttft" if role == "prefill" else "tpot"
     parts: list[pd.DataFrame] = []
-    for _, group in working.groupby(group_cols, dropna=False, sort=False):
+    for _, group in df.groupby(group_cols, dropna=False, sort=False):
         parts.append(_pareto_2d(group, x_col, "seq/s", maximize_x=False, maximize_y=True))
     return pd.concat(parts, ignore_index=True) if parts else df.iloc[0:0].copy()
 
@@ -145,6 +147,42 @@ def _best_worker_match(
 def _max_tpot(runtime_config: config.RuntimeConfig) -> float:
     values = runtime_config.tpot if isinstance(runtime_config.tpot, list) else [runtime_config.tpot]
     return float(max(values))
+
+
+def _attach_source_provenance(candidate: dict, prefill: dict, decode: dict) -> dict:
+    """Keep worker operation sources aligned with a rate-matched deployment."""
+    candidate["_per_ops_source"] = {
+        "prefill": prefill.get("_per_ops_source"),
+        "decode": decode.get("_per_ops_source"),
+    }
+    return candidate
+
+
+def _validate_frontier(
+    frontier: pd.DataFrame,
+    x_col: str,
+    *,
+    maximize_x: bool,
+    num_gpu_set: set[int],
+) -> None:
+    """Reject malformed Pareto output before it reaches result files or plots."""
+    if frontier.empty:
+        raise RuntimeError("Pareto v2 produced an empty frontier")
+
+    expected = _pareto_2d(frontier, x_col, "tokens/s/gpu", maximize_x=maximize_x, maximize_y=True)
+    if len(expected) != len(frontier):
+        raise RuntimeError("Pareto v2 produced dominated or non-finite objective points")
+
+    ordered = frontier.sort_values(x_col, ascending=not maximize_x)
+    efficiency = ordered["tokens/s/gpu"].to_numpy(dtype=float)
+    if np.any(np.diff(efficiency) < 0):
+        raise RuntimeError("Pareto v2 frontier is not monotonic in objective space")
+
+    if num_gpu_set:
+        used_gpus = set(frontier["num_total_gpus"].astype(int))
+        if not used_gpus <= num_gpu_set:
+            unexpected = sorted(used_gpus - num_gpu_set)
+            raise RuntimeError(f"Pareto v2 returned deployments outside num_gpu_list: {unexpected}")
 
 
 def sweep_disagg_pareto_v2(
@@ -253,12 +291,9 @@ def sweep_disagg_pareto_v2(
     if p_feasible.empty or d_feasible.empty:
         raise NoFeasibleConfigError("Pareto v2 found no worker candidates satisfying TTFT/TPOT constraints")
 
-    # Do not prune individual workers before rate matching. StaticSummary's
-    # resource constraint and the legacy result builder currently use different
-    # GPU accounting for MoE/CP. That discrepancy makes otherwise natural
-    # throughput/latency worker dominance unsafe after discrete worker matching.
-    # V2 therefore performs its only lossy reduction in the final objective
-    # space, where dominance is exact.
+    # Do not prune individual workers before rate matching. Discrete worker
+    # templates can make an apparently dominated worker useful at a different
+    # P/D replica ratio, so the only lossy reduction is in final objective space.
     p_envelope = p_feasible.drop(columns=["_corrected_ttft"])
     d_envelope = d_feasible
 
@@ -287,7 +322,9 @@ def sweep_disagg_pareto_v2(
             if match is None:
                 continue
             if request_latency_mode:
-                candidate = _rate_match_dict(p_row, match[0], d_row, match[1], p_deg, d_deg)
+                candidate = _attach_source_provenance(
+                    _rate_match_dict(p_row, match[0], d_row, match[1], p_deg, d_deg), p_row, d_row
+                )
                 if candidate["request_latency"] > float(runtime_config.request_latency):
                     continue
                 rows.append(candidate)
@@ -296,25 +333,41 @@ def sweep_disagg_pareto_v2(
                     float(p_row["seq/s"]) * match[0] * p_deg,
                     float(d_row["seq/s"]) * match[1] * d_deg,
                 )
-                reported_gpus = (
-                    int(p_row["pp"] * p_row["tp"] * p_row["dp"]) * match[0]
-                    + int(d_row["pp"] * d_row["tp"] * d_row["dp"]) * match[1]
+                total_gpus = (
+                    int(p_row["num_total_gpus"]) * match[0]
+                    + int(d_row["num_total_gpus"]) * match[1]
                 )
-                efficiency = throughput * runtime_config.osl / reported_gpus
+                efficiency = throughput * runtime_config.osl / total_gpus
                 if efficiency > best_efficiency:
                     best_efficiency = efficiency
                     best_choice = (p_row, match)
         if not request_latency_mode and best_choice is not None:
             p_row, match = best_choice
-            rows.append(_rate_match_dict(p_row, match[0], d_row, match[1], p_deg, d_deg))
+            rows.append(
+                _attach_source_provenance(
+                    _rate_match_dict(p_row, match[0], d_row, match[1], p_deg, d_deg), p_row, d_row
+                )
+            )
 
     if not rows:
         raise NoFeasibleConfigError("Pareto v2 found no rate-matched deployment satisfying all constraints")
-    candidates = pd.DataFrame(rows, columns=common.ColumnsDisagg).round(3)
+    candidates = pd.DataFrame(rows, columns=[*common.ColumnsDisagg, "_per_ops_source"])
     if request_latency_mode:
         frontier = _pareto_2d(candidates, "request_latency", "tokens/s/gpu", maximize_x=False, maximize_y=True)
+        frontier = _pareto_2d(
+            frontier.round(3), "request_latency", "tokens/s/gpu", maximize_x=False, maximize_y=True
+        )
     else:
         frontier = _pareto_2d(candidates, "tokens/s/user", "tokens/s/gpu", maximize_x=True, maximize_y=True)
+        frontier = _pareto_2d(
+            frontier.round(3), "tokens/s/user", "tokens/s/gpu", maximize_x=True, maximize_y=True
+        )
+    _validate_frontier(
+        frontier,
+        "request_latency" if request_latency_mode else "tokens/s/user",
+        maximize_x=not request_latency_mode,
+        num_gpu_set=num_gpu_set,
+    )
     frontier.attrs["pareto_v2_diagnostics"] = {
         "raw_prefill_workers": len(p_raw),
         "feasible_prefill_workers": len(p_feasible),

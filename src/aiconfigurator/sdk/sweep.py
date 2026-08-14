@@ -633,7 +633,16 @@ def _get_disagg_worker_candidates(
                 )
                 if not summary.check_oom() and not summary.check_kv_cache_oom():
                     all_configs_oom = False
-                    result_rows.append(summary.get_summary_df())
+                    summary_df = summary.get_summary_df().copy()
+                    phase_sources = summary.get_per_ops_source()
+                    if phase_sources is None:
+                        phase_sources = (
+                            summary.get_context_source_dict()
+                            if role == "prefill"
+                            else summary.get_generation_source_dict()
+                        )
+                    summary_df["_per_ops_source"] = [phase_sources]
+                    result_rows.append(summary_df)
                 else:
                     # Larger b will always OOM. check_kv_cache_oom covers the
                     # fraction-based budget (e.g. vLLM only manages

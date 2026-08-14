@@ -85,7 +85,7 @@ _LEGACY_TPOT_SWEEP: list[int] = list(range(1, 20, 1)) + list(range(20, 300, 5))
 # DeepSeek-V3.2 / V4-family MoE models need large pipeline-parallel candidates
 # on systems where the conservative 8-GPU/PP=1 template can exclude every
 # memory-feasible deployment. GLM-5.2 resolves to the DEEPSEEKV32 family.
-_LARGE_PIPELINE_PARALLEL_MODEL_FAMILIES = {"DEEPSEEKV32", "DEEPSEEKV4"}
+_LARGE_PIPELINE_PARALLEL_MODEL_FAMILIES = {"DEEPSEEKV32", "DEEPSEEKV4", "KIMIK3"}
 
 _QUANT_ENUM_TABLES: dict[str, type] = {
     "gemm_quant_mode": common.GEMMQuantMode,
@@ -492,6 +492,11 @@ class Task:
     analytical_wideep_dispatch_dtype: str = "half"
     analytical_wideep_combine_dtype: str = "half"
     communication_placement: Literal["independent", "tp_first"] = "independent"
+    # MoE token distribution selects the matching silicon table slice and the
+    # corresponding analytical workload assumption. Keep the historical
+    # ModelConfig default while allowing reproducible experiments to request a
+    # measured distribution explicitly.
+    workload_distribution: str = "power_law"
     # Fine-grained HYBRID/EMPIRICAL transfer control: which empirical transfer kinds are
     # permitted (see common.TransferKind). None = all (default). Accepts a preset name
     # ("conservative"/"balanced"/"aggressive"/"off"), a kind ("xshape"), or a list thereof.
@@ -1194,6 +1199,11 @@ class Task:
         # span multiple 8-GPU nodes: the system spec and communication ops
         # already model inter-node bandwidth/latency. H200 remains on the
         # compact defaults because its 141-GiB memory has feasible PP=1 points.
+        # Kimi-K3 is substantially larger and needs cross-node candidates even
+        # on H200; all packaged systems can model that topology through their
+        # scale-out communication specification.
+        if self._model_family == "KIMIK3":
+            return True
         if system == "h100_sxm":
             return True
         try:
@@ -1580,8 +1590,8 @@ class Task:
             # moe_backend / attention_backend / wideep_num_slots are shared across roles
             # (Task has no per-role variant) and fed to ModelConfig so get_model selects the
             # right MoE kernel (deepep_moe / megamoe), MLA attention perf tables (fa3 vs
-            # flashinfer), and EPLB slot count. workload_distribution remains non-configurable
-            # in v2 and ModelConfig's default matches v1's.
+            # flashinfer), EPLB slot count, and explicit MoE token distribution.
+            workload_distribution=self.workload_distribution,
             moe_backend=self.moe_backend,
             # None means "unspecified" -> fall back to flashinfer (matches v1 and ModelConfig's default).
             attention_backend=self.attention_backend or "flashinfer",

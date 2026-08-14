@@ -10,6 +10,8 @@ from aiconfigurator.sdk import common, config
 from aiconfigurator.sdk.pareto_v2 import (
     _best_worker_match,
     _frontier_mask_2d,
+    _pareto_2d,
+    _validate_frontier,
     _worker_envelope,
     _worker_templates,
     sweep_disagg_pareto_v2,
@@ -58,6 +60,36 @@ def test_frontier_retains_tradeoffs_and_equal_objective_configs():
     assert _frontier_mask_2d(x, y, maximize_x=True, maximize_y=True).tolist() == [True, True, False, True, True]
 
 
+def test_frontier_does_not_reintroduce_dominated_duplicate_and_is_idempotent():
+    frame = pd.DataFrame(
+        {
+            "x": [10.0, 9.0, 9.0, 8.0],
+            "y": [5.0, 4.0, 4.0, 6.0],
+        }
+    )
+    first = _pareto_2d(frame, "x", "y", maximize_x=True, maximize_y=True)
+    second = _pareto_2d(first, "x", "y", maximize_x=True, maximize_y=True)
+
+    assert list(zip(first["x"], first["y"], strict=True)) == [(10.0, 5.0), (8.0, 6.0)]
+    pd.testing.assert_frame_equal(first, second)
+
+
+def test_frontier_validation_rejects_dominated_points_and_gpu_budget_violations():
+    dominated = pd.DataFrame(
+        {
+            "tokens/s/user": [10.0, 9.0],
+            "tokens/s/gpu": [5.0, 4.0],
+            "num_total_gpus": [8, 8],
+        }
+    )
+    with pytest.raises(RuntimeError, match="dominated or non-finite"):
+        _validate_frontier(dominated, "tokens/s/user", maximize_x=True, num_gpu_set={8})
+
+    outside_budget = dominated.iloc[[0]].assign(num_total_gpus=12)
+    with pytest.raises(RuntimeError, match="outside num_gpu_list"):
+        _validate_frontier(outside_budget, "tokens/s/user", maximize_x=True, num_gpu_set={8})
+
+
 def test_worker_envelope_matches_pairwise_dominance():
     df = pd.DataFrame(
         [
@@ -71,13 +103,13 @@ def test_worker_envelope_matches_pairwise_dominance():
     assert set(zip(result["num_total_gpus"], result["bs"], strict=True)) == {(1, 1), (1, 2), (2, 1)}
 
 
-def test_worker_envelope_preserves_legacy_reported_gpu_dimension():
+def test_worker_envelope_uses_authoritative_gpu_dimension():
     ep_worker = _worker(parallel="ep", bs=1, tpot=10, ttft=10, rate=8, gpus=8)
     ep_worker.update(tp=1, pp=1, dp=1, moe_ep=8)
     dp_worker = _worker(parallel="dp", bs=2, tpot=9, ttft=9, rate=9, gpus=8)
     dp_worker.update(tp=1, pp=1, dp=8, moe_ep=1)
     result = _worker_envelope(pd.DataFrame([ep_worker, dp_worker]), role="decode", require_same_tp=True)
-    assert set(result["parallel"]) == {"ep", "dp"}
+    assert set(result["parallel"]) == {"dp"}
 
 
 def test_vector_worker_match_equals_brute_force():
@@ -140,7 +172,40 @@ def test_v2_preserves_high_tps_point_removed_by_efficiency_topk(monkeypatch):
     assert diagnostics["frontier_points"] == 2
 
 
-def test_v2_does_not_prune_worker_under_legacy_gpu_accounting_mismatch(monkeypatch):
+def test_v2_preserves_prefill_and_decode_operation_sources(monkeypatch):
+    prefill = _worker(parallel="p", bs=1, tpot=1, ttft=10, rate=20, gpus=1)
+    decode = _worker(parallel="d", bs=1, tpot=5, ttft=0, rate=20, gpus=1)
+    prefill["_per_ops_source"] = {"context_attention": "silicon"}
+    decode["_per_ops_source"] = {"generation_attention": "empirical"}
+    calls = iter([pd.DataFrame([prefill]), pd.DataFrame([decode])])
+    monkeypatch.setattr("aiconfigurator.sdk.pareto_v2._get_disagg_worker_candidates", lambda **_: next(calls))
+
+    result = sweep_disagg_pareto_v2(
+        model_path="test",
+        runtime_config=config.RuntimeConfig(isl=8, osl=4, ttft=100, tpot=20),
+        prefill_database=MagicMock(),
+        prefill_backend_name="sglang",
+        prefill_model_config=config.ModelConfig(),
+        prefill_parallel_config_list=[(1, 1, 1, 1, 1, 1)],
+        prefill_latency_correction=1,
+        decode_database=MagicMock(),
+        decode_backend_name="sglang",
+        decode_model_config=config.ModelConfig(),
+        decode_parallel_config_list=[(1, 1, 1, 1, 1, 1)],
+        decode_latency_correction=1,
+        prefill_max_num_tokens=8,
+        decode_max_num_tokens=1,
+        prefill_num_worker_list=[1],
+        decode_num_worker_list=[1],
+        num_gpu_list=[2],
+    )
+    assert result.iloc[0]["_per_ops_source"] == {
+        "prefill": {"context_attention": "silicon"},
+        "decode": {"generation_attention": "empirical"},
+    }
+
+
+def test_v2_prefill_choice_uses_authoritative_cp_gpu_accounting(monkeypatch):
     slower = _worker(parallel="p-slower", bs=1, tpot=1, ttft=10, rate=6.586, gpus=8)
     faster = _worker(parallel="p-faster", bs=1, tpot=1, ttft=9, rate=6.859, gpus=8)
     for row in (slower, faster):
@@ -170,9 +235,10 @@ def test_v2_does_not_prune_worker_under_legacy_gpu_accounting_mismatch(monkeypat
         num_gpu_list=[1, 2, 4, 8, 16, 24, 32],
     )
     row = result.iloc[0]
-    assert row["(p)parallel"] == "p-slower"
-    assert row["(p)workers"] == 3
-    assert row["(d)workers"] == 1
+    assert row["(p)parallel"] == "p-faster"
+    expected_gpus = 8 * (row["(p)workers"] + row["(d)workers"])
+    assert row["num_total_gpus"] == expected_gpus == 24
+    assert row["tokens/s/gpu"] == pytest.approx(row["tokens/s"] / expected_gpus, abs=1e-3)
 
 
 def test_v2_applies_corrected_ttft_and_request_latency(monkeypatch):

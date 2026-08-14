@@ -932,6 +932,26 @@ def test_large_pipeline_parallel_augments_dsv32_blackwell_defaults():
     assert t4.agg_pp_candidates == [1]
 
 
+def test_kimi_k3_large_pipeline_defaults_cover_32_gpu_workers():
+    task = Task(
+        serving_mode="disagg",
+        pareto_algorithm="v2",
+        prefill_model_path="moonshotai/Kimi-K3",
+        decode_model_path="moonshotai/Kimi-K3",
+        prefill_system_name="h100_sxm",
+        decode_system_name="h100_sxm",
+        prefill_backend_name="sglang",
+        decode_backend_name="sglang",
+        prefill_backend_version="0.5.16",
+        decode_backend_version="0.5.16",
+        total_gpus=32,
+        workload_distribution="balanced",
+    )
+    assert {16, 32} <= set(task.prefill_num_gpu_candidates)
+    assert {2, 4} <= set(task.prefill_pp_candidates)
+    assert task.build_model_config(role="prefill").workload_distribution == "balanced"
+
+
 def test_megamoe_sglang_parallel_lists_and_validation():
     """SGLang MegaMoE (initial support): DeepSeek-V4-Pro on Blackwell gets EP-only parallel
     lists; non-sglang / non-DeepSeek-V4 are rejected (v1 _validate_megamoe_backend_support)."""
