@@ -14,6 +14,7 @@ KernelSim 位于 SDK 的 kernelsim 组件中，为 Analytical 提供基于 shape
 | FA/MLA | FA2/FA3 和 MLA attention | Q/KV shape、head 数、head dim、causal、硬件带宽/计算能力 |
 | BMM | 通用 batch matrix multiplication | batch、矩阵形状、dtype、访存和计算量 |
 | MoE | 普通 MoE 单卡计算部分 | token、hidden/intermediate、EP/TP、dtype、效率参数 |
+| KDA | Kimi K3 Delta Attention core | phase、backend、batch/sequence、head geometry、conv/scan/recurrence route |
 | DSA Index MQA | DSA/V3.2/GLM index score | ragged/paged、batch、query/context、index heads、head dim |
 | DSA TopK | DSA index transform/TopK | layout、context、query、K、score recipe |
 | MSA Index | MiniMax M3 BF16 Triton 风格 index | batch、Q、context、4-head index shape |
@@ -66,6 +67,36 @@ Flash K=512 是主要多硬件校准范围。Pro K=1024 的 v1 使用 H100 定�
 
 对 norm、rope、store 等未单独校准的小算子，可以使用访存和启动项的快速估算；但其 source 应保持可审计，不能在报告中误称为 silicon 查表。
 
+## 混合精度 transfer proxy
+
+Analytical 1.1 增加三类不重新拟合的工作量迁移：
+
+| proxy | 复用参数 | 只改变的主要工作量 | 状态 |
+|---|---|---|---|
+| W8A16 GEMM | BF16 GEMM Sum-3P | INT8 weight + FP32 output scale bytes | 低可信 |
+| W8A16 MoE | BF16 Triton MoE | INT8 expert weight + scale bytes | 低可信 |
+| W4A16 MXFP4 MoE | BF16 Triton MoE | packed MXFP4 weight + E8M0 block scale bytes | 低可信 |
+
+这些 proxy 保持 BF16 FLOPs、compute peak、activation/intermediate traffic、launch 和效率参数。
+它们不包含 backend-specific dequant、tile、workspace 和 small-M 代价，首次使用会发出 warning，
+不得当作 Silicon 或重新拟合模型。通用 `int4_wo` GEMM/MoE 仍未支持。
+
+FA v4 允许计算 dtype 与 KV cache 物理字节宽度分离。`FP8 KV + BF16 FMHA` 只减少
+KV HBM/L2 流量，反量化假定融合且代价忽略；V4 sparse attention 还使用其 584-byte
+packed KV contract。MLA 的 FP8 KV 只影响全局 cache 容量，算子时延暂按 BF16 compute
+proxy 估算。
+
+DSA Index MQA 在硬件无 FP8 peak 时可使用 BF16 resource-scaled proxy。它保留 H100
+FP8 launch/task-service 结构，只按 BF16/FP8 理论 resource ratio 缩放任务项，不代表
+存在已采 BF16 DeepGEMM kernel。
+
+## KDA 模型边界
+
+KDA KernelSim 覆盖 SGLang/vLLM 的 conv、prefill scan、decode recurrence 和部分 fused
+decode/verify estimator。其 prefill v4 saturation 依赖固定 64-token chunk、已核实 SM 数
+和 K3 geometry。当前 Analytical adapter 尚未完整共享 Silicon 的 fused route resolver，
+因此 fused conv/onorm ownership、DSPARK verify 和 backend 边界仍是主要风险。
+
 ## 使用建议与风险
 
 - 无实测数据时优先使用 Analytical `standard`，并用 `low/high` 做敏感性区间。
@@ -73,3 +104,5 @@ Flash K=512 是主要多硬件校准范围。Pro K=1024 的 v1 使用 H100 定�
 - MLA/attention 的 dtype 能力边界必须在前端和 operation 层校验。
 - DSV4、DSA、MSA 模型强绑定 SGLang kernel 语义；跨 backend 或版本迁移需要重新验证。
 - 单硬件拟合模型只能用于阶段性排序、瓶颈分析和无卡估算，不能替代多硬件实采校准。
+- 国产 GPU YAML 的 SM/共享内存字段只是 KernelSim 调度代理；显式 architecture capability
+  决定 FP8/FP4 路由，结果不代表 NVIDIA ISA 或 backend 可执行性。
