@@ -38,6 +38,49 @@ def test_engine_step_backend_defaults_to_rust(monkeypatch, tmp_path: Path) -> No
     assert not rust_engine_step.should_use_rust_engine_step(RuntimeConfig(engine_step_backend="auto"), database)
 
 
+def _model_with_communication_placement(placement: str) -> SimpleNamespace:
+    return SimpleNamespace(config=ModelConfig(communication_placement=placement))
+
+
+def test_independent_placement_preserves_default_and_explicit_rust_routing(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("AICONFIGURATOR_ENGINE_STEP_BACKEND", raising=False)
+    monkeypatch.setattr(rust_engine_step, "_POWER_DATA_CACHE", {})
+    database = _power_probe_database(tmp_path, with_power=False)
+    model = _model_with_communication_placement("independent")
+
+    assert rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
+    assert rust_engine_step.should_use_rust_engine_step(
+        RuntimeConfig(engine_step_backend="rust"), database, model
+    )
+
+
+def test_tp_first_placement_delegates_default_and_explicit_rust_to_python(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("AICONFIGURATOR_ENGINE_STEP_BACKEND", raising=False)
+    monkeypatch.setattr(rust_engine_step, "_POWER_DATA_CACHE", {})
+    database = _power_probe_database(tmp_path, with_power=False)
+    model = _model_with_communication_placement("tp_first")
+
+    assert not rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
+    assert not rust_engine_step.should_use_rust_engine_step(
+        RuntimeConfig(engine_step_backend="rust"), database, model
+    )
+
+
+def test_tp_first_python_fallback_warning_is_emitted_once(monkeypatch, tmp_path: Path, caplog) -> None:
+    monkeypatch.delenv("AICONFIGURATOR_ENGINE_STEP_BACKEND", raising=False)
+    monkeypatch.setattr(rust_engine_step, "_POWER_DATA_CACHE", {})
+    rust_engine_step._warn_python_placement_fallback_once.cache_clear()
+    database = _power_probe_database(tmp_path, with_power=False)
+    model = _model_with_communication_placement("tp_first")
+
+    with caplog.at_level("WARNING", logger=rust_engine_step.__name__):
+        assert not rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
+        assert not rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
+
+    messages = [record.message for record in caplog.records if "communication placement tp_first" in record.message]
+    assert len(messages) == 1
+
+
 def _power_probe_database(tmp_path: Path, *, with_power: bool):
     """A real ``PerfDatabase`` instance (loader bypassed) whose data tree the
     power probe can scan. Default routing requires the real type: synthetic

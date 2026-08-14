@@ -13,6 +13,7 @@ onto that handle and cache one handle per engine identity.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -245,7 +246,7 @@ def _normalize_tuning_iterations(iterations: dict[str, Any] | list[Any]) -> list
 _RUST_SUPPORTED_DATABASE_MODES = {"SILICON", "HYBRID", "EMPIRICAL"}
 
 
-def should_use_rust_engine_step(runtime_config: RuntimeConfig, database: Any = None) -> bool:
+def should_use_rust_engine_step(runtime_config: RuntimeConfig, database: Any = None, model: Any = None) -> bool:
     """Route to the compiled engine only when it can give the SAME answer.
 
     The compiled engine is the DEFAULT. The Python step remains reachable
@@ -260,11 +261,27 @@ def should_use_rust_engine_step(runtime_config: RuntimeConfig, database: Any = N
       the FFI yet, so rust-routing an agg sweep would silently zero its
       ``power_w``. Explicit ``"rust"`` keeps its historical force semantics
       (the parity scan tooling relies on it and measures latency only).
+    * a model using non-independent communication placement, because the Rust
+      engine does not carry the Python placement metadata into communication
+      operation queries yet.
     """
     backend = getattr(runtime_config, "engine_step_backend", None) or os.environ.get(ENGINE_STEP_BACKEND_ENV)
     requested = str(backend).lower() if backend else None
     if requested is not None and requested != "rust":
         return False
+    if database is not None:
+        system_spec = getattr(database, "system_spec", {}) or {}
+        from aiconfigurator_core.sdk.system_spec import architecture_family, is_single_supernode
+
+        placement = str(
+            getattr(getattr(model, "config", None), "communication_placement", "independent") or "independent"
+        ).lower()
+        if placement != "independent":
+            _warn_python_placement_fallback_once(str(getattr(database, "system", "<unknown>")), placement)
+            return False
+        if architecture_family(system_spec) == "domestic" or is_single_supernode(system_spec):
+            _warn_python_topology_fallback_once(str(getattr(database, "system", "<unknown>")))
+            return False
     if requested is None:
         # Deferred import: perf_database is heavy and this module must stay
         # light to import (engine.py imports it at top level).
@@ -299,6 +316,25 @@ def should_use_rust_engine_step(runtime_config: RuntimeConfig, database: Any = N
             )
             return False
     return True
+
+
+@functools.cache
+def _warn_python_topology_fallback_once(system: str) -> None:
+    logger.warning(
+        "Using Python engine-step for system %s: the Rust engine does not yet model "
+        "explicit architecture capabilities or single-supernode-only topology.",
+        system,
+    )
+
+
+@functools.cache
+def _warn_python_placement_fallback_once(system: str, placement: str) -> None:
+    logger.warning(
+        "Using Python engine-step for system %s with communication placement %s: "
+        "the Rust engine does not yet propagate placement-aware communication metadata.",
+        system,
+        placement,
+    )
 
 
 # Power-data probe results keyed by (system, backend, version). The probe is
@@ -751,7 +787,9 @@ def _engine_config_json(model: Any, database: Any) -> str:
 
 
 def _database_mode_key(database: Any) -> str:
-    mode = getattr(database, "_requested_database_mode", None) or getattr(database, "get_default_database_mode", lambda: None)()
+    mode = getattr(database, "_requested_database_mode", None) or getattr(
+        database, "get_default_database_mode", lambda: None
+    )()
     return getattr(mode, "name", str(mode)) if mode is not None else "SILICON"
 
 

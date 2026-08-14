@@ -23,7 +23,6 @@ from .model import (
 )
 from .v4 import V4Saturation, predict_chunk_v4
 
-
 # These are measured hardware capabilities, not fitted latency coefficients.
 # L40S intentionally remains absent: its v2 path must not invent an SM count.
 _VERIFIED_SM_COUNTS = {
@@ -79,7 +78,9 @@ def _kernel_estimate(
 ) -> KernelEstimate:
     profile = get_profile(profile_level)
     if kernel_source in {"causal_conv1d_fn_qkv3", "causal_conv1d_update"}:
-        return estimate_conv(shape, {"context": "prefill", "generation": "decode", "verify": "verify"}[phase], hardware, profile, route)
+        return estimate_conv(
+            shape, {"context": "prefill", "generation": "decode", "verify": "verify"}[phase], hardware, profile, route
+        )
     if kernel_source in {"chunk_kda", "chunk_kda_with_fused_gate", "flashkda_fwd"}:
         return estimate_scan(shape, hardware, profile, route)
     if kernel_source in {"fused_kda_decode", "kda_fused_decode"}:
@@ -158,7 +159,9 @@ def estimate_kernel(
     if kernel_source in {"chunk_kda", "chunk_kda_with_fused_gate"} and phase == "context" and backend == "sglang":
         sm_count = _VERIFIED_SM_COUNTS.get(system)
         if sm_count is not None:
-            central_us = predict_chunk_v4(shape, hardware, get_profile(level), _base_waves(shape, sm_count), V4Saturation(0.04, 0.48, 32.0))
+            central_us = predict_chunk_v4(
+                shape, hardware, get_profile(level), _base_waves(shape, sm_count), V4Saturation(0.04, 0.48, 32.0)
+            )
             policy = "v4_central_low_confidence" if system == "rtx_pro_6000_server" else "v4_central"
             confidence = "low" if system == "rtx_pro_6000_server" else "medium"
     return KdaAnalyticalEstimate(

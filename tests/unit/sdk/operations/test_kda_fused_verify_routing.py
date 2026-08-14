@@ -14,10 +14,10 @@ untouched. The Rust twin lives in ``operators/mamba.rs::KdaOp::query``.
 
 import pytest
 
-from aiconfigurator_core.sdk.operations.mamba import KDAKernel
-from aiconfigurator_core.sdk.performance_result import PerformanceResult
 from aiconfigurator_core.sdk import common
 from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig
+from aiconfigurator_core.sdk.operations.mamba import KDAKernel
+from aiconfigurator_core.sdk.performance_result import PerformanceResult
 
 pytestmark = pytest.mark.unit
 

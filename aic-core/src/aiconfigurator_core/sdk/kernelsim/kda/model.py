@@ -11,7 +11,6 @@ from dataclasses import asdict, dataclass
 from math import ceil, isfinite
 from typing import Literal
 
-
 MODEL_VERSION = "2026-08-10.kimi-k3-kda-core-v4"
 Phase = Literal["prefill", "decode", "verify"]
 Route = Literal["sglang", "vllm"]
@@ -230,11 +229,6 @@ def estimate_conv(
     read_bytes = int(tokens * channels * 2 * 1.8)
     write_bytes = tokens * channels * 2
     flops = tokens * channels * shape.conv_width * 2
-    launch_us = (
-        (3.0 if phase == "decode" else 5.0)
-        if route == "vllm"
-        else (5.0 if phase == "decode" else 5.5)
-    )
     return _estimate(
         kernel="causal_conv1d_fn_qkv3" if phase == "prefill" else "causal_conv1d_update",
         phase=phase,
@@ -309,7 +303,9 @@ def estimate_scan(shape: KdaShape, hardware: KdaHardware, profile: KdaProfile, r
     )
 
 
-def estimate_recurrence(shape: KdaShape, phase: Phase, hardware: KdaHardware, profile: KdaProfile, route: Route) -> KernelEstimate:
+def estimate_recurrence(
+    shape: KdaShape, phase: Phase, hardware: KdaHardware, profile: KdaProfile, route: Route
+) -> KernelEstimate:
     """Packed decode recurrence or chain verify recurrence, excluding convolution."""
     if phase not in {"decode", "verify"}:
         raise ValueError("recurrence supports decode or verify only")
@@ -320,14 +316,12 @@ def estimate_recurrence(shape: KdaShape, phase: Phase, hardware: KdaHardware, pr
     read_bytes = tokens * 4 * width * 2 + state * shape.batch_size
     write_bytes = tokens * width * 2 + state * (tokens if phase == "verify" else shape.batch_size)
     flops = tokens * shape.local_heads * shape.head_dim * shape.head_dim * 8
-    kernel = "fused_recurrent_kda" if route == "vllm" and phase == "verify" else (
-        "fused_sigmoid_gating_delta_rule_update" if phase == "verify" else "fused_recurrent_kda_packed_decode"
+    kernel = (
+        "fused_recurrent_kda"
+        if route == "vllm" and phase == "verify"
+        else ("fused_sigmoid_gating_delta_rule_update" if phase == "verify" else "fused_recurrent_kda_packed_decode")
     )
-    launch_us = (
-        (3.0 if phase == "decode" else 5.0)
-        if route == "vllm"
-        else (5.0 if phase == "decode" else 5.5)
-    )
+    launch_us = (3.0 if phase == "decode" else 5.0) if route == "vllm" else (5.0 if phase == "decode" else 5.5)
     return _estimate(
         kernel=kernel,
         phase=phase,
@@ -467,8 +461,13 @@ def estimate_kda_plan(
 
     def total(profile: KdaProfile) -> float:
         if existing is None:
-            return sum(item.latency_us for item in estimate_kda_core(shape, phase, route, hardware, profile, fused_decode=fused_decode))
-        return estimate_kda_module(shape, phase, route, hardware, existing, profile, fused_decode=fused_decode).latency_us
+            return sum(
+                item.latency_us
+                for item in estimate_kda_core(shape, phase, route, hardware, profile, fused_decode=fused_decode)
+            )
+        return estimate_kda_module(
+            shape, phase, route, hardware, existing, profile, fused_decode=fused_decode
+        ).latency_us
 
     lower = total(get_profile("low"))
     v2_central = total(get_profile("standard"))
