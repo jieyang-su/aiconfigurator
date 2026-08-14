@@ -487,6 +487,7 @@ class NemotronHModel(BaseModel):
                         num_kv_heads_per_gpu,
                         kvcache_quant_mode,
                         head_size=self._head_size,
+                        fmha_quant_mode=self.config.fmha_quant_mode,
                     ),
                     ops.GEMM(
                         "generation_proj_gemm",

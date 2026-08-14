@@ -359,6 +359,7 @@ class Qwen35Model(BaseModel):
                         n_kv_per_tp,
                         kvcache_q,
                         head_size=self._head_size,
+                        fmha_quant_mode=self.config.fmha_quant_mode,
                     ),
                     ops.GEMM(
                         "generation_proj_gemm", c, h, n_q_per_tp * self._head_size, gemm_q, low_precision_input=True

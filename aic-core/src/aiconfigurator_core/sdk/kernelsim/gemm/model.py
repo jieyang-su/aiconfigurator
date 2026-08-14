@@ -9,9 +9,36 @@ uses microseconds.
 from __future__ import annotations
 
 import math
+import warnings as python_warnings
 from dataclasses import dataclass
 
 EMPIRICAL_MODEL_VERSION = "2026-07-29.aic-gemm-empirical-v3"
+W8A16_TRANSFER_MODEL_VERSION = "2026-08-13.w8a16-int8wo-bf16-transfer-v1"
+W8A16_TRANSFER_LIMITATION = (
+    "W8A16 dense GEMM uses an uncalibrated BF16 parameter transfer: activations, "
+    "outputs, FLOPs, launch cost, and compute efficiency remain BF16, while only "
+    "INT8 weight values and per-output-channel FP32 scale traffic are substituted. "
+    "Fused dequantization cost, backend-specific packing/tiling, small-M behavior, "
+    "and non-NVIDIA hardware are not calibrated. The current SGLang GEMM collector "
+    "also does not fully connect its declared int8_wo case. Treat this estimate as "
+    "low confidence. This is an ANALYTICAL transfer proxy, not a Silicon calibration "
+    "row, and must not be reported as measured W8A16 performance."
+)
+
+
+class W8A16TransferModelWarning(UserWarning):
+    """Warning for the deliberately limited W8A16 dense GEMM recipe."""
+
+
+_w8a16_warning_emitted = False
+
+
+def _warn_w8a16_transfer_once() -> None:
+    global _w8a16_warning_emitted
+    if _w8a16_warning_emitted:
+        return
+    _w8a16_warning_emitted = True
+    python_warnings.warn(W8A16_TRANSFER_LIMITATION, W8A16TransferModelWarning, stacklevel=3)
 
 
 @dataclass(frozen=True)
@@ -256,6 +283,52 @@ def estimate_bf16_gemm(
     )
 
 
+def estimate_w8a16_gemm(
+    m: int,
+    n: int,
+    k: int,
+    peak_bf16_flops: float,
+    mem_bandwidth_bytes_s: float,
+    params: Bf16Sum3PParameters | None = None,
+    *,
+    parameter_level: str = "standard",
+) -> LatencyBreakdown:
+    """Estimate an INT8-weight/BF16-activation GEMM by BF16 transfer.
+
+    The proxy assumes one FP32 scale per output channel and fused weight
+    dequantization, so no materialized BF16 weight tensor is charged.
+    """
+    _warn_w8a16_transfer_once()
+    params = _resolve_parameters(parameter_level, params, get_bf16_parameters)
+    m, n, k = _positive_shape(m, n, k)
+    peak = _positive_rate("peak_bf16_flops", peak_bf16_flops)
+    bandwidth = _positive_rate("mem_bandwidth_bytes_s", mem_bandwidth_bytes_s)
+    launch_us = _nonnegative("params.t_launch_us", params.t_launch_us)
+    eta_mem = _positive_rate("params.eta_mem", params.eta_mem)
+    eta_compute = _positive_rate("params.eta_compute", params.eta_compute)
+
+    flops = 2.0 * m * n * k
+    scale_bytes = 4.0 * n
+    gemm_bytes = 2.0 * m * k + n * k + scale_bytes + 2.0 * m * n
+    memory_s = gemm_bytes / bandwidth / eta_mem
+    compute_s = flops / peak / eta_compute
+    body_s = memory_s + compute_s
+    return LatencyBreakdown(
+        model="w8a16_int8wo_bf16_transfer_sum_3p",
+        latency_us=launch_us + _us(body_s),
+        launch_us=launch_us,
+        body_us=_us(body_s),
+        transition_us=0.0,
+        quant_us=0.0,
+        gemm_memory_us=_us(memory_s),
+        compute_us=_us(compute_s),
+        roofline_branch="sum",
+        flops=flops,
+        gemm_bytes=gemm_bytes,
+        quant_bytes=scale_bytes,
+    )
+
+
 def estimate_deepgemm_fp8(
     m: int,
     n: int,
@@ -370,6 +443,10 @@ def bf16_gemm_latency_us(*args, **kwargs) -> float:
     return estimate_bf16_gemm(*args, **kwargs).latency_us
 
 
+def w8a16_gemm_latency_us(*args, **kwargs) -> float:
+    return estimate_w8a16_gemm(*args, **kwargs).latency_us
+
+
 def deepgemm_fp8_latency_us(*args, **kwargs) -> float:
     return estimate_deepgemm_fp8(*args, **kwargs).latency_us
 
@@ -395,17 +472,22 @@ __all__ = [
     "SGLANG_FP8_MAX_5P_LOW",
     "SGLANG_FP8_MAX_5P_PRECISE",
     "SGLANG_FP8_MAX_5P_STANDARD",
+    "W8A16_TRANSFER_LIMITATION",
+    "W8A16_TRANSFER_MODEL_VERSION",
     "Bf16Sum3PParameters",
     "DeepGemmMax8PParameters",
     "LatencyBreakdown",
     "SglangFp8Max5PParameters",
+    "W8A16TransferModelWarning",
     "bf16_gemm_latency_us",
     "deepgemm_fp8_latency_us",
     "estimate_bf16_gemm",
     "estimate_deepgemm_fp8",
     "estimate_sglang_fp8",
+    "estimate_w8a16_gemm",
     "get_bf16_parameters",
     "get_deepgemm_parameters",
     "get_sglang_fp8_parameters",
     "sglang_fp8_latency_us",
+    "w8a16_gemm_latency_us",
 ]

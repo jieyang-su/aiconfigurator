@@ -5,7 +5,7 @@ import warnings
 import pytest
 
 from aiconfigurator_core.sdk import common, config
-from aiconfigurator_core.sdk.kernelsim.analytical import dsa_sparse_attention_latency_ms
+from aiconfigurator_core.sdk.kernelsim.analytical import dsa_sparse_attention_latency_ms, index_mqa_latency_ms
 from aiconfigurator_core.sdk.kernelsim.dsa import DsaIndexModelWarning
 from aiconfigurator_core.sdk.models import get_model
 from aiconfigurator_core.sdk.operations import (
@@ -116,3 +116,26 @@ def test_sparse_attention_head_quantum_is_explicit_and_changes_only_kernel_work(
     hopper = dsa_sparse_attention_latency_ms(**kwargs, config=AnalyticalConfig(sparse_attention_head_quantum=64))
     blackwell = dsa_sparse_attention_latency_ms(**kwargs, config=AnalyticalConfig(sparse_attention_head_quantum=128))
     assert default < hopper < blackwell
+
+
+def test_index_mqa_uses_bf16_proxy_when_hardware_has_no_fp8_peak():
+    from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig
+
+    gpu = {
+        "sm_count": 132,
+        "clock_hz": 1.83e9,
+        "bfloat16_tc_flops": 0.989e15,
+        "mem_bw": 3.35e12,
+    }
+    with pytest.warns(DsaIndexModelWarning, match="uncalibrated proxy"):
+        latency = index_mqa_latency_ms(
+            gpu=gpu,
+            layout="paged",
+            batch=1,
+            query_length=1,
+            context_length=8192,
+            index_heads=64,
+            index_head_dim=128,
+            config=AnalyticalConfig(),
+        )
+    assert latency == pytest.approx(0.004198242, rel=1e-5)

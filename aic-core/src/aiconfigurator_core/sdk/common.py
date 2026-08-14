@@ -1142,6 +1142,7 @@ class MoEQuantMode(Enum):
     """
 
     bfloat16 = QuantMapping(2, 1, "bfloat16", "bfloat16")  # w16a16
+    int8_wo = QuantMapping(1, 1, "int8_wo", "bfloat16")  # w8a16
     fp8 = QuantMapping(1, 2, "fp8", "fp8")  # w8fp8
     int4_wo = QuantMapping(0.5, 1, "int4_wo", "bfloat16")  # w4a16
     fp8_block = QuantMapping(1, 2, "fp8_block", "fp8")  # specific for trtllm torch ds fp8

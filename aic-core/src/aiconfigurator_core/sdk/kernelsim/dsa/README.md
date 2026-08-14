@@ -25,6 +25,37 @@ Every estimate emits `DsaIndexModelWarning` and records the limitation in the
 result. This is intentional: the model is a semi-mature no-table fallback, not
 a claim of silicon-equivalent accuracy.
 
+### BF16 proxy boundary
+
+The production SGLang paths used for calibration call DeepGEMM
+`fp8_mqa_logits`/`fp8_paged_mqa_logits`; no equivalent BF16 kernel was measured.
+For estimate-only hardware profiles that omit `fp8_tc_flops`, AIC therefore
+uses an explicit low-confidence BF16 proxy rather than claiming a calibrated
+BF16 backend:
+
+```text
+resource_fp8  = max(flops / reference_fp8_peak, fp8_bytes / HBM)
+resource_bf16 = max(flops / bf16_peak,          bf16_bytes / HBM)
+R_resource    = max(1, resource_bf16 / resource_fp8)
+
+latency_bf16_proxy = floor_fp8 + task_fp8 * R_resource
+```
+
+Q and K use two bytes per element in the BF16 workload; the FP32 score buffer
+and per-query FP32 weights remain unchanged, and the FP8 K scale is removed.
+When a hardware profile has no FP8 peak, the counterfactual reference uses
+`2 * bfloat16_tc_flops`. This ratio affects only the variable task term: the
+H100 FP8 launch floor, service geometry, tile assumptions and chunk rules are
+retained. The result exposes the reference and target resource times plus
+`resource_scale`, emits `DsaIndexModelWarning`, and uses the scope
+`uncalibrated_bf16_resource_scaled_proxy`.
+
+This proxy is intended only for coarse no-GPU architecture comparison on
+BF16-only systems. It does not establish that current SGLang or DeepGEMM can
+execute the indexer in BF16, and must not be treated as silicon-equivalent.
+TopK remains a separate FP32-score operation and is not rescaled with Index MQA
+input precision.
+
 ## Index MQA v2
 
 The selected candidate is layout-specific task service rather than roofline:

@@ -226,6 +226,7 @@ class MiniMaxM3Model(BaseModel):
                     kvcache_quant_mode,
                     head_size=self._head_size,
                     use_qk_norm=True,
+                    fmha_quant_mode=fmha_quant_mode,
                 ),
                 ops.GEMM(
                     "generation_dense_proj_gemm", dense_layers * mtp, h, local_heads * self._head_size, gemm_quant_mode

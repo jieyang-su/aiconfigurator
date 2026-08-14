@@ -156,6 +156,7 @@ class LLAMAModel(BaseModel):
                     kvcache_quant_mode,
                     head_size=self._head_size,
                     use_qk_norm=self._use_qk_norm,
+                    fmha_quant_mode=fmha_quant_mode,
                 ),
                 ops.GEMM(
                     "generation_proj_gemm",

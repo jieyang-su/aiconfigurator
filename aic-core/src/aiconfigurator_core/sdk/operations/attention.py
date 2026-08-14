@@ -482,9 +482,12 @@ class ContextAttention(Operation):
                 return PerformanceResult(0.0, energy=0.0, source="analytical")
             full_s = s + prefix
             kv_length = max(s, min(full_s, window_size) if window_size > 0 else full_s)
-            dtype = "fp8" if (
-                kvcache_quant_mode == common.KVCacheQuantMode.fp8 or fmha_quant_mode == common.FMHAQuantMode.fp8
-            ) else "bf16"
+            # Compute precision and cache representation are independent in the
+            # analytical FA model.  FP8 KV does not imply FP8 FMHA: when the
+            # request is FP8-KV + BF16-FMHA, keep BF16 matrix math and pass the
+            # physically smaller KV stream separately.
+            dtype = "fp8" if fmha_quant_mode.value.compute_dtype == "fp8" else "bf16"
+            kv_cache_bytes_per_token = 2 * head_size * kvcache_quant_mode.value.memory
             return PerformanceResult(
                 attention_latency_ms(
                     system=database.system,
@@ -496,6 +499,7 @@ class ContextAttention(Operation):
                     kv_heads=n_kv,
                     head_dim=head_size,
                     dtype=dtype,
+                    kv_cache_bytes_per_token=kv_cache_bytes_per_token,
                     config=database._analytical_config,
                 ),
                 energy=0.0,
@@ -641,6 +645,7 @@ class GenerationAttention(Operation):
         window_size: int = 0,
         head_size: int = 128,
         use_qk_norm: bool = False,
+        fmha_quant_mode: common.FMHAQuantMode | None = None,
     ) -> None:
         """Initialize generation attention query parameters."""
         super().__init__(name, scale_factor)
@@ -648,6 +653,10 @@ class GenerationAttention(Operation):
         self._weights = 0.0
         self._n_kv = n_kv
         self._kv_cache_dtype = kv_cache_dtype
+        # Generation silicon tables are keyed only by KV dtype, so legacy
+        # callers can leave this unset. Analytical callers pass the configured
+        # FMHA mode explicitly to separate compute from cache representation.
+        self._fmha_quant_mode = fmha_quant_mode
         self._window_size = window_size
         self._head_size = head_size
         self._use_qk_norm = use_qk_norm
@@ -772,12 +781,18 @@ class GenerationAttention(Operation):
         database_mode: common.DatabaseMode | None = None,
         window_size: int = 0,
         head_size: int = 128,
+        fmha_quant_mode: common.FMHAQuantMode | None = None,
     ):
         """Query generation attention table. Verbatim port of legacy body."""
         # Strict eager resolution (parity with the Rust engine, which resolves
         # flops with `?` at query entry): reject a missing *_tc_flops entry up
         # front — a SILICON exact hit never invokes the get_sol closure.
-        generation_attn_flops(database.system_spec, kvcache_quant_mode)
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        if database_mode == common.DatabaseMode.ANALYTICAL and fmha_quant_mode is not None:
+            common.get_quant_tc_flops(database.system_spec, fmha_quant_mode)
+        else:
+            generation_attn_flops(database.system_spec, kvcache_quant_mode)
 
         def get_sol(
             b: int,
@@ -875,8 +890,6 @@ class GenerationAttention(Operation):
 
         assert n_kv <= n, "n_kv must be less than or equal to n"
 
-        if database_mode is None:
-            database_mode = database._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(b, s, n, n_kv, head_size, window_size, kvcache_quant_mode)[0]
             return PerformanceResult(sol_latency, energy=0.0, source="sol")
@@ -889,7 +902,9 @@ class GenerationAttention(Operation):
             from aiconfigurator_core.sdk.kernelsim.analytical import attention_latency_ms
 
             kv_length = max(1, min(s, window_size) if window_size > 0 else s)
-            dtype = "fp8" if kvcache_quant_mode == common.KVCacheQuantMode.fp8 else "bf16"
+            effective_fmha = fmha_quant_mode or generation_attn_mode(database.system_spec, kvcache_quant_mode)
+            dtype = "fp8" if effective_fmha.value.compute_dtype == "fp8" else "bf16"
+            kv_cache_bytes_per_token = 2 * head_size * kvcache_quant_mode.value.memory
             return PerformanceResult(
                 attention_latency_ms(
                     system=database.system,
@@ -901,6 +916,7 @@ class GenerationAttention(Operation):
                     kv_heads=n_kv,
                     head_dim=head_size,
                     dtype=dtype,
+                    kv_cache_bytes_per_token=kv_cache_bytes_per_token,
                     config=database._analytical_config,
                 ),
                 energy=0.0,
@@ -984,6 +1000,7 @@ class GenerationAttention(Operation):
             self._kv_cache_dtype,
             window_size=self._window_size,
             head_size=self._head_size,
+            fmha_quant_mode=self._fmha_quant_mode,
         )
         gen_seq_imbalance_correction_scale = float(
             kwargs.get(

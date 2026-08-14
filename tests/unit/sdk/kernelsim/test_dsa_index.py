@@ -5,6 +5,7 @@ import warnings
 from typing import ClassVar
 
 from aiconfigurator_core.sdk.kernelsim.dsa import (
+    BF16_PROXY_MESSAGE,
     LIMITED_SCOPE_MESSAGE,
     DsaIndexModelWarning,
     IndexMqaShape,
@@ -84,13 +85,46 @@ class DsaIndexKernelSimTests(unittest.TestCase):
     def test_mqa_validation_and_scope_warning(self) -> None:
         with self.assertRaisesRegex(ValueError, "next_n=1 or 2"):
             IndexMqaShape("paged", 1, 4, 4096, 64)
-        with self.assertRaisesRegex(ValueError, "only the calibrated FP8"):
-            IndexMqaShape("ragged", 1, 1, 4096, 64, dtype="bf16")
+        with self.assertRaisesRegex(ValueError, "calibrated FP8 kernel or the uncalibrated BF16 proxy"):
+            IndexMqaShape("ragged", 1, 1, 4096, 64, dtype="fp16")
         shape = IndexMqaShape("paged", 1, 1, 4096, 48)
         with self.assertWarns(DsaIndexModelWarning):
             result = estimate_index_mqa(shape, **self.hardware)
         self.assertIn(LIMITED_SCOPE_MESSAGE, result.warnings)
         self.assertTrue(any("32/64" in message for message in result.warnings))
+
+    def test_bf16_proxy_scales_only_task_service_term(self) -> None:
+        shape = IndexMqaShape("paged", 1, 1, 8192, 64, dtype="bf16")
+        with self.assertWarnsRegex(DsaIndexModelWarning, "uncalibrated proxy"):
+            result = estimate_index_mqa(
+                shape,
+                sm_count=132,
+                clock_hz=1.83e9,
+                fp8_peak_flops_s=None,
+                bf16_peak_flops_s=0.989e15,
+                hbm_bandwidth_bytes_s=3.35e12,
+            )
+        self.assertEqual(result.scope, "uncalibrated_bf16_resource_scaled_proxy")
+        self.assertEqual(result.roofline_branch, "task_service_bf16_proxy")
+        self.assertIn(BF16_PROXY_MESSAGE, result.warnings)
+        self.assertAlmostEqual(result.resource_scale, 1.912201, places=5)
+        self.assertAlmostEqual(
+            result.latency_us,
+            result.floor_us + result.baseline_control_us * result.resource_scale,
+        )
+        self.assertGreater(result.modeled_bytes, 0)
+        self.assertGreater(result.memory_us, result.reference_memory_us)
+
+    def test_bf16_proxy_requires_bf16_peak(self) -> None:
+        shape = IndexMqaShape("paged", 1, 1, 8192, 64, dtype="bf16")
+        with self.assertRaisesRegex(ValueError, "bf16_peak_flops_s"):
+            estimate_index_mqa(
+                shape,
+                sm_count=132,
+                clock_hz=1.83e9,
+                fp8_peak_flops_s=None,
+                hbm_bandwidth_bytes_s=3.35e12,
+            )
 
     def test_mqa_three_levels_are_monotonic(self) -> None:
         shapes = (

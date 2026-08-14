@@ -138,11 +138,12 @@ class HardwareSpec:
 class AttentionShape:
     """Logical attention shape.
 
-    ``kv_length_total`` includes history and current query tokens. Q/K/V use a
-    common effective dtype; mixed Q and KV-cache precision is intentionally not
-    inferred from a misleading external ``attn_dtype`` label. ``head_dim`` is
-    the QK reduction width. The optional value and storage widths support
-    asymmetric values and shared-latent KV layouts.
+    ``kv_length_total`` includes history and current query tokens. ``dtype`` is
+    the compute dtype used for Q/K/V matrix math and on-chip storage. The
+    optional ``kv_cache_bytes_per_token`` describes a different physical cache
+    representation without changing the compute dtype. ``head_dim`` is the QK
+    reduction width. The optional value and storage widths support asymmetric
+    values and shared-latent KV layouts.
     """
 
     batch_size: int
@@ -158,6 +159,7 @@ class AttentionShape:
     label: str = ""
     value_head_dim: int | None = None
     kv_storage_dim: int | None = None
+    kv_cache_bytes_per_token: float | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -188,6 +190,12 @@ class AttentionShape:
         storage_dim = self.head_dim + value_dim if self.kv_storage_dim is None else self.kv_storage_dim
         _positive_integer("kv_storage_dim", storage_dim)
         object.__setattr__(self, "kv_storage_dim", storage_dim)
+        if self.kv_cache_bytes_per_token is not None:
+            object.__setattr__(
+                self,
+                "kv_cache_bytes_per_token",
+                _positive_number("kv_cache_bytes_per_token", self.kv_cache_bytes_per_token),
+            )
 
     @property
     def history_length(self) -> int:

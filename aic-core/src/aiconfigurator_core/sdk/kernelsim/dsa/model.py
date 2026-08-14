@@ -16,7 +16,7 @@ import math
 import warnings as python_warnings
 from dataclasses import dataclass
 
-DSA_INDEX_MODEL_VERSION = "2026-08-11.aic-dsa-index-v3"
+DSA_INDEX_MODEL_VERSION = "2026-08-13.aic-dsa-index-v4"
 CALIBRATED_TOPK = 2048
 CALIBRATED_HEADS = (32, 64)
 CALIBRATED_HEAD_DIM = 128
@@ -34,6 +34,13 @@ LIMITED_SCOPE_MESSAGE = (
     "TopK natural covers the FP32-score fused transform through 524K context "
     "and 8192 query rows; flat/top-last remain v2 diagnostics. It is not validated "
     "across GPUs, backends, dtypes, layouts, or sparse-attention variants."
+)
+
+BF16_PROXY_MESSAGE = (
+    "BF16 DSA Index MQA is an uncalibrated proxy, not a measured SGLang/DeepGEMM "
+    "kernel. It preserves the H100 FP8 launch/task-service fit and scales only "
+    "the task term by the BF16-to-FP8 theoretical resource ratio. Backend, "
+    "scheduler, tile, and cross-GPU transfer effects are not modeled."
 )
 
 
@@ -95,9 +102,13 @@ class IndexMqaShape:
         if self.query_length > self.context_length:
             raise ValueError("query_length must not exceed context_length")
         dtype = self.dtype.strip().lower()
-        if dtype not in {"fp8", "float8", "float8_e4m3fn"}:
-            raise ValueError("Index MQA currently supports only the calibrated FP8 kernel")
-        object.__setattr__(self, "dtype", "fp8")
+        if dtype in {"fp8", "float8", "float8_e4m3fn"}:
+            dtype = "fp8"
+        elif dtype in {"bf16", "bfloat16"}:
+            dtype = "bf16"
+        else:
+            raise ValueError("Index MQA supports the calibrated FP8 kernel or the uncalibrated BF16 proxy")
+        object.__setattr__(self, "dtype", dtype)
         if self.layout == "paged" and self.query_length not in {1, 2}:
             raise ValueError("the calibrated SGLang 0.5.12 paged MQA kernel supports next_n=1 or 2")
 
@@ -232,6 +243,10 @@ class IndexMqaEstimate:
     eta_compute: float | None = None
     eta_memory: float | None = None
     service_atoms: float = 0.0
+    reference_compute_us: float = 0.0
+    reference_memory_us: float = 0.0
+    baseline_control_us: float = 0.0
+    resource_scale: float = 1.0
 
 
 def estimate_index_mqa(
@@ -239,15 +254,17 @@ def estimate_index_mqa(
     *,
     sm_count: int,
     clock_hz: float,
-    fp8_peak_flops_s: float,
+    fp8_peak_flops_s: float | None,
     hbm_bandwidth_bytes_s: float,
+    bf16_peak_flops_s: float | None = None,
     parameter_level: str = "standard",
     params: IndexMqaParameters | None = None,
 ) -> IndexMqaEstimate:
-    """Estimate the FP8 DeepGEMM-style index-score kernel.
+    """Estimate the FP8 index-score kernel or an explicit BF16 proxy.
 
-    The selected latency path is task-service, not roofline.  The supplied
-    peak/bandwidth values only produce inspectable lower-bound diagnostics.
+    The calibrated FP8 path remains task-service rather than roofline. The
+    BF16 proxy preserves its launch floor and scales only its task term by the
+    ratio between BF16 and FP8 theoretical resource lower bounds.
     """
     if not isinstance(shape, IndexMqaShape):
         raise TypeError("shape must be an IndexMqaShape")
@@ -259,7 +276,6 @@ def estimate_index_mqa(
         level = "custom"
     sm_count = _positive_int("sm_count", sm_count)
     clock = _positive_rate("clock_hz", clock_hz)
-    peak = _positive_rate("fp8_peak_flops_s", fp8_peak_flops_s)
     bandwidth = _positive_rate("hbm_bandwidth_bytes_s", hbm_bandwidth_bytes_s)
     warning_messages = _scope_warnings(
         heads=shape.index_heads,
@@ -268,6 +284,23 @@ def estimate_index_mqa(
         chunk_slots=shape.score_chunk_slots,
     )
     python_warnings.warn(LIMITED_SCOPE_MESSAGE, DsaIndexModelWarning, stacklevel=2)
+    if shape.dtype == "fp8":
+        peak = _positive_rate("fp8_peak_flops_s", fp8_peak_flops_s)
+        bf16_peak = None
+    else:
+        if bf16_peak_flops_s is None:
+            raise ValueError("bf16_peak_flops_s is required for the BF16 Index MQA proxy")
+        bf16_peak = _positive_rate("bf16_peak_flops_s", bf16_peak_flops_s)
+        if fp8_peak_flops_s is None:
+            peak = 2.0 * bf16_peak
+            warning_messages.append(
+                "hardware has no FP8 peak; the BF16 proxy assumes a counterfactual "
+                "FP8 reference peak equal to 2x BF16 peak"
+            )
+        else:
+            peak = _positive_rate("fp8_peak_flops_s", fp8_peak_flops_s)
+        warning_messages.append(BF16_PROXY_MESSAGE)
+        python_warnings.warn(BF16_PROXY_MESSAGE, DsaIndexModelWarning, stacklevel=2)
 
     paged = shape.layout == "paged"
     if paged:
@@ -292,30 +325,59 @@ def estimate_index_mqa(
     # excluded from the selected prediction because the candidate comparison
     # showed roofline terms had weak identification for this kernel.
     flops = float(valid_pairs * 2 * shape.index_heads * shape.head_dim)
-    modeled_bytes = float(
+    fp8_modeled_bytes = float(
         shape.batch_size * shape.query_length * shape.index_heads * shape.head_dim
         + shape.batch_size * shape.query_length * shape.index_heads * 4
         + shape.batch_size * shape.context_length * (shape.head_dim + 4)
         + (score_slots * 4)
     )
-    compute_us = flops / peak * 1e6
-    memory_us = modeled_bytes / bandwidth * 1e6
-    task_us = service_atoms * cycles / clock * 1e6
+    bf16_modeled_bytes = float(
+        shape.batch_size * shape.query_length * shape.index_heads * shape.head_dim * 2
+        + shape.batch_size * shape.query_length * shape.index_heads * 4
+        + shape.batch_size * shape.context_length * shape.head_dim * 2
+        + (score_slots * 4)
+    )
+    reference_compute_us = flops / peak * 1e6
+    reference_memory_us = fp8_modeled_bytes / bandwidth * 1e6
+    if shape.dtype == "bf16":
+        assert bf16_peak is not None
+        compute_us = flops / bf16_peak * 1e6
+        memory_us = bf16_modeled_bytes / bandwidth * 1e6
+        reference_resource_us = max(reference_compute_us, reference_memory_us)
+        resource_scale = max(1.0, max(compute_us, memory_us) / reference_resource_us)
+        modeled_bytes = bf16_modeled_bytes
+    else:
+        compute_us = reference_compute_us
+        memory_us = reference_memory_us
+        resource_scale = 1.0
+        modeled_bytes = fp8_modeled_bytes
+    baseline_task_us = service_atoms * cycles / clock * 1e6
     floor_us = floor * (chunks if not paged else 1) * params.latency_scale
-    task_us *= params.latency_scale
-    warning_messages.append("FLOPs/bytes are diagnostic lower bounds; task-service terms determine latency")
+    baseline_task_us *= params.latency_scale
+    task_us = baseline_task_us * resource_scale
+    if shape.dtype == "bf16":
+        warning_messages.append(
+            "FLOPs/bytes determine only the BF16-to-FP8 task scaling ratio; "
+            "the launch floor and task-service geometry remain the FP8 calibration"
+        )
+    else:
+        warning_messages.append("FLOPs/bytes are diagnostic lower bounds; task-service terms determine latency")
     return IndexMqaEstimate(
         latency_us=floor_us + task_us,
         parameter_level=level,
         layout=shape.layout,
-        scope="single_h100_sglang_0.5.12_graph_replay_v2",
+        scope=(
+            "uncalibrated_bf16_resource_scaled_proxy"
+            if shape.dtype == "bf16"
+            else "single_h100_sglang_0.5.12_graph_replay_v2"
+        ),
         warnings=tuple(warning_messages),
         floor_us=floor_us,
         compute_us=compute_us,
         memory_us=memory_us,
         resource_us=0.0,
         control_us=task_us,
-        roofline_branch="task_service_layout",
+        roofline_branch=("task_service_bf16_proxy" if shape.dtype == "bf16" else "task_service_layout"),
         valid_pairs=valid_pairs,
         score_slots=score_slots,
         chunk_rows=chunk_rows,
@@ -324,6 +386,10 @@ def estimate_index_mqa(
         flops=flops,
         modeled_bytes=modeled_bytes,
         service_atoms=service_atoms,
+        reference_compute_us=reference_compute_us,
+        reference_memory_us=reference_memory_us,
+        baseline_control_us=baseline_task_us,
+        resource_scale=resource_scale,
     )
 
 
@@ -636,6 +702,7 @@ def estimate_index_topk(
 
 
 __all__ = [
+    "BF16_PROXY_MESSAGE",
     "CALIBRATED_TOPK",
     "DSA_INDEX_MODEL_VERSION",
     "LIMITED_SCOPE_MESSAGE",

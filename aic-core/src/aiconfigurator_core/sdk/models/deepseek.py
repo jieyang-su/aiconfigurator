@@ -481,6 +481,7 @@ class DeepSeekModel(BaseModel):
                         self._num_kv_heads // tp_size,
                         kvcache_quant_mode,
                         head_size=self._vllm_head_size,
+                        fmha_quant_mode=fmha_quant_mode,
                     )
                 ]
                 if self._backend_name == "vllm"

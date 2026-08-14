@@ -3,8 +3,10 @@ import logging
 import pytest
 
 from aiconfigurator_core.sdk import common
+from aiconfigurator_core.sdk import config as sdk_config
 from aiconfigurator_core.sdk.config import RuntimeConfig
 from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig
+from aiconfigurator_core.sdk.models import get_model
 from aiconfigurator_core.sdk.perf_database import get_database_view
 from aiconfigurator_core.sdk.rust_engine_step import should_use_rust_engine_step
 
@@ -73,8 +75,103 @@ def test_gemm_attention_and_mla_boundaries(analytical_db):
     assert gemm.source == attention.source == "analytical"
     assert float(gemm) > 0 and float(attention) > 0
 
-    with pytest.raises(ValueError, match="MLA supports BF16 only"):
-        analytical_db.query_generation_mla(8, 4096, 16, common.KVCacheQuantMode.fp8)
+    bf16_kv = analytical_db.query_generation_mla(8, 4096, 16, common.KVCacheQuantMode.bfloat16)
+    fp8_kv = analytical_db.query_generation_mla(8, 4096, 16, common.KVCacheQuantMode.fp8)
+    assert fp8_kv.source == "analytical"
+    assert float(fp8_kv) == pytest.approx(float(bf16_kv))
+
+    with pytest.raises(ValueError, match="BF16 compute only"):
+        analytical_db.query_context_mla(
+            1,
+            1024,
+            0,
+            16,
+            common.KVCacheQuantMode.fp8,
+            common.FMHAQuantMode.fp8,
+        )
+
+
+def test_attention_separates_compute_dtype_from_kv_storage(analytical_db):
+    kwargs = dict(b=8, s=8192, n=32, n_kv=8)
+    bf16_kv_bf16_math = analytical_db.query_generation_attention(
+        **kwargs,
+        kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+    )
+    fp8_kv_bf16_math = analytical_db.query_generation_attention(
+        **kwargs,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+    )
+    fp8_kv_fp8_math = analytical_db.query_generation_attention(
+        **kwargs,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
+        fmha_quant_mode=common.FMHAQuantMode.fp8,
+    )
+
+    assert float(fp8_kv_bf16_math) < float(bf16_kv_bf16_math)
+    assert float(fp8_kv_bf16_math) != pytest.approx(float(fp8_kv_fp8_math), rel=1e-4)
+
+
+def test_fp8_kv_bf16_attention_and_mla_need_no_fp8_peak():
+    database = get_database_view(
+        "_dom_br100_64",
+        "sglang",
+        "estimate",
+        allow_missing_data=True,
+        database_mode="ANALYTICAL",
+    )
+    assert database is not None
+
+    context = database.query_context_attention(
+        1,
+        1024,
+        0,
+        32,
+        8,
+        common.KVCacheQuantMode.fp8,
+        common.FMHAQuantMode.bfloat16,
+    )
+    generation = database.query_generation_attention(
+        8,
+        8192,
+        32,
+        8,
+        common.KVCacheQuantMode.fp8,
+        fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+    )
+    mla = database.query_generation_mla(8, 8192, 16, common.KVCacheQuantMode.fp8)
+    bf16_bmm = database.query_mla_bmm(8, 16, common.GEMMQuantMode.bfloat16)
+    fp8_kv_bmm = database.query_mla_bmm(8, 16, common.GEMMQuantMode.fp8)
+
+    assert context.source == generation.source == mla.source == bf16_bmm.source == fp8_kv_bmm.source == "analytical"
+    assert all(float(result) > 0 for result in (context, generation, mla, bf16_bmm, fp8_kv_bmm))
+    assert float(fp8_kv_bmm) == pytest.approx(float(bf16_bmm))
+
+
+def test_mla_fp8_proxy_preserves_fp8_kv_memory_sizing():
+    def build(kv_mode):
+        return get_model(
+            "moonshotai/Kimi-K3",
+            sdk_config.ModelConfig(
+                tp_size=16,
+                moe_tp_size=1,
+                moe_ep_size=16,
+                gemm_quant_mode=common.GEMMQuantMode.fp8,
+                moe_quant_mode=common.MoEQuantMode.w4a16_mxfp4,
+                kvcache_quant_mode=kv_mode,
+                fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+            ),
+            backend_name="sglang",
+        )
+
+    bf16 = build(common.KVCacheQuantMode.bfloat16)
+    fp8 = build(common.KVCacheQuantMode.fp8)
+    seq_len = 4096
+    bf16_per_token = bf16.get_kvcache_bytes_per_sequence(seq_len + 1) - bf16.get_kvcache_bytes_per_sequence(seq_len)
+    fp8_per_token = fp8.get_kvcache_bytes_per_sequence(seq_len + 1) - fp8.get_kvcache_bytes_per_sequence(seq_len)
+
+    assert fp8_per_token == pytest.approx(bf16_per_token / 2)
 
 
 def test_rust_request_falls_back_to_python(analytical_db):

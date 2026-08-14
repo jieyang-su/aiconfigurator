@@ -424,6 +424,7 @@ class KimiK3Model(BaseModel):
                                 self._num_kv_heads // tp,
                                 kvcache_q,
                                 head_size=cfg.v_head_dim,
+                                fmha_quant_mode=self.config.fmha_quant_mode,
                             )
                         ]
                         if self._backend_name == "vllm"
@@ -511,6 +512,7 @@ class KimiK3Model(BaseModel):
                         n_q // tp,
                         kvcache_q,
                         head_size=v_dim,
+                        fmha_quant_mode=self.config.fmha_quant_mode,
                     ),
                     ops.GEMM("draft_proj_gemm", dc * dsf, h, n_q * v_dim // tp, gemm_q, low_precision_input=True),
                 ]
@@ -531,6 +533,7 @@ class KimiK3Model(BaseModel):
                         max(1, n_kv // tp),
                         kvcache_q,
                         head_size=hd,
+                        fmha_quant_mode=self.config.fmha_quant_mode,
                     ),
                     ops.GEMM("draft_proj_gemm", dc * dsf, h, n_q * hd // tp, gemm_q, low_precision_input=True),
                 ]

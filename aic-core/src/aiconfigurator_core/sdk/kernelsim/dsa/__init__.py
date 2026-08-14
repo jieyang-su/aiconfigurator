@@ -1,6 +1,7 @@
 """Provisional analytical models for sparse-attention index kernels."""
 
 from .model import (
+    BF16_PROXY_MESSAGE,
     CALIBRATED_TOPK,
     DSA_INDEX_MODEL_VERSION,
     LIMITED_SCOPE_MESSAGE,
@@ -18,6 +19,7 @@ from .model import (
 )
 
 __all__ = [
+    "BF16_PROXY_MESSAGE",
     "CALIBRATED_TOPK",
     "DSA_INDEX_MODEL_VERSION",
     "LIMITED_SCOPE_MESSAGE",

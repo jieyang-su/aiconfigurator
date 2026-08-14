@@ -271,6 +271,7 @@ impl GemmQuantMode {
 #[serde(rename_all = "snake_case")]
 pub enum MoeQuantMode {
     Bfloat16,
+    Int8Wo,
     Fp8,
     Int4Wo,
     Fp8Block,
@@ -296,6 +297,12 @@ impl MoeQuantMode {
                 memory: 2.0,
                 compute: 1.0,
                 name: "bfloat16",
+                compute_dtype: Some(ComputeDtype::Bfloat16),
+            },
+            Self::Int8Wo => QuantMapping {
+                memory: 1.0,
+                compute: 1.0,
+                name: "int8_wo",
                 compute_dtype: Some(ComputeDtype::Bfloat16),
             },
             Self::Fp8 => QuantMapping {
@@ -671,6 +678,15 @@ mod tests {
 
     #[test]
     fn moe_quant_payloads_match_python_quant_mapping() {
+        assert_eq!(
+            MoeQuantMode::Int8Wo.mapping(),
+            QuantMapping {
+                memory: 1.0,
+                compute: 1.0,
+                name: "int8_wo",
+                compute_dtype: Some(ComputeDtype::Bfloat16)
+            }
+        );
         assert_eq!(
             MoeQuantMode::W4afp8.mapping(),
             QuantMapping {

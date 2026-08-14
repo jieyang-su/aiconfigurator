@@ -9,7 +9,7 @@ from typing import Any
 from .profiles import PROFILE_VERSION, ReferenceProfile, get_reference_profile
 from .schema import AttentionShape, HardwareSpec, ModelOptions, dtype_bytes
 
-MODEL_VERSION = "2026-07-28.aic-fa-roofline-v3"
+MODEL_VERSION = "2026-08-13.aic-fa-roofline-v4"
 
 
 @dataclass(frozen=True)
@@ -143,6 +143,11 @@ def estimate_attention(
     matrix_peak = hardware.matrix_peak(shape.dtype)
     input_bytes = dtype_bytes(shape.dtype)
     output_bytes = dtype_bytes(shape.output_dtype)
+    kv_cache_bytes_per_token = (
+        shape.kv_storage_dim * input_bytes
+        if shape.kv_cache_bytes_per_token is None
+        else shape.kv_cache_bytes_per_token
+    )
     br, bc, block_metadata = _block_sizes(hardware, shape, options)
     tile_work = _tile_work(shape, br, bc)
     query_tiles = ceil(shape.query_length / br)
@@ -189,26 +194,35 @@ def estimate_attention(
     kv_hbm_heads = shape.kv_heads if options.assume_gqa_hbm_reuse else shape.query_heads
     kv_loaded = tile_work["kv_tokens_loaded_per_query_head"]
     kv_hbm_loaded = shape.kv_length_total if options.assume_query_tile_l2_reuse else kv_loaded
-    kv_l2_elements = shape.batch_size * kv_l2_heads * kv_loaded * shape.kv_storage_dim
-    kv_hbm_elements = shape.batch_size * kv_hbm_heads * kv_hbm_loaded * shape.kv_storage_dim
+    kv_l2_tokens = shape.batch_size * kv_l2_heads * kv_loaded
+    kv_hbm_tokens = shape.batch_size * kv_hbm_heads * kv_hbm_loaded
     lse_bytes = query_rows * 4 if options.store_lse else 0
     q_bytes = kv_splits * query_elements * input_bytes
-    kv_hbm_bytes = kv_hbm_elements * input_bytes
+    kv_hbm_bytes = kv_hbm_tokens * kv_cache_bytes_per_token
     output_hbm_bytes = output_elements * output_bytes
     partial_bytes = kv_splits * query_rows * (shape.value_head_dim + 1) * 4 if kv_splits > 1 else 0
     if kv_splits > 1:
         mainloop_hbm_bytes = q_bytes + kv_hbm_bytes + partial_bytes
         reduction_hbm_bytes = partial_bytes + output_hbm_bytes + lse_bytes
-        mainloop_l2_bytes = kv_splits * query_elements * input_bytes + kv_l2_elements * input_bytes + partial_bytes
+        mainloop_l2_bytes = (
+            kv_splits * query_elements * input_bytes
+            + kv_l2_tokens * kv_cache_bytes_per_token
+            + partial_bytes
+        )
         reduction_l2_bytes = partial_bytes + output_hbm_bytes + lse_bytes
     else:
         mainloop_hbm_bytes = q_bytes + kv_hbm_bytes + output_hbm_bytes + lse_bytes
         reduction_hbm_bytes = 0
-        mainloop_l2_bytes = query_elements * input_bytes + kv_l2_elements * input_bytes + output_hbm_bytes + lse_bytes
+        mainloop_l2_bytes = (
+            query_elements * input_bytes
+            + kv_l2_tokens * kv_cache_bytes_per_token
+            + output_hbm_bytes
+            + lse_bytes
+        )
         reduction_l2_bytes = 0
 
-    live_kv_elements = shape.batch_size * shape.kv_heads * shape.query_length * shape.kv_storage_dim
-    live_kv_cache_update_bytes = 2 * live_kv_elements * input_bytes if options.include_kv_cache_update else 0
+    live_kv_tokens = shape.batch_size * shape.kv_heads * shape.query_length
+    live_kv_cache_update_bytes = 2 * live_kv_tokens * kv_cache_bytes_per_token if options.include_kv_cache_update else 0
     hbm_bytes = mainloop_hbm_bytes + reduction_hbm_bytes
     l2_bytes = mainloop_l2_bytes + reduction_l2_bytes
 
@@ -283,6 +297,7 @@ def estimate_attention(
         "mainloop_hbm_bytes": mainloop_hbm_bytes,
         "reduction_hbm_bytes": reduction_hbm_bytes,
         "live_kv_cache_update_bytes": live_kv_cache_update_bytes,
+        "kv_cache_bytes_per_token": kv_cache_bytes_per_token,
         "total_hbm_bytes": total_counted_hbm_bytes,
         "mainloop_l2_requested_bytes": mainloop_l2_bytes,
         "reduction_l2_requested_bytes": reduction_l2_bytes,
@@ -344,6 +359,8 @@ def estimate_attention(
     }
     assumptions = (
         "Q-outer/KV-inner tiled online-softmax dataflow.",
+        "A separate KV-cache byte width changes HBM/L2 traffic only; conversion into the compute dtype is assumed "
+        "fused and has no explicit penalty.",
         "One base logical CTA per batch, query head and query tile; occupancy is linearized by CTA/SM count.",
         "GQA HBM/L2 reuse follows the selected ideal reuse switches, not a cache simulation.",
         "L2 capacity is reported but no residency, associativity or hit-rate model is applied.",

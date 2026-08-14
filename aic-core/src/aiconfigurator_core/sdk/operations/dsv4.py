@@ -1602,11 +1602,13 @@ class DeepSeekV4SparseAttention(Operation):
                 pairs += batch * compressed
 
         effective_kv = max(1, math.ceil(pairs / (batch * query)))
-        effective_fp8 = (
-            self._kvcache_quant_mode == common.KVCacheQuantMode.fp8 or self._fmha_quant_mode == common.FMHAQuantMode.fp8
-        )
         from aiconfigurator_core.sdk.kernelsim.analytical import attention_latency_ms
 
+        # SGLang's DSV4 sparse FlashMLA contract is BF16 Q and BF16 WGMMA with
+        # an FP8 KV cache. Hopper and Blackwell kernels dequantize the no-PE
+        # cache values into BF16 shared memory before QK/PV; the cache itself
+        # stores 448 FP8 no-PE bytes, 64 BF16 RoPE values, and 8 scale/padding
+        # bytes per token.
         latency = attention_latency_ms(
             system=database.system,
             gpu=database.system_spec["gpu"],
@@ -1616,7 +1618,13 @@ class DeepSeekV4SparseAttention(Operation):
             query_heads=database._analytical_config.sparse_attention_executed_heads(self._local_heads),
             kv_heads=1,
             head_dim=self._head_dim,
-            dtype="fp8" if effective_fp8 else "bf16",
+            dtype="bf16",
+            value_head_dim=self._head_dim,
+            kv_storage_dim=self._head_dim,
+            kv_cache_bytes_per_token=584,
+            # Cache packing/writes are fused into the preceding DSV4 KV
+            # norm/RoPE path and sit outside this attention-core boundary.
+            include_kv_cache_update=False,
             config=database._analytical_config,
             # Pair-count reduction above already includes causal/window/sparse
             # masking; use an equivalent rectangular workload here.

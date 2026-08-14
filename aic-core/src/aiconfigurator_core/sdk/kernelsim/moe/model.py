@@ -9,9 +9,41 @@ selected recipe, never a value inferred from the BF16 peak.
 from __future__ import annotations
 
 import math
+import warnings as python_warnings
 from dataclasses import dataclass
 
 EMPIRICAL_MODEL_VERSION = "2026-07-30.aic-sglang-moe-full-traffic-sum3-v2"
+W4A16_TRANSFER_MODEL_VERSION = "2026-08-12.w4a16-mxfp4-bf16-transfer-v1"
+W8A16_TRANSFER_MODEL_VERSION = "2026-08-13.w8a16-int8wo-bf16-transfer-v1"
+W4A16_TRANSFER_LIMITATION = (
+    "W4A16 MXFP4 MoE uses a provisional BF16-Triton parameter transfer with only "
+    "the logical weight and scale traffic adjusted. It is not a W4A16 kernel fit: "
+    "unpack/dequantization, backend launch and tiling, small-token behavior, and "
+    "EP>1 execution are uncalibrated; the Cutlass quant label is also only a "
+    "temporary proxy through this SGLang model. Treat the estimate as low confidence."
+)
+W8A16_TRANSFER_LIMITATION = (
+    "W8A16 INT8-WO MoE uses an uncalibrated BF16-Triton parameter transfer with "
+    "only INT8 expert-weight and FP32 per-output-channel scale traffic adjusted. "
+    "Fused dequantization, backend packing/tiling, small-token behavior, non-NVIDIA "
+    "hardware, and EP>1 execution are uncalibrated. SGLang exposes the underlying "
+    "use_int8_w8a16 helper, but the current top-level collector does not persist an "
+    "int8_wo case. Treat the estimate as low confidence. This is an ANALYTICAL "
+    "transfer proxy, not a Silicon calibration row, and must not be reported as "
+    "measured W8A16 performance."
+)
+
+
+class W4A16TransferModelWarning(UserWarning):
+    """Warning for the deliberately limited W4A16 transfer recipe."""
+
+
+class W8A16TransferModelWarning(UserWarning):
+    """Warning for the deliberately limited W8A16 transfer recipe."""
+
+
+_w4a16_warning_emitted = False
+_w8a16_warning_emitted = False
 
 
 @dataclass(frozen=True)
@@ -65,14 +97,27 @@ _RECIPE_METADATA = {
         "required_peak_field": "bfloat16_tc_flops",
         "collector_boundary": "routing_and_triton_fused_moe",
     },
+    "w8a16_int8wo_bf16_transfer": {
+        "required_peak_field": "bfloat16_tc_flops",
+        "collector_boundary": "routing_and_sglang_moe_w8a16_transfer_proxy",
+    },
     "fp8_block_triton": {
         "required_peak_field": "fp8_tc_flops",
         "collector_boundary": "routing_and_triton_fused_moe_with_block_quant",
+    },
+    "w4a16_mxfp4_bf16_transfer": {
+        "required_peak_field": "bfloat16_tc_flops",
+        "collector_boundary": "routing_and_sglang_moe_w4a16_transfer_proxy",
     },
     "nvfp4_cutedsl": {
         "required_peak_field": "fp4_tc_flops",
         "collector_boundary": "predispatched_cutedsl_quant_gemm_act_quant_gemm",
     },
+}
+
+_RECIPE_PARAMETER_SOURCE = {
+    "w8a16_int8wo_bf16_transfer": "bf16_triton",
+    "w4a16_mxfp4_bf16_transfer": "bf16_triton",
 }
 
 
@@ -132,6 +177,27 @@ def _nvfp4_scale_bytes(rows: float, cols: float) -> float:
     return float(rounded_rows * rounded_scale_cols)
 
 
+def _mxfp4_scale_bytes(rows: float, cols: float) -> float:
+    """Logical one-byte E8M0 scale traffic for each 32-value MXFP4 block."""
+    return float(rows * _ceil_div(cols, 32))
+
+
+def _warn_w4a16_transfer_once() -> None:
+    global _w4a16_warning_emitted
+    if _w4a16_warning_emitted:
+        return
+    _w4a16_warning_emitted = True
+    python_warnings.warn(W4A16_TRANSFER_LIMITATION, W4A16TransferModelWarning, stacklevel=3)
+
+
+def _warn_w8a16_transfer_once() -> None:
+    global _w8a16_warning_emitted
+    if _w8a16_warning_emitted:
+        return
+    _w8a16_warning_emitted = True
+    python_warnings.warn(W8A16_TRANSFER_LIMITATION, W8A16TransferModelWarning, stacklevel=3)
+
+
 def required_peak_field(recipe: str) -> str:
     if recipe not in _RECIPE_METADATA:
         raise KeyError(f"unknown recipe {recipe!r}; choose from {sorted(_RECIPE_METADATA)}")
@@ -158,7 +224,8 @@ def _resolve_parameters(
         normalized = "custom"
     else:
         selected = get_moe_parameters(normalized)
-    return normalized, getattr(selected, recipe)
+    parameter_source = _RECIPE_PARAMETER_SOURCE.get(recipe, recipe)
+    return normalized, getattr(selected, parameter_source)
 
 
 def work_terms(
@@ -210,7 +277,12 @@ def work_terms(
         "flops_gemm2": 2.0 * assignments * h * j,
     }
 
-    if recipe in {"bf16_triton", "fp8_block_triton"}:
+    if recipe in {
+        "bf16_triton",
+        "fp8_block_triton",
+        "w8a16_int8wo_bf16_transfer",
+        "w4a16_mxfp4_bf16_transfer",
+    }:
         terms["bytes_routing_logits"] = 6.0 * t * experts
         terms["bytes_routing_topk"] = 32.0 * assignments
         terms["bytes_combine"] = 0.0 if routed == 1 else 2.0 * assignments * h + 2.0 * t * h
@@ -227,6 +299,45 @@ def work_terms(
                 "bytes_gemm2_input": 2.0 * assignments * j,
                 "bytes_gemm2_weight_values": 2.0 * active * h * j,
                 "bytes_gemm2_weight_scale": 0.0,
+                "bytes_gemm2_output": 2.0 * assignments * h,
+                "bytes_control": 0.0,
+            }
+        )
+    elif recipe == "w8a16_int8wo_bf16_transfer":
+        # Match SGLang's use_int8_w8a16 helper: BF16 activations and outputs,
+        # INT8 fused gate/up and down weights, and FP32 output-channel scales.
+        # The collector allocates w1_scale as [E, 2 * fused_inter] and w2_scale
+        # as [hidden, E]; only active rank-local experts are charged here.
+        terms.update(
+            {
+                "bytes_input_quant": 0.0,
+                "bytes_gemm1_input": 2.0 * assignments * h,
+                "bytes_gemm1_weight_values": 2.0 * active * h * j,
+                "bytes_gemm1_weight_scale": 16.0 * active * j,
+                "bytes_gemm1_output": 4.0 * assignments * j,
+                "bytes_activation_quant": 6.0 * assignments * j,
+                "bytes_gemm2_input": 2.0 * assignments * j,
+                "bytes_gemm2_weight_values": active * h * j,
+                "bytes_gemm2_weight_scale": 4.0 * active * h,
+                "bytes_gemm2_output": 2.0 * assignments * h,
+                "bytes_control": 0.0,
+            }
+        )
+    elif recipe == "w4a16_mxfp4_bf16_transfer":
+        # Scheme 1 deliberately preserves the BF16 Triton execution model and
+        # all BF16 activation/intermediate traffic. Only packed weight values
+        # and their logical per-32-value MXFP4 scales differ from BF16.
+        terms.update(
+            {
+                "bytes_input_quant": 0.0,
+                "bytes_gemm1_input": 2.0 * assignments * h,
+                "bytes_gemm1_weight_values": active * h * j,
+                "bytes_gemm1_weight_scale": active * _mxfp4_scale_bytes(2.0 * j, h),
+                "bytes_gemm1_output": 4.0 * assignments * j,
+                "bytes_activation_quant": 6.0 * assignments * j,
+                "bytes_gemm2_input": 2.0 * assignments * j,
+                "bytes_gemm2_weight_values": 0.5 * active * h * j,
+                "bytes_gemm2_weight_scale": active * _mxfp4_scale_bytes(h, j),
                 "bytes_gemm2_output": 2.0 * assignments * h,
                 "bytes_control": 0.0,
             }
@@ -296,6 +407,10 @@ def estimate_sglang_moe(
         raise KeyError(f"unknown recipe {recipe!r}; choose from {sorted(_RECIPE_METADATA)}")
     peak = _positive_rate("peak_flops_s", peak_flops_s)
     bandwidth = _positive_rate("mem_bandwidth_bytes_s", mem_bandwidth_bytes_s)
+    if recipe == "w4a16_mxfp4_bf16_transfer":
+        _warn_w4a16_transfer_once()
+    elif recipe == "w8a16_int8wo_bf16_transfer":
+        _warn_w8a16_transfer_once()
     level, selected = _resolve_parameters(recipe, parameter_level, params)
     terms = work_terms(
         recipe,
@@ -326,12 +441,29 @@ def estimate_sglang_moe(
     )
     weight_value_bytes = float(terms["bytes_gemm1_weight_values"]) + float(terms["bytes_gemm2_weight_values"])
     weight_scale_bytes = float(terms["bytes_gemm1_weight_scale"]) + float(terms["bytes_gemm2_weight_scale"])
+    if recipe == "w4a16_mxfp4_bf16_transfer":
+        # Preserve the established W4A16 scope label for downstream reports.
+        scope = "provisional BF16 parameter transfer; EP=1 assumption"
+        if moe_ep_size != 1:
+            scope += "; ideal uniform EP extrapolation, uncalibrated"
+    elif recipe == "w8a16_int8wo_bf16_transfer":
+        scope = "provisional w8a16_int8wo BF16 parameter transfer; EP=1 assumption"
+        if moe_ep_size != 1:
+            scope += "; ideal uniform EP extrapolation, uncalibrated"
+    else:
+        scope = "measured EP=1" if moe_ep_size == 1 else "ideal uniform EP extrapolation"
     return MoeLatencyBreakdown(
         model="sglang_moe_aggregate_sum3_full_semantic_traffic",
-        model_version=EMPIRICAL_MODEL_VERSION,
+        model_version=(
+            W4A16_TRANSFER_MODEL_VERSION
+            if recipe == "w4a16_mxfp4_bf16_transfer"
+            else W8A16_TRANSFER_MODEL_VERSION
+            if recipe == "w8a16_int8wo_bf16_transfer"
+            else EMPIRICAL_MODEL_VERSION
+        ),
         recipe=recipe,
         parameter_level=level,
-        scope="measured EP=1" if moe_ep_size == 1 else "ideal uniform EP extrapolation",
+        scope=scope,
         required_peak_field=required_peak_field(recipe),
         collector_boundary=str(terms["collector_boundary"]),
         latency_us=launch_us + body_us,
@@ -373,9 +505,15 @@ __all__ = [
     "MOE_LOW",
     "MOE_PRECISE",
     "MOE_STANDARD",
+    "W4A16_TRANSFER_LIMITATION",
+    "W4A16_TRANSFER_MODEL_VERSION",
+    "W8A16_TRANSFER_LIMITATION",
+    "W8A16_TRANSFER_MODEL_VERSION",
     "MoeLatencyBreakdown",
     "MoeParameters",
     "RecipeParameters",
+    "W4A16TransferModelWarning",
+    "W8A16TransferModelWarning",
     "estimate_sglang_moe",
     "get_moe_parameters",
     "required_peak_field",

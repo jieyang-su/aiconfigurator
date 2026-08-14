@@ -253,7 +253,14 @@ class ContextMLA(Operation):
         # Strict eager resolution (parity with the Rust engine, which resolves
         # flops with `?` at query entry): reject a missing *_tc_flops entry up
         # front — a SILICON exact hit never invokes the get_sol closure.
-        common.get_quant_tc_flops(database.system_spec, fmha_quant_mode)
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        if database_mode == common.DatabaseMode.ANALYTICAL:
+            if fmha_quant_mode.value.compute_dtype == "fp8":
+                raise ValueError("ANALYTICAL MLA supports BF16 compute only; FP8 FMHA is intentionally unsupported")
+            common.get_quant_tc_flops(database.system_spec, common.FMHAQuantMode.bfloat16)
+        else:
+            common.get_quant_tc_flops(database.system_spec, fmha_quant_mode)
 
         def get_sol(
             b: int,
@@ -310,8 +317,6 @@ class ContextMLA(Operation):
             latency, _ = util_empirical.estimate(sol_time, (num_heads, s + prefix, b), grid)
             return latency
 
-        if database_mode is None:
-            database_mode = database._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
             return PerformanceResult(sol_latency, energy=0.0, source="sol")
@@ -325,8 +330,9 @@ class ContextMLA(Operation):
 
             from aiconfigurator_core.sdk.kernelsim.analytical import mla_latency_ms
 
-            if kvcache_quant_mode == common.KVCacheQuantMode.fp8 or fmha_quant_mode == common.FMHAQuantMode.fp8:
-                raise ValueError("ANALYTICAL MLA supports BF16 only; FP8 MLA is intentionally unsupported")
+            # MLA KernelSim is calibrated for BF16 math. FP8 KV remains the
+            # model-level storage choice (used by memory/KV-cache sizing), but
+            # this compute proxy deliberately ignores its dequantization cost.
             if s <= 0:
                 return PerformanceResult(0.0, energy=0.0, source="analytical")
             return PerformanceResult(
@@ -516,7 +522,12 @@ class GenerationMLA(Operation):
         # Strict eager resolution (parity with the Rust engine, which resolves
         # flops with `?` at query entry): reject a missing *_tc_flops entry up
         # front — a SILICON exact hit never invokes the get_sol closure.
-        generation_attn_flops(database.system_spec, kvcache_quant_mode)
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        if database_mode == common.DatabaseMode.ANALYTICAL:
+            common.get_quant_tc_flops(database.system_spec, common.FMHAQuantMode.bfloat16)
+        else:
+            generation_attn_flops(database.system_spec, kvcache_quant_mode)
 
         def get_sol(
             b: int, s: int, num_heads: int, kvcache_quant_mode: common.KVCacheQuantMode
@@ -552,8 +563,6 @@ class GenerationMLA(Operation):
             latency, _ = util_empirical.estimate(sol_time, (num_heads, b, s), grid)
             return latency
 
-        if database_mode is None:
-            database_mode = database._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(b, s, num_heads, kvcache_quant_mode)[0]
             return PerformanceResult(sol_latency, energy=0.0, source="sol")
@@ -567,8 +576,6 @@ class GenerationMLA(Operation):
 
             from aiconfigurator_core.sdk.kernelsim.analytical import mla_latency_ms
 
-            if kvcache_quant_mode == common.KVCacheQuantMode.fp8:
-                raise ValueError("ANALYTICAL MLA supports BF16 only; FP8 MLA is intentionally unsupported")
             return PerformanceResult(
                 mla_latency_ms(
                     system=database.system,
@@ -735,10 +742,21 @@ class MLABmm(Operation):
         database_mode: common.DatabaseMode | None = None,
     ):
         """Query MLA BMM table (legacy body + exact-head-first routing)."""
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        # MLA KernelSim is calibrated for BF16 math. Keep the model-level FP8
+        # KV mode for cache-capacity accounting, but price the decode absorption
+        # BMMs with the same BF16-compute proxy as GenerationMLA. This also lets
+        # BF16-only systems evaluate FP8 KV storage without inventing FP8 MMA.
+        compute_quant_mode = (
+            common.GEMMQuantMode.bfloat16
+            if database_mode == common.DatabaseMode.ANALYTICAL
+            else quant_mode
+        )
         # Strict eager resolution (parity with the Rust engine, which resolves
         # flops with `?` at query entry): reject a missing *_tc_flops entry up
         # front — a SILICON exact hit never invokes the get_sol closure.
-        common.get_quant_tc_flops(database.system_spec, quant_mode)
+        common.get_quant_tc_flops(database.system_spec, compute_quant_mode)
 
         def get_sol(
             num_tokens: int, num_heads: int, quant_mode: common.GEMMQuantMode, if_pre: bool
@@ -776,8 +794,6 @@ class MLABmm(Operation):
             latency, _ = util_empirical.estimate(sol_time, (num_tokens,), grid)
             return latency
 
-        if database_mode is None:
-            database_mode = database._default_database_mode
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(num_tokens, num_heads, quant_mode, if_pre)[0]
             return PerformanceResult(sol_latency, energy=0.0, source="sol")
@@ -787,15 +803,13 @@ class MLABmm(Operation):
             from aiconfigurator_core.sdk.kernelsim.analytical import bmm_latency_ms
 
             gpu = database.system_spec["gpu"]
-            is_fp8 = quant_mode != common.GEMMQuantMode.bfloat16
-            peak = gpu["fp8_tc_flops"] if is_fp8 else gpu["bfloat16_tc_flops"]
             return PerformanceResult(
                 bmm_latency_ms(
                     num_tokens=num_tokens,
                     num_heads=num_heads,
                     if_pre=if_pre,
-                    dtype="fp8" if is_fp8 else "bf16",
-                    peak_flops_s=peak,
+                    dtype="bf16",
+                    peak_flops_s=gpu["bfloat16_tc_flops"],
                     mem_bandwidth_bytes_s=gpu["mem_bw"],
                     config=database._analytical_config,
                 ),

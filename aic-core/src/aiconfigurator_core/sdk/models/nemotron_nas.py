@@ -276,6 +276,7 @@ class NemotronNas(BaseModel):
                                 self._num_heads // tp_size,
                                 num_kv_heads_per_gpu,
                                 kvcache_quant_mode,
+                                fmha_quant_mode=self.config.fmha_quant_mode,
                             ),
                             ops.GEMM(
                                 "generation_proj_gemm",

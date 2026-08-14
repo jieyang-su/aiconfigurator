@@ -15,7 +15,7 @@ def _result_source(database) -> str:
 
 
 class DSAIndexScore(Operation):
-    """Granular FP8 Index MQA score kernel for DSA producer layers."""
+    """Granular DSA Index MQA score kernel with an FP8 fit and BF16 proxy."""
 
     _CP_AWARE: ClassVar[bool] = True
 

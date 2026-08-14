@@ -135,6 +135,7 @@ class MOEModel(BaseModel):
                     window_size=window_size,
                     head_size=self._head_size,
                     use_qk_norm=self._use_qk_norm,
+                    fmha_quant_mode=fmha_quant_mode,
                 )
             )
         else:
@@ -255,6 +256,7 @@ class MOEModel(BaseModel):
                     kvcache_quant_mode,
                     head_size=self._head_size,
                     use_qk_norm=self._use_qk_norm,
+                    fmha_quant_mode=fmha_quant_mode,
                 ),
                 ops.GEMM(
                     "generation_proj_gemm",
@@ -479,6 +481,7 @@ class SGLangEPMOEModel(BaseModel):
                     window_size=window_size,
                     head_size=self._head_size,
                     use_qk_norm=self._use_qk_norm,
+                    fmha_quant_mode=fmha_quant_mode,
                 )
             )
         else:
@@ -602,6 +605,7 @@ class SGLangEPMOEModel(BaseModel):
                     kvcache_quant_mode,
                     head_size=self._head_size,
                     use_qk_norm=self._use_qk_norm,
+                    fmha_quant_mode=fmha_quant_mode,
                 ),
                 ops.GEMM(
                     "generation_proj_gemm",

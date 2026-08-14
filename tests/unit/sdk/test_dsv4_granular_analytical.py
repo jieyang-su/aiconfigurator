@@ -133,6 +133,78 @@ def test_fa_shape_allows_sparse_equivalent_q_greater_than_k():
         AttentionShape(1, 128, 64, 64, 1, 512, "bf16", causal=True)
 
 
+def test_fa_mixed_kv_storage_changes_only_cache_traffic():
+    from aiconfigurator_core.sdk.kernelsim.analytical import fa_hardware
+    from aiconfigurator_core.sdk.kernelsim.fa import AttentionShape, ModelOptions, estimate_attention
+    from aiconfigurator_core.sdk.perf_database import get_database_view
+
+    database = get_database_view(
+        "h100_sxm", "sglang", "estimate", allow_missing_data=True, database_mode="ANALYTICAL"
+    )
+    hardware = fa_hardware(database.system, database.system_spec["gpu"])
+    options = ModelOptions(mode="profiled", estimate_level="standard")
+    common_shape = dict(
+        batch_size=8,
+        query_length=1,
+        kv_length_total=8192,
+        query_heads=64,
+        kv_heads=1,
+        head_dim=512,
+        dtype="bf16",
+        value_head_dim=512,
+        kv_storage_dim=512,
+    )
+    bf16_cache = estimate_attention(hardware, AttentionShape(**common_shape), options)
+    mixed_cache = estimate_attention(
+        hardware,
+        AttentionShape(**common_shape, kv_cache_bytes_per_token=584),
+        options,
+    )
+
+    assert bf16_cache.resources_us["matrix_peak_flops"] == mixed_cache.resources_us["matrix_peak_flops"]
+    assert bf16_cache.tiles["automatic_block"] == mixed_cache.tiles["automatic_block"]
+    assert bf16_cache.work["kv_cache_bytes_per_token"] == 1024
+    assert mixed_cache.work["kv_cache_bytes_per_token"] == 584
+    assert mixed_cache.work["mainloop_hbm_bytes"] < bf16_cache.work["mainloop_hbm_bytes"]
+
+
+def test_v4_sparse_attention_uses_bf16_compute_with_packed_fp8_kv(monkeypatch):
+    captured = {}
+
+    def fake_attention_latency_ms(**kwargs):
+        captured.update(kwargs)
+        return 1.0
+
+    monkeypatch.setattr(
+        "aiconfigurator_core.sdk.kernelsim.analytical.attention_latency_ms",
+        fake_attention_latency_ms,
+    )
+    database = get_database_view(
+        "h100_sxm", "sglang", "estimate", allow_missing_data=True, database_mode="ANALYTICAL"
+    )
+    op = DeepSeekV4SparseAttention(
+        "dsv4_sparse",
+        1.0,
+        layout="paged",
+        local_heads=64,
+        head_dim=512,
+        window_size=4096,
+        compress_ratio=4,
+        index_topk=512,
+        kvcache_quant_mode=common.KVCacheQuantMode.fp8,
+        fmha_quant_mode=common.FMHAQuantMode.fp8,
+    )
+
+    result = op.query(database, batch_size=4, s=8192)
+
+    assert float(result) == pytest.approx(1.0)
+    assert captured["dtype"] == "bf16"
+    assert captured["value_head_dim"] == 512
+    assert captured["kv_storage_dim"] == 512
+    assert captured["kv_cache_bytes_per_token"] == 584
+    assert captured["include_kv_cache_update"] is False
+
+
 def test_v4_mhc_analytical_is_no_table():
     from aiconfigurator_core.sdk.operations import DeepSeekV4MHCModule
 

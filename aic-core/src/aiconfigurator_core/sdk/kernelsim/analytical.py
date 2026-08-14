@@ -32,6 +32,7 @@ from aiconfigurator_core.sdk.kernelsim.gemm.model import (
     estimate_bf16_gemm,
     estimate_deepgemm_fp8,
     estimate_sglang_fp8,
+    estimate_w8a16_gemm,
 )
 from aiconfigurator_core.sdk.kernelsim.moe.model import estimate_sglang_moe
 from aiconfigurator_core.sdk.kernelsim.msa import MsaIndexShape, estimate_msa_index
@@ -164,6 +165,15 @@ def fa_hardware(system: str, gpu: dict) -> HardwareSpec:
 def gemm_latency_ms(m: int, n: int, k: int, quant_mode, gpu: dict, config: AnalyticalConfig) -> float:
     if quant_mode == common.GEMMQuantMode.bfloat16:
         result = estimate_bf16_gemm(m, n, k, gpu["bfloat16_tc_flops"], gpu["mem_bw"], parameter_level=config.level)
+    elif quant_mode == common.GEMMQuantMode.int8_wo:
+        result = estimate_w8a16_gemm(
+            m,
+            n,
+            k,
+            gpu["bfloat16_tc_flops"],
+            gpu["mem_bw"],
+            parameter_level=config.level,
+        )
     elif quant_mode in {
         common.GEMMQuantMode.fp8,
         common.GEMMQuantMode.fp8_static,
@@ -190,7 +200,7 @@ def gemm_latency_ms(m: int, n: int, k: int, quant_mode, gpu: dict, config: Analy
     else:
         raise ValueError(
             f"ANALYTICAL GEMM does not support quant mode {quant_mode.name!r}; "
-            "supported modes are BF16 and FP8 variants"
+            "supported modes are BF16, W8A16, and FP8 variants"
         )
     return result.latency_us / 1000.0
 
@@ -208,6 +218,10 @@ def attention_latency_ms(
     dtype: str,
     config: AnalyticalConfig,
     causal: bool = True,
+    value_head_dim: int | None = None,
+    kv_storage_dim: int | None = None,
+    kv_cache_bytes_per_token: float | None = None,
+    include_kv_cache_update: bool = True,
 ) -> float:
     result = estimate_attention(
         fa_hardware(system, gpu),
@@ -220,12 +234,16 @@ def attention_latency_ms(
             head_dim=head_dim,
             dtype=dtype,
             causal=causal,
+            value_head_dim=value_head_dim,
+            kv_storage_dim=kv_storage_dim,
+            kv_cache_bytes_per_token=kv_cache_bytes_per_token,
         ),
         ModelOptions(
             algorithm=config.attention_algorithm,
             mode="profiled",
             estimate_level=config.level,
             assume_query_tile_l2_reuse=True,
+            include_kv_cache_update=include_kv_cache_update,
         ),
     )
     return result.latency_us / 1000.0
@@ -294,10 +312,22 @@ def index_mqa_latency_ms(
     index_head_dim: int,
     config: AnalyticalConfig,
 ) -> float:
-    required = {"sm_count", "clock_hz", "fp8_tc_flops", "mem_bw"}
+    required = {"sm_count", "clock_hz", "mem_bw"}
     missing = sorted(required - gpu.keys())
     if missing:
         raise ValueError(f"DSA Index MQA analytical hardware fields missing: {', '.join(missing)}")
+    if "fp8_tc_flops" in gpu:
+        dtype = "fp8"
+        fp8_peak = float(gpu["fp8_tc_flops"])
+        bf16_peak = None
+    else:
+        if "bfloat16_tc_flops" not in gpu:
+            raise ValueError(
+                "DSA Index MQA analytical hardware fields missing: fp8_tc_flops or bfloat16_tc_flops"
+            )
+        dtype = "bf16"
+        fp8_peak = None
+        bf16_peak = float(gpu["bfloat16_tc_flops"])
     result = estimate_index_mqa(
         IndexMqaShape(
             layout=layout,
@@ -306,10 +336,12 @@ def index_mqa_latency_ms(
             context_length=context_length,
             index_heads=index_heads,
             head_dim=index_head_dim,
+            dtype=dtype,
         ),
         sm_count=int(gpu["sm_count"]),
         clock_hz=float(gpu["clock_hz"]),
-        fp8_peak_flops_s=float(gpu["fp8_tc_flops"]),
+        fp8_peak_flops_s=fp8_peak,
+        bf16_peak_flops_s=bf16_peak,
         hbm_bandwidth_bytes_s=float(gpu["mem_bw"]),
         parameter_level=config.level,
     )
@@ -470,9 +502,15 @@ def moe_latency_ms(
 ) -> float:
     recipe_map = {
         "bfloat16": "bf16_triton",
+        "int8_wo": "w8a16_int8wo_bf16_transfer",
         "fp8": "fp8_block_triton",
         "fp8_block": "fp8_block_triton",
         "nvfp4": "nvfp4_cutedsl",
+        # Provisional scheme-1 support: retain BF16 execution efficiencies and
+        # compute peak while reducing only MXFP4 weight traffic. The model emits
+        # a one-time low-confidence warning; no dedicated W4A16 fit is used.
+        "w4a16_mxfp4": "w4a16_mxfp4_bf16_transfer",
+        "w4a16_mxfp4_cutlass": "w4a16_mxfp4_bf16_transfer",
         # Kimi-K3's routed experts use W4A8 MXFP4/MXFP8.  The archived
         # no-GPU MoE model has no separate MXFP4 fit; its NVFP4 CuTeDSL
         # contract is the closest calibrated low-bit weight recipe.
@@ -485,7 +523,9 @@ def moe_latency_ms(
         raise ValueError(f"ANALYTICAL MoE does not support quant mode {quant_mode.name!r}") from error
     peak_key = {
         "bf16_triton": "bfloat16_tc_flops",
+        "w8a16_int8wo_bf16_transfer": "bfloat16_tc_flops",
         "fp8_block_triton": "fp8_tc_flops",
+        "w4a16_mxfp4_bf16_transfer": "bfloat16_tc_flops",
         "nvfp4_cutedsl": "fp4_tc_flops",
     }[recipe]
     if peak_key not in gpu:
