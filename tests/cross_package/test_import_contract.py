@@ -70,6 +70,13 @@ CORE_SDK_LEAF_MODULES = [
     "utils",
 ]
 
+# New core-only implementation modules have no historical
+# ``aiconfigurator.sdk`` import path to preserve. Keep them outside the legacy
+# compatibility surface while continuing to require aliases for every legacy
+# SDK leaf.
+CORE_ONLY_LEAF_MODULES = {"operations.dsa_granular"}
+CORE_ONLY_MODULE_PREFIXES = ("kernelsim.",)
+
 
 def _discover_python_leaves(root: object, prefix: str = "") -> set[str]:
     """Return import suffixes for every non-package Python module below root."""
@@ -85,10 +92,16 @@ def _discover_python_leaves(root: object, prefix: str = "") -> set[str]:
 
 
 def test_import_contract_covers_every_core_sdk_leaf() -> None:
-    """A new core SDK module must add a legacy wrapper and contract case."""
+    """Every non-core-only SDK leaf must have a legacy compatibility case."""
     core_sdk_root = importlib.resources.files("aiconfigurator_core.sdk")
+    compatibility_leaves = {
+        module
+        for module in _discover_python_leaves(core_sdk_root)
+        if module not in CORE_ONLY_LEAF_MODULES
+        and not module.startswith(CORE_ONLY_MODULE_PREFIXES)
+    }
 
-    assert set(CORE_SDK_LEAF_MODULES) == _discover_python_leaves(core_sdk_root)
+    assert set(CORE_SDK_LEAF_MODULES) == compatibility_leaves
 
 
 @pytest.mark.parametrize("module_suffix", CORE_SDK_LEAF_MODULES)
