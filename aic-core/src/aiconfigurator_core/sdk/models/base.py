@@ -96,6 +96,11 @@ class BaseModel:
         self.model_family = model_family
         self.architecture = architecture
         self.config = model_config
+        # Communication placement is an immutable, model-local what-if. It is
+        # deliberately not stored on PerfDatabase, which is shared by views.
+        from aiconfigurator_core.sdk.system_spec import ParallelLayout
+
+        self._parallel_layout = ParallelLayout.from_model_config(model_config)
         self.extra_params = extra_params
         self._use_qk_norm = bool(extra_params.get("use_qk_norm", False)) if isinstance(extra_params, dict) else False
         self.encoder_ops = []
@@ -126,6 +131,42 @@ class BaseModel:
 
         self._nextn = normalize_nextn(model_config.nextn)
         model_config.nextn = self._nextn
+
+    def bind_parallel_layout(self) -> None:
+        """Attach placement metadata to communication-bearing operations.
+
+        Models construct operations in many family-specific modules. Binding
+        after construction keeps that code unchanged and leaves the default
+        historical ``independent`` behavior untouched.
+        """
+        from aiconfigurator_core.sdk.operations.communication import (
+            NCCL,
+            P2P,
+            CustomAllReduce,
+        )
+        from aiconfigurator_core.sdk.operations.moe import (
+            MoEDispatch,
+            TrtLLMWideEPMoEDispatch,
+        )
+
+        for operations in (self.encoder_ops, self.context_ops, self.generation_ops):
+            for operation in operations:
+                if isinstance(operation, P2P):
+                    group = "pp"
+                elif isinstance(operation, MoEDispatch | TrtLLMWideEPMoEDispatch):
+                    group = "moe_tp_ep"
+                elif isinstance(operation, NCCL):
+                    name = getattr(operation, "_name", "").lower()
+                    group = (
+                        "cp"
+                        if operation._seq_split > 1 or "cp" in name
+                        else ("tp" if "tp" in name else ("dp" if "dp" in name else "collective"))
+                    )
+                elif isinstance(operation, CustomAllReduce):
+                    group = "tp"
+                else:
+                    continue
+                operation.set_parallel_layout(self._parallel_layout, group)
 
     @property
     def activation_hidden_size(self) -> int:

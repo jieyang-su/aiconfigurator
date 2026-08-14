@@ -44,6 +44,10 @@ class ModelConfig:
     enable_wideep: bool = False
     enable_eplb: bool = False  # Expert Parallel Load Balancing
     wideep_num_slots: int = None  # EPLB num_slots, defaults to num_experts if None
+    # Communication placement policy. ``independent`` preserves the historical
+    # size-only bandwidth selection; ``tp_first`` is an explicit analytical
+    # what-if layout and is not a claim about NCCL rank placement.
+    communication_placement: str = "independent"
 
     def resolve_moe_parallelism(self) -> tuple[int, int]:
         """Resolve and validate MoE parallelism dimensions in-place.

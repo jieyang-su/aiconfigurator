@@ -54,6 +54,17 @@ class InferenceSession:
         self._model = model
         self._database = database
         self._backend = backend
+        from aiconfigurator_core.sdk.system_spec import validate_parallelism
+
+        validate_parallelism(
+            database.system_spec,
+            tp=model.config.tp_size,
+            pp=model.config.pp_size,
+            attention_dp=model.config.attention_dp_size,
+            cp=model.config.cp_size,
+            moe_tp=model.config.moe_tp_size or 1,
+            moe_ep=model.config.moe_ep_size or 1,
+        )
 
     def run_static(
         self,

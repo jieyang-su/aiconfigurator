@@ -20,7 +20,7 @@ from aiconfigurator_core.sdk import common, perf_interp
 from aiconfigurator_core.sdk.common import PerfDataFilename, parse_support_matrix_version
 from aiconfigurator_core.sdk.errors import InterpolationDataNotAvailableError, PerfDataNotAvailableError
 from aiconfigurator_core.sdk.performance_result import PerformanceResult
-from aiconfigurator_core.sdk.system_spec import SystemSpec
+from aiconfigurator_core.sdk.system_spec import SystemSpec, is_blackwell_spec, is_hopper_spec
 
 databases_cache = defaultdict(lambda: defaultdict(lambda: defaultdict()))
 logger = logging.getLogger(__name__)
@@ -110,20 +110,40 @@ def load_system_spec(
     return _load_system_spec_from_paths(tuple(resolved_paths), system_name)
 
 
-def is_blackwell_system(system_name: str | None) -> bool:
+def is_blackwell_system(system_name: str | dict | None) -> bool:
     """True for Blackwell-class systems (SM >= 100, e.g. b200_sxm / gb200 / b300 / gb300)."""
     if not system_name:
         return False
-    spec = load_system_spec(system_name)
-    return int(spec.get("gpu", {}).get("sm_version", -1)) >= 100
+    spec = system_name if isinstance(system_name, dict) else load_system_spec(system_name)
+    return is_blackwell_spec(spec)
 
 
-def is_hopper_system(system_name: str | None) -> bool:
+def is_hopper_system(system_name: str | dict | None) -> bool:
     """True for Hopper-class systems (SM 90, e.g. h100 / h200 / gh200)."""
     if not system_name:
         return False
-    spec = load_system_spec(system_name)
-    return int(spec.get("gpu", {}).get("sm_version", -1)) == 90
+    spec = system_name if isinstance(system_name, dict) else load_system_spec(system_name)
+    return is_hopper_spec(spec)
+
+
+def is_sm100_system(system_name: str | dict | None) -> bool:
+    """True only for real NVIDIA SM100 systems, never for a proxy SM value."""
+    if not system_name:
+        return False
+    from aiconfigurator_core.sdk.system_spec import is_sm100_spec
+
+    spec = system_name if isinstance(system_name, dict) else load_system_spec(system_name)
+    return is_sm100_spec(spec)
+
+
+@functools.cache
+def _warn_domestic_analytical_once(system: str) -> None:
+    logger.warning(
+        "ANALYTICAL evaluation for domestic system %s uses proxy NVIDIA microarchitecture "
+        "parameters only for KernelSim scheduling. Results are estimate-only, communication "
+        "is limited to one supernode, and no NVIDIA ISA/backend compatibility is implied.",
+        system,
+    )
 
 
 def build_no_databases_message() -> str:
@@ -1085,6 +1105,10 @@ def _get_configured_database_view(
     view = _cached_configured_database_view(root_template, normalized_mode, policy, config)
     if normalized_mode == common.DatabaseMode.ANALYTICAL:
         warn_backend_compatibility(view.backend)
+        from aiconfigurator_core.sdk.system_spec import architecture_family
+
+        if architecture_family(view.system_spec) == "domestic":
+            _warn_domestic_analytical_once(view.system)
     return view
 
 
@@ -2720,6 +2744,7 @@ class PerfDatabase:
         database_mode: Optional[common.DatabaseMode] = None,
         window_size: int = 0,
         head_size: int = 128,
+        fmha_quant_mode: common.FMHAQuantMode | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Query generation attention latency. Delegates to
         ``GenerationAttention._query_generation_attention_table``."""
@@ -2735,6 +2760,7 @@ class PerfDatabase:
             database_mode,
             window_size,
             head_size,
+            fmha_quant_mode,
         )
 
     @functools.lru_cache(maxsize=32768)
@@ -2902,12 +2928,16 @@ class PerfDatabase:
         tp_size: int,
         size: int,
         database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Query custom AllReduce latency. Delegates to
         ``CustomAllReduce._query_custom_allreduce_table``."""
         from aiconfigurator_core.sdk.operations.communication import CustomAllReduce
 
-        return CustomAllReduce._query_custom_allreduce_table(self, quant_mode, tp_size, size, database_mode)
+        return CustomAllReduce._query_custom_allreduce_table(
+            self, quant_mode, tp_size, size, database_mode, parallel_layout, communication_group
+        )
 
     @functools.lru_cache(maxsize=32768)
     def query_nccl(
@@ -2917,12 +2947,16 @@ class PerfDatabase:
         operation: str,
         message_size: int,  # element number
         database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = None,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Query NCCL collective communication latency. Delegates to
         ``NCCL._query_nccl_table``."""
         from aiconfigurator_core.sdk.operations.communication import NCCL
 
-        return NCCL._query_nccl_table(self, dtype, num_gpus, operation, message_size, database_mode)
+        return NCCL._query_nccl_table(
+            self, dtype, num_gpus, operation, message_size, database_mode, parallel_layout, communication_group
+        )
 
     @functools.lru_cache(maxsize=32768)
     def query_moe(
@@ -3080,12 +3114,19 @@ class PerfDatabase:
 
     @functools.lru_cache(maxsize=32768)
     def query_p2p(
-        self, message_bytes: int, database_mode: common.DatabaseMode | None = None
+        self,
+        message_bytes: int,
+        database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = "pp",
+        group_size: int = 2,
     ) -> PerformanceResult | tuple[float, float, float]:
         """Query P2P latency. Delegates to ``P2P._query_p2p_table``."""
         from aiconfigurator_core.sdk.operations.communication import P2P
 
-        return P2P._query_p2p_table(self, message_bytes, database_mode)
+        return P2P._query_p2p_table(
+            self, message_bytes, database_mode, parallel_layout, communication_group, group_size
+        )
 
     @functools.lru_cache(maxsize=32768)
     def query_wideep_deepep_ll(
@@ -3098,6 +3139,8 @@ class PerfDatabase:
         dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
         combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
         database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = "moe_tp_ep",
     ) -> PerformanceResult | tuple[float, float, float]:
         """Delegates to ``MoEDispatch``; see
         ``operations.moe.MoEDispatch._query_wideep_deepep_ll_table``."""
@@ -3113,6 +3156,8 @@ class PerfDatabase:
             dispatch_dtype=dispatch_dtype,
             combine_dtype=combine_dtype,
             database_mode=database_mode,
+            parallel_layout=parallel_layout,
+            communication_group=communication_group,
         )
 
     @functools.lru_cache(maxsize=32768)
@@ -3127,6 +3172,8 @@ class PerfDatabase:
         dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
         combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
         database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = "moe_tp_ep",
     ) -> PerformanceResult | tuple[float, float, float]:
         """Delegates to ``MoEDispatch``; see
         ``operations.moe.MoEDispatch._query_wideep_deepep_normal_table``."""
@@ -3143,6 +3190,8 @@ class PerfDatabase:
             dispatch_dtype=dispatch_dtype,
             combine_dtype=combine_dtype,
             database_mode=database_mode,
+            parallel_layout=parallel_layout,
+            communication_group=communication_group,
         )
 
     @functools.lru_cache(maxsize=32768)
@@ -3194,6 +3243,8 @@ class PerfDatabase:
         node_num: int | None = None,
         database_mode: common.DatabaseMode | None = None,
         moe_backend: str | None = None,
+        parallel_layout=None,
+        communication_group: str | None = "moe_tp_ep",
     ) -> PerformanceResult | tuple[float, float, float]:
         """Delegates to ``TrtLLMWideEPMoEDispatch``; see
         ``operations.moe.TrtLLMWideEPMoEDispatch._query_alltoall_table``."""
@@ -3211,6 +3262,8 @@ class PerfDatabase:
             node_num=node_num,
             database_mode=database_mode,
             moe_backend=moe_backend,
+            parallel_layout=parallel_layout,
+            communication_group=communication_group,
         )
 
     # ═══════════════════════════════════════════════════════════════════

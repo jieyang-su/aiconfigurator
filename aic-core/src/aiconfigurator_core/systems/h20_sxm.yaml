@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# NVIDIA does not publish a complete public H20 product datasheet. The product
+# values below are the consistently reported H20-3e specifications and agree
+# with this repository's H20 collector assumptions (96 GiB class memory and
+# ~4023 GB/s HBM bandwidth). Microarchitecture-only KernelSim fields are marked
+# as derived proxies and must not be interpreted as NVIDIA-published limits.
+data_dir: data/h20_sxm # Analytical-only initially; no packaged Silicon tables
+gpu:
+  architecture_family: nvidia
+  mem_bw: 4000000000000 # 4.0 TB/s HBM3; measured code paths use ~4023 GB/s
+  mem_bw_empirical_scaling_factor: 0.8 # same formula calibration convention as H100/H200
+  mem_empirical_constant_latency: 0.000003 # 3 us formula proxy
+  mem_capacity: 103079215104 # 96 GiB HBM3
+  bfloat16_tc_flops: 148000000000000 # 148 TFLOPS
+  int8_tc_flops: 296000000000000 # 296 TOPS
+  fp8_tc_flops: 296000000000000 # 296 TFLOPS
+  power: 400 # W nominal TDP
+  sm_version: 90 # Hopper ISA
+  # Analytical FA/MLA proxy profile. H20 is reported with 9984 CUDA cores,
+  # equivalent to 78 Hopper SMs, and a 1.98 GHz boost clock. Shared memory and
+  # L2 capacity reuse GH100/H100 architectural values. L2 bandwidth is scaled
+  # from H100 by (78*1.98)/(132*1.83); vector peak follows the existing
+  # sm_count*clock*512 convention.
+  sm_count: 78
+  clock_hz: 1980000000
+  shared_memory_per_sm_bytes: 262144
+  l2_capacity_bytes: 52428800
+  l2_bandwidth_bytes_s: 5990400000000
+  vector_peak_flops: 79073280000000
+
+node:
+  num_gpus_per_node: 8
+  inter_node_bw: 50000000000 # Byte/s per GPU, one direction; NDR 400 Gb/s proxy
+  intra_node_bw: 450000000000 # Byte/s per GPU, one direction; 900 GB/s bidirectional NVLink
+  pcie_bw: 64000000000 # Byte/s, one direction, PCIe 5.0 x16
+  p2p_latency: 0.00001 # 10 us formula proxy
+
+misc:
+  # Software/runtime reservations are inherited from the closest HGX Hopper
+  # profile; they are deployment assumptions rather than H20 hardware facts.
+  nccl_mem:
+    1: 0
+    2: 358612992
+    4: 411041792
+    8: 411041792
+  other_mem: 3758096384
+  nccl_version: '2.27.3'

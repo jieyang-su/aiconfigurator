@@ -113,7 +113,9 @@ def get_model(
     else:
         model_config.cp_style = "none"
 
-    return cls.create(model_info, model_config, backend_name)
+    model = cls.create(model_info, model_config, backend_name)
+    model.bind_parallel_layout()
+    return model
 
 
 # Re-export concrete model classes for backward compatibility. Auto-discovery

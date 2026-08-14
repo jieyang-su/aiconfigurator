@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 AIC contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Domestic GPU estimate-only system profile.
+# This is the 128-GPU BR100 supernode variant. See _dom_br100_64.yaml for
+# the proxy and no-silicon-data assumptions.
+
+data_dir: data/_dom_br100_128
+gpu:
+  mem_bw: 2300000000000 # 2.3TB/s
+  mem_bw_empirical_scaling_factor: 0.8 # provisional generic correction
+  mem_empirical_constant_latency: 0.000003 # 3us provisional estimate
+  mem_capacity: 68719476736 # 64GiB; source description says 64GB
+  bfloat16_tc_flops: 1024000000000000 # 1024TFLOPS BF16
+  power: 700 # provisional H100 proxy; BR100 board power not provided
+  sm_version: 90 # H100 proxy, not a BR100 ISA claim
+  architecture_family: domestic
+  capability_overrides:
+    fp8_mma: false
+    fp4_mma: false
+    mnnvl: false
+  sm_count: 132 # H100 proxy for analytical kernelsim
+  clock_hz: 1830000000 # H100 proxy
+  shared_memory_per_sm_bytes: 262144 # H100 proxy
+  l2_capacity_bytes: 52428800 # H100 proxy
+  l2_bandwidth_bytes_s: 9369600000000 # H100 proxy
+  vector_peak_flops: 123724800000000 # H100 proxy
+
+node:
+  topology_scope: single_supernode
+  num_gpus_per_node: 128 # BR100 supernode size
+  inter_node_bw: 0 # cross-supernode link not modeled
+  intra_node_bw: 400000000000 # 400GB/s per GPU within the supernode
+  pcie_bw: 64000000000 # H100 proxy; BR100 host link not provided
+  p2p_latency: 0.00001 # provisional H100 proxy
+
+misc:
+  nccl_mem:
+    1: 0
+    2: 358612992
+    4: 411041792
+    8: 411041792
+  other_mem: 3758096384
+  nccl_version: '2.27.3' # placeholder; no domestic collective backend data yet

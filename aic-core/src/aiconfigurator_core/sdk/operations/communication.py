@@ -13,8 +13,8 @@
   alongside NCCL data because ``query_nccl`` picks between them at query
   time (XPU systems load oneCCL when NCCL is empty).
 
-- ``P2P`` has no silicon table — latency is computed analytically from
-  ``inter_node_bw`` + ``p2p_latency``. The base ``Operation.load_data``
+- ``P2P`` has no silicon table — latency is computed analytically from the
+  topology-selected pipeline bandwidth + ``p2p_latency``. The base ``Operation.load_data``
   no-op default applies; ``_query_p2p_table`` is factored out for
   parity with the other ops.
 
@@ -58,6 +58,33 @@ def _cache_key(database: PerfDatabase) -> tuple:
         database.version,
         database.enable_shared_layer,
     )
+
+
+def _silicon_collective_topology_scale(
+    database: PerfDatabase,
+    anchor_num_gpus: int,
+    requested_num_gpus: int,
+    parallel_layout,
+    communication_group: str | None,
+) -> float:
+    """Transfer a measured collective from its table topology to the requested layout.
+
+    Communication tables are keyed by rank count, not placement. Preserve the
+    measured launch/algorithm behavior, then scale only the ring participation
+    fraction and the bandwidth selected for the requested logical group.
+    """
+    if anchor_num_gpus <= 1 or requested_num_gpus <= 1:
+        return 1.0
+
+    anchor_bw = database._get_p2p_bandwidth(anchor_num_gpus)
+    target_bw = (
+        parallel_layout.bandwidth(database.system_spec, communication_group, requested_num_gpus)
+        if parallel_layout is not None
+        else database._get_p2p_bandwidth(requested_num_gpus)
+    )
+    anchor_ring_fraction = (anchor_num_gpus - 1) / anchor_num_gpus
+    requested_ring_fraction = (requested_num_gpus - 1) / requested_num_gpus
+    return requested_ring_fraction / anchor_ring_fraction * anchor_bw / target_bw
 
 
 class CustomAllReduce(Operation):
@@ -123,14 +150,28 @@ class CustomAllReduce(Operation):
         tp_size: int,
         size: int,
         database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = None,
     ):
         """Query custom_allreduce table. Verbatim port of the legacy body."""
         from aiconfigurator_core.sdk.perf_database import PerfDataNotAvailableError
 
-        def get_sol(quant_mode: common.CommQuantMode, tp_size: int, size: int) -> tuple[float, float, float]:
+        def get_sol(
+            quant_mode: common.CommQuantMode,
+            tp_size: int,
+            size: int,
+            *,
+            p2p_bw_override: float | None = None,
+        ) -> tuple[float, float, float]:
             if tp_size == 1:
                 return 0, 0, 0
-            p2p_bw = database._get_p2p_bandwidth(tp_size)
+            p2p_bw = p2p_bw_override
+            if p2p_bw is None:
+                p2p_bw = (
+                    parallel_layout.bandwidth(database.system_spec, communication_group, tp_size)
+                    if parallel_layout is not None
+                    else database._get_p2p_bandwidth(tp_size)
+                )
             # ``size`` is an element count. Keep accepting the legacy string
             # inputs used by the public SOL API while honoring explicit FP8/
             # INT8 communication dtypes from Analytical MoE paths.
@@ -207,7 +248,14 @@ class CustomAllReduce(Operation):
                 return PerformanceResult(0.0, energy=0.0, source="empirical")
             if database.system_spec["node"]["num_gpus_per_node"] == 72 and tp_size > 4:
                 # on GB200, we only have custom all reduce for up to tp4.
-                return database.query_nccl(quant_mode, tp_size, "all_reduce", size)
+                return database.query_nccl(
+                    quant_mode,
+                    tp_size,
+                    "all_reduce",
+                    size,
+                    parallel_layout=parallel_layout,
+                    communication_group=communication_group,
+                )
 
             data_wrapper.raise_if_not_loaded()
 
@@ -236,25 +284,26 @@ class CustomAllReduce(Operation):
             config = perf_interp.OpInterpConfig(
                 axes=("message_bytes",),
                 resolver=perf_interp.Grid(),
-                sol_fn=lambda sz: get_sol(quant_mode, effective_tp, sz)[0],
+                sol_fn=lambda sz: get_sol(
+                    quant_mode,
+                    effective_tp,
+                    sz,
+                    p2p_bw_override=database._get_p2p_bandwidth(effective_tp),
+                )[0],
             )
             result = perf_interp.query(config, comm_dict, size)
             lat = perf_interp.get_value(result, "latency")
             energy = perf_interp.get_value(result, "energy")
 
-            if tp_size > database.system_spec["node"]["num_gpus_per_node"]:
-                base_bw = database._get_p2p_bandwidth(database.system_spec["node"]["num_gpus_per_node"])
-                target_bw = database._get_p2p_bandwidth(tp_size)
-                scale_factor = (
-                    (tp_size - 1)
-                    / tp_size
-                    * database.system_spec["node"]["num_gpus_per_node"]
-                    / (database.system_spec["node"]["num_gpus_per_node"] - 1)
-                    * base_bw
-                    / target_bw
-                )
-                lat = lat * scale_factor
-                energy = energy * scale_factor
+            scale_factor = _silicon_collective_topology_scale(
+                database,
+                effective_tp,
+                tp_size,
+                parallel_layout,
+                communication_group,
+            )
+            lat = lat * scale_factor
+            energy = energy * scale_factor
 
             return database._interp_pr(lat, energy=energy)
 
@@ -280,7 +329,13 @@ class CustomAllReduce(Operation):
         # count, not size in bytes
         size = (-(-kwargs.get("x") // self._seq_split)) * self._h  # CP: ceil = busiest rank
 
-        result = database.query_custom_allreduce(common.CommQuantMode.half, self._tp_size, size)
+        result = database.query_custom_allreduce(
+            common.CommQuantMode.half,
+            self._tp_size,
+            size,
+            parallel_layout=getattr(self, "_parallel_layout", None),
+            communication_group=getattr(self, "_communication_group", "tp"),
+        )
         return PerformanceResult(
             float(result) * self._scale_factor,
             energy=result.energy * self._scale_factor,
@@ -392,6 +447,8 @@ class NCCL(Operation):
         operation: str,
         message_size: int,
         database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = None,
     ):
         """Query NCCL table. Verbatim port of the legacy body."""
 
@@ -405,10 +462,21 @@ class NCCL(Operation):
             return node
 
         def get_sol(
-            dtype: common.CommQuantMode, num_gpus: int, operation: str, message_size: int
+            dtype: common.CommQuantMode,
+            num_gpus: int,
+            operation: str,
+            message_size: int,
+            *,
+            p2p_bw_override: float | None = None,
         ) -> tuple[float, float, float]:
             sol_time = 0.0
-            p2p_bw = database._get_p2p_bandwidth(num_gpus)
+            p2p_bw = p2p_bw_override
+            if p2p_bw is None:
+                p2p_bw = (
+                    parallel_layout.bandwidth(database.system_spec, communication_group, num_gpus)
+                    if parallel_layout is not None
+                    else database._get_p2p_bandwidth(num_gpus)
+                )
 
             if operation == "all_gather" or operation == "alltoall" or operation == "reduce_scatter":
                 sol_time = dtype.value.memory * message_size * (num_gpus - 1) / num_gpus / p2p_bw * 1000
@@ -517,20 +585,30 @@ class NCCL(Operation):
             config = perf_interp.OpInterpConfig(
                 axes=("message_bytes",),
                 resolver=perf_interp.Grid(),
-                sol_fn=lambda sz: get_sol(dtype, effective_num_gpus, operation, sz)[0],
+                sol_fn=lambda sz: get_sol(
+                    dtype,
+                    effective_num_gpus,
+                    operation,
+                    sz,
+                    p2p_bw_override=database._get_p2p_bandwidth(effective_num_gpus),
+                )[0],
             )
             result = perf_interp.query(config, nccl_dict, message_size)
             lat = perf_interp.get_value(result, "latency")
             energy = perf_interp.get_value(result, "energy")
 
-            if num_gpus > max_num_gpus:  # need to do some correction
+            if num_gpus > max_num_gpus:
                 logger.debug(f"nccl num_gpus {num_gpus} > max_num_gpus {max_num_gpus}, need to do some correction")
-                max_num_gpus_bw = database._get_p2p_bandwidth(max_num_gpus)
-                num_gpus_bw = database._get_p2p_bandwidth(num_gpus)
-                scale_factor = max_num_gpus_bw / num_gpus_bw
-                scaling_formula = (num_gpus - 1) / num_gpus * max_num_gpus / (max_num_gpus - 1) * scale_factor
-                lat = lat * scaling_formula
-                energy = energy * scaling_formula
+
+            scaling_formula = _silicon_collective_topology_scale(
+                database,
+                effective_num_gpus,
+                num_gpus,
+                parallel_layout,
+                communication_group,
+            )
+            lat = lat * scaling_formula
+            energy = energy * scaling_formula
 
             return database._interp_pr(lat, energy=energy)
 
@@ -550,7 +628,14 @@ class NCCL(Operation):
         # CP: ceil = busiest rank
         message_size = (-(-kwargs.get("x") // self._seq_split)) * self._num_elements_per_token
 
-        result = database.query_nccl(self._comm_quant_mode, self._num_gpus, self._nccl_op, message_size)
+        result = database.query_nccl(
+            self._comm_quant_mode,
+            self._num_gpus,
+            self._nccl_op,
+            message_size,
+            parallel_layout=getattr(self, "_parallel_layout", None),
+            communication_group=getattr(self, "_communication_group", "collective"),
+        )
         return PerformanceResult(
             float(result) * self._scale_factor,
             energy=result.energy * self._scale_factor,
@@ -589,17 +674,33 @@ class P2P(Operation):
         database: PerfDatabase,
         message_bytes: int,
         database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = "pp",
+        group_size: int = 2,
     ):
         """Query P2P latency analytically. Verbatim port of the legacy body."""
 
         def get_sol(message_bytes: int) -> tuple[float, float, float]:
-            # TODO, use intra_node_bw if num_gpus < num_gpus_per_node
-            sol_time = message_bytes / database.system_spec["node"]["inter_node_bw"] * 1000
+            from aiconfigurator_core.sdk.system_spec import get_pipeline_p2p_bandwidth
+
+            bandwidth = (
+                parallel_layout.bandwidth(database.system_spec, communication_group, group_size)
+                if parallel_layout is not None
+                else get_pipeline_p2p_bandwidth(database.system_spec)
+            )
+            sol_time = message_bytes / bandwidth * 1000
             return sol_time, 0, sol_time
 
         def get_empirical(message_bytes: int) -> float:
+            from aiconfigurator_core.sdk.system_spec import get_pipeline_p2p_bandwidth
+
+            bandwidth = (
+                parallel_layout.bandwidth(database.system_spec, communication_group, group_size)
+                if parallel_layout is not None
+                else get_pipeline_p2p_bandwidth(database.system_spec)
+            )
             return (
-                message_bytes / database.system_spec["node"]["inter_node_bw"]
+                message_bytes / bandwidth
                 + database.system_spec["node"]["p2p_latency"]
             ) * 1000
 
@@ -641,7 +742,15 @@ class P2P(Operation):
         size = (-(-kwargs.get("x") // self._seq_split)) * self._h  # CP: ceil = busiest rank
         p2p_bytes = size * 2
 
-        result = database.query_p2p(p2p_bytes)
+        result = database.query_p2p(
+            p2p_bytes,
+            parallel_layout=getattr(self, "_parallel_layout", None),
+            communication_group=getattr(self, "_communication_group", "pp"),
+            # A pipeline transfer is point-to-point between adjacent stages;
+            # pp_size is used by the layout to inspect the stage edge, while
+            # the communicating group itself has two participants.
+            group_size=2,
+        )
         return PerformanceResult(
             float(result) * self._scale_factor,
             energy=result.energy * self._scale_factor,

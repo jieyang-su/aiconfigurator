@@ -596,6 +596,7 @@ DefaultHFModels = {
 Supported systems (GPU types)
 """
 SupportedSystems = {
+    "h20_sxm",
     "h100_sxm",
     "h100_pcie",
     "h200_sxm",

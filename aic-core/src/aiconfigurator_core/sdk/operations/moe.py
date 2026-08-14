@@ -49,7 +49,12 @@ from typing import TYPE_CHECKING, ClassVar
 from aiconfigurator_core.sdk import common, perf_interp
 from aiconfigurator_core.sdk.errors import PerfDataNotAvailableError
 from aiconfigurator_core.sdk.operations import util_empirical
-from aiconfigurator_core.sdk.operations.base import Operation, _read_filtered_rows, resolve_op_data_path
+from aiconfigurator_core.sdk.operations.base import (
+    CommunicationDatabaseView,
+    Operation,
+    _read_filtered_rows,
+    resolve_op_data_path,
+)
 from aiconfigurator_core.sdk.performance_result import PerformanceResult
 
 if TYPE_CHECKING:
@@ -1034,16 +1039,26 @@ class MoEDispatch(Operation):
         dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
         combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
         database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = "moe_tp_ep",
     ) -> PerformanceResult | tuple[float, float, float]:
         """Verbatim port of legacy ``PerfDatabase.query_wideep_deepep_ll``."""
         cls.load_data(database)
 
         def get_sol(num_tokens: int, topk: int, num_experts: int) -> tuple[float, float, float]:
+            from aiconfigurator_core.sdk.system_spec import get_p2p_bandwidth, is_single_supernode
+
+            if is_single_supernode(database.system_spec) and node_num > 1:
+                raise ValueError("WideEP cross-supernode communication is unavailable on a single-supernode system.")
             world = max(1, round(node_num * database.system_spec["node"]["num_gpus_per_node"]))
             remote_ranks = min(topk, num_experts, max(1, world - 1))
             elements = num_tokens * remote_ranks * hidden_size
             data_bytes = elements * (dispatch_dtype.value.memory + combine_dtype.value.memory)
-            bandwidth = database.system_spec["node"]["inter_node_bw" if node_num > 1 else "intra_node_bw"]
+            bandwidth = (
+                parallel_layout.bandwidth(database.system_spec, communication_group, world)
+                if parallel_layout is not None
+                else get_p2p_bandwidth(database.system_spec, world)
+            )
             sol_time = data_bytes / bandwidth * 1000
             return sol_time, 0.0, sol_time
 
@@ -1117,16 +1132,26 @@ class MoEDispatch(Operation):
         dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
         combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
         database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = "moe_tp_ep",
     ) -> PerformanceResult | tuple[float, float, float]:
         """Verbatim port of legacy ``PerfDatabase.query_wideep_deepep_normal``."""
         cls.load_data(database)
 
         def get_sol(num_tokens: int, num_experts: int, topk: int, hidden_size: int) -> tuple[float, float, float]:
+            from aiconfigurator_core.sdk.system_spec import get_p2p_bandwidth, is_single_supernode
+
+            if is_single_supernode(database.system_spec) and node_num > 1:
+                raise ValueError("WideEP cross-supernode communication is unavailable on a single-supernode system.")
             world = max(1, round(node_num * database.system_spec["node"]["num_gpus_per_node"]))
             remote_ranks = min(topk, num_experts, max(1, world - 1))
             elements = num_tokens * remote_ranks * hidden_size
             data_bytes = elements * (dispatch_dtype.value.memory + combine_dtype.value.memory)
-            bandwidth = database.system_spec["node"]["inter_node_bw" if node_num > 1 else "intra_node_bw"]
+            bandwidth = (
+                parallel_layout.bandwidth(database.system_spec, communication_group, world)
+                if parallel_layout is not None
+                else get_p2p_bandwidth(database.system_spec, world)
+            )
             sol_time = data_bytes / bandwidth * 1000
             return sol_time, 0.0, sol_time
 
@@ -1211,6 +1236,22 @@ class MoEDispatch(Operation):
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         num_tokens = kwargs.get("x")
+        parallel_layout = getattr(self, "_parallel_layout", None)
+        if parallel_layout is not None:
+            database = CommunicationDatabaseView(
+                database, parallel_layout, getattr(self, "_communication_group", "moe_tp_ep")
+            )
+
+        def query_nccl(group: str, *args):
+            if parallel_layout is None:
+                return database.query_nccl(*args)
+            return database.query_nccl(*args, communication_group=group)
+
+        def query_custom_allreduce(group: str, *args):
+            if parallel_layout is None:
+                return database.query_custom_allreduce(*args)
+            return database.query_custom_allreduce(*args, communication_group=group)
+
         volume = num_tokens * self._hidden_size
         # Measured communication tables are collected at fixed dtypes. Only
         # formula-driven ANALYTICAL communication consumes these explicit
@@ -1222,7 +1263,9 @@ class MoEDispatch(Operation):
             comm_dtype = database._analytical_config.moe_communication_dtype(wideep=False, dispatch=self._pre_dispatch)
             wideep_dispatch_dtype = database._analytical_config.moe_communication_dtype(wideep=True, dispatch=True)
             wideep_combine_dtype = database._analytical_config.moe_communication_dtype(wideep=True, dispatch=False)
-        _sm_version = database.system_spec["gpu"].get("sm_version", -1)
+        from aiconfigurator_core.sdk.system_spec import is_sm100_spec
+
+        _is_sm100 = is_sm100_spec(database.system_spec)
         _num_gpus_per_node = database.system_spec["node"]["num_gpus_per_node"]
         _node_num = self.num_gpus / _num_gpus_per_node
 
@@ -1235,7 +1278,7 @@ class MoEDispatch(Operation):
             assert self._attention_tp_size == 1 or self._attention_dp_size == 1, (
                 "trtllm does not support TP>1 and DP>1 for attn simultaneously"
             )
-            if _sm_version == 100:
+            if _is_sm100:
                 logger.debug("MoEDispatch: In trtllm SM100 execution path")
 
                 _alltoall_backends = {"CUTLASS", "TRTLLM"}
@@ -1279,13 +1322,13 @@ class MoEDispatch(Operation):
                         comm_latency = float(dispatch_result)
                     elif self._attention_dp_size > 1:
                         all_gather_volume = (dispatch_x_volume + dispatch_sf_volume) * self._attention_dp_size
-                        comm_latency = database.query_nccl(comm_dtype, self.num_gpus, "all_gather", all_gather_volume)
+                        comm_latency = query_nccl("dp", comm_dtype, self.num_gpus, "all_gather", all_gather_volume)
                     elif self._attention_tp_size > 1:
                         if self._reduce_results:
                             if _num_gpus_per_node == 72 and self.num_gpus > 4:
-                                comm_latency = database.query_nccl(comm_dtype, self.num_gpus, "all_reduce", volume)
+                                comm_latency = query_nccl("tp", comm_dtype, self.num_gpus, "all_reduce", volume)
                             else:
-                                comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
+                                comm_latency = query_custom_allreduce("tp", comm_dtype, self.num_gpus, volume)
                         else:
                             comm_latency = 0
                     else:
@@ -1304,7 +1347,8 @@ class MoEDispatch(Operation):
                         )
                         comm_latency = float(combine_result)
                     elif self._attention_dp_size > 1:
-                        comm_latency = database.query_nccl(
+                        comm_latency = query_nccl(
+                            "dp",
                             comm_dtype,
                             self.num_gpus,
                             "reduce_scatter",
@@ -1313,9 +1357,9 @@ class MoEDispatch(Operation):
                     elif self._attention_tp_size > 1:
                         if self._reduce_results:
                             if _num_gpus_per_node == 72 and self.num_gpus > 4:
-                                comm_latency = database.query_nccl(comm_dtype, self.num_gpus, "all_reduce", volume)
+                                comm_latency = query_nccl("tp", comm_dtype, self.num_gpus, "all_reduce", volume)
                             else:
-                                comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
+                                comm_latency = query_custom_allreduce("tp", comm_dtype, self.num_gpus, volume)
                         else:
                             comm_latency = 0
                     else:
@@ -1325,9 +1369,10 @@ class MoEDispatch(Operation):
                 if self._pre_dispatch:
                     if self._attention_tp_size > 1:  # tp>1, use allreduce
                         # to do: custom allreduce
-                        comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
+                        comm_latency = query_custom_allreduce("tp", comm_dtype, self.num_gpus, volume)
                     elif self._attention_dp_size > 1:
-                        comm_latency = database.query_nccl(
+                        comm_latency = query_nccl(
+                            "dp",
                             comm_dtype,
                             self.num_gpus,
                             "all_gather",
@@ -1338,9 +1383,10 @@ class MoEDispatch(Operation):
                 else:
                     if self._attention_tp_size > 1:  # tp>1, use allreduce
                         # to do: custom allreduce
-                        comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
+                        comm_latency = query_custom_allreduce("tp", comm_dtype, self.num_gpus, volume)
                     elif self._attention_dp_size > 1:
-                        comm_latency = database.query_nccl(
+                        comm_latency = query_nccl(
+                            "dp",
                             comm_dtype,
                             self.num_gpus,
                             "reduce_scatter",
@@ -1357,10 +1403,11 @@ class MoEDispatch(Operation):
 
             # Add allreduce latency when TP > 1
             if self._attention_tp_size > 1:
-                comm_latency += database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
+                comm_latency += query_custom_allreduce("tp", comm_dtype, self.num_gpus, volume)
 
             if self._attention_dp_size > 1:
-                comm_latency += database.query_nccl(
+                comm_latency += query_nccl(
+                    "dp",
                     comm_dtype,
                     self.num_gpus,
                     "all_gather" if self._pre_dispatch else "reduce_scatter",
@@ -1397,13 +1444,15 @@ class MoEDispatch(Operation):
                 if self._pre_dispatch:
                     if combined_attention_tpdp:
                         # Matches SGLang DP attention: shard across attention TP, then gather across the full TP world.
-                        comm_latency = database.query_nccl(
+                        comm_latency = query_nccl(
+                            "tp",
                             comm_dtype,
                             self._attention_tp_size,
                             "reduce_scatter",
                             volume,
                         )
-                        comm_latency += database.query_nccl(
+                        comm_latency += query_nccl(
+                            "attention",
                             comm_dtype,
                             self.num_gpus,
                             "all_gather",
@@ -1413,7 +1462,7 @@ class MoEDispatch(Operation):
                         if self._is_context:
                             # prefill: tokens are CP-sharded across ranks -> all_gather
                             # to assemble the full token set for expert routing.
-                            comm_latency = database.query_nccl(comm_dtype, self.num_gpus, "all_gather", volume)
+                            comm_latency = query_nccl("cp", comm_dtype, self.num_gpus, "all_gather", volume)
                         else:
                             # decode: CP does not run; attention is replicated across the
                             # CP ranks so every rank already holds all tokens -> the
@@ -1421,9 +1470,10 @@ class MoEDispatch(Operation):
                             comm_latency = 0
                     elif self._attention_tp_size > 1:  # tp>1, use allreduce
                         # to do: custom allreduce
-                        comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
+                        comm_latency = query_custom_allreduce("tp", comm_dtype, self.num_gpus, volume)
                     elif self._attention_dp_size > 1:
-                        comm_latency = database.query_nccl(
+                        comm_latency = query_nccl(
+                            "dp",
                             comm_dtype,
                             self.num_gpus,
                             "all_gather",
@@ -1434,13 +1484,15 @@ class MoEDispatch(Operation):
                 else:
                     if combined_attention_tpdp:
                         # Reverse path: reduce-scatter across the full TP world, then rebuild each attention TP group.
-                        comm_latency = database.query_nccl(
+                        comm_latency = query_nccl(
+                            "attention",
                             comm_dtype,
                             self.num_gpus,
                             "reduce_scatter",
                             volume * self._attention_dp_size,
                         )
-                        comm_latency += database.query_nccl(
+                        comm_latency += query_nccl(
+                            "tp",
                             comm_dtype,
                             self._attention_tp_size,
                             "all_gather",
@@ -1449,17 +1501,18 @@ class MoEDispatch(Operation):
                     elif self._attn_cp_size > 1:
                         if self._is_context:
                             # prefill: scatter results back to the CP-sharded layout.
-                            comm_latency = database.query_nccl(comm_dtype, self.num_gpus, "reduce_scatter", volume)
+                            comm_latency = query_nccl("cp", comm_dtype, self.num_gpus, "reduce_scatter", volume)
                         else:
                             # decode: each rank computed its owned experts' partial outputs
                             # for all (replicated) tokens; combine into the full per-token
                             # sum every rank needs (next layer re-replicates) -> all_reduce.
-                            comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
+                            comm_latency = query_custom_allreduce("cp", comm_dtype, self.num_gpus, volume)
                     elif self._attention_tp_size > 1:  # tp>1, use allreduce
                         # to do: custom allreduce
-                        comm_latency = database.query_custom_allreduce(comm_dtype, self.num_gpus, volume)
+                        comm_latency = query_custom_allreduce("tp", comm_dtype, self.num_gpus, volume)
                     elif self._attention_dp_size > 1:
-                        comm_latency = database.query_nccl(
+                        comm_latency = query_nccl(
+                            "dp",
                             comm_dtype,
                             self.num_gpus,
                             "reduce_scatter",
@@ -1655,8 +1708,9 @@ class TrtLLMWideEPMoE(Operation):
         1. SM >= 100 (Blackwell) with fp8_block -> deepgemm (DeepGemm kernel)
         2. Otherwise -> moe_torch_flow (Cutlass kernel)
         """
-        sm_version = database.system_spec["gpu"]["sm_version"]
-        is_blackwell = sm_version >= 100
+        from aiconfigurator_core.sdk.system_spec import is_blackwell_spec
+
+        is_blackwell = is_blackwell_spec(database.system_spec)
 
         # Convert quant_mode to string for comparison if needed
         quant_mode_str = quant_mode.name if hasattr(quant_mode, "name") else str(quant_mode)
@@ -2135,15 +2189,16 @@ class TrtLLMWideEPMoEDispatch(Operation):
         if moe_backend is not None and moe_backend.upper() in {"DEEPGEMM", "CUTE_DSL"}:
             return "NotEnabled"
 
-        sm_version = database.system_spec["gpu"]["sm_version"]
         num_gpus_per_node = database.system_spec["node"]["num_gpus_per_node"]
         is_inter_node = moe_ep_size > num_gpus_per_node
         is_wideep = moe_backend is not None and moe_backend.upper() == "WIDEEP"
 
-        supports_mnnvl = sm_version >= 100
+        from aiconfigurator_core.sdk.system_spec import supports_mnnvl
+
+        has_mnnvl = supports_mnnvl(database.system_spec)
 
         if is_wideep:
-            if supports_mnnvl:
+            if has_mnnvl:
                 preferred = "NVLinkTwoSided"
             else:
                 deepep_feasible = moe_ep_size > 1 and topk <= 8
@@ -2154,7 +2209,7 @@ class TrtLLMWideEPMoEDispatch(Operation):
                 else:
                     preferred = "NotEnabled"
         else:
-            if supports_mnnvl:
+            if has_mnnvl:
                 preferred = "NVLinkOneSided"
             else:
                 preferred = "NotEnabled"
@@ -2192,6 +2247,8 @@ class TrtLLMWideEPMoEDispatch(Operation):
         node_num: int | None = None,
         database_mode: common.DatabaseMode | None = None,
         moe_backend: str | None = None,
+        parallel_layout=None,
+        communication_group: str | None = "moe_tp_ep",
     ) -> PerformanceResult | tuple[float, float, float]:
         """Verbatim port of legacy ``PerfDatabase.query_trtllm_alltoall``."""
         from aiconfigurator_core.sdk.perf_database import PerfDataNotAvailableError
@@ -2217,12 +2274,15 @@ class TrtLLMWideEPMoEDispatch(Operation):
               low-precision variant returns results in fp4 (0.5 B/elem).
               remote_ranks = min(topk, num_experts, ep_size - 1).
             """
-            is_inter_node = node_num > 1
+            from aiconfigurator_core.sdk.system_spec import get_p2p_bandwidth
 
-            if is_inter_node:
-                bw = database.system_spec["node"]["inter_node_bw"]
-            else:
-                bw = database.system_spec["node"]["intra_node_bw"]
+            # node_num is a legacy TRT-LLM table key derived with a 4-GPU-node
+            # convention. The real communication domain is moe_ep_size.
+            bw = (
+                parallel_layout.bandwidth(database.system_spec, communication_group, moe_ep_size)
+                if parallel_layout is not None
+                else get_p2p_bandwidth(database.system_spec, moe_ep_size)
+            )
 
             remote_ranks = min(topk, num_experts, moe_ep_size - 1)
 
@@ -2425,6 +2485,10 @@ class TrtLLMWideEPMoEDispatch(Operation):
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query TrtLLM WideEP All2All communication latency."""
+        if getattr(self, "_parallel_layout", None) is not None:
+            database = CommunicationDatabaseView(
+                database, self._parallel_layout, getattr(self, "_communication_group", "moe_tp_ep")
+            )
         num_tokens = kwargs.get("x")
 
         phase = "Pre-dispatch" if self._pre_dispatch else "Post-dispatch"
@@ -2460,6 +2524,8 @@ class TrtLLMWideEPMoEDispatch(Operation):
                 quant_mode=self._quant_mode,
                 moe_backend="wideep",
                 node_num=self._node_num,
+                parallel_layout=getattr(self, "_parallel_layout", None),
+                communication_group=getattr(self, "_communication_group", "moe_tp_ep"),
             )
             dispatch_result = database.query_trtllm_alltoall(
                 op_name="alltoall_dispatch",
@@ -2471,6 +2537,8 @@ class TrtLLMWideEPMoEDispatch(Operation):
                 quant_mode=self._quant_mode,
                 moe_backend="wideep",
                 node_num=self._node_num,
+                parallel_layout=getattr(self, "_parallel_layout", None),
+                communication_group=getattr(self, "_communication_group", "moe_tp_ep"),
             )
             comm_latency = _as_performance_result(prepare_result) + _as_performance_result(dispatch_result)
         else:
@@ -2485,6 +2553,8 @@ class TrtLLMWideEPMoEDispatch(Operation):
                 quant_mode=self._quant_mode,
                 moe_backend="wideep",
                 node_num=self._node_num,
+                parallel_layout=getattr(self, "_parallel_layout", None),
+                communication_group=getattr(self, "_communication_group", "moe_tp_ep"),
             )
             comm_latency = _as_performance_result(combine_result)
 

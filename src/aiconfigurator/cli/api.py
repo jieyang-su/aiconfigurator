@@ -172,6 +172,7 @@ def cli_default(
     analytical_moe_combine_dtype: str = "half",
     analytical_wideep_dispatch_dtype: str = "half",
     analytical_wideep_combine_dtype: str = "half",
+    communication_placement: str = "independent",
     isl: int = 4000,
     osl: int = 1000,
     image_height: int = 0,
@@ -308,6 +309,7 @@ def cli_default(
         analytical_moe_combine_dtype=analytical_moe_combine_dtype,
         analytical_wideep_dispatch_dtype=analytical_wideep_dispatch_dtype,
         analytical_wideep_combine_dtype=analytical_wideep_combine_dtype,
+        communication_placement=communication_placement,
         isl=isl,
         osl=osl,
         image_height=image_height,
@@ -412,6 +414,7 @@ def cli_recommend(
     analytical_moe_combine_dtype: str = "half",
     analytical_wideep_dispatch_dtype: str = "half",
     analytical_wideep_combine_dtype: str = "half",
+    communication_placement: str = "independent",
     isl: int = 4000,
     osl: int = 1000,
     image_height: int = 0,
@@ -537,6 +540,7 @@ def cli_recommend(
         analytical_moe_combine_dtype=analytical_moe_combine_dtype,
         analytical_wideep_dispatch_dtype=analytical_wideep_dispatch_dtype,
         analytical_wideep_combine_dtype=analytical_wideep_combine_dtype,
+        communication_placement=communication_placement,
         isl=isl,
         osl=osl,
         image_height=image_height,
@@ -972,6 +976,7 @@ def cli_estimate(
     analytical_moe_combine_dtype: str = "half",
     analytical_wideep_dispatch_dtype: str = "half",
     analytical_wideep_combine_dtype: str = "half",
+    communication_placement: str = "independent",
     isl: int = 1024,
     osl: int = 1024,
     image_height: int = 0,
@@ -1216,6 +1221,7 @@ def cli_estimate(
                 "moe_combine_dtype": analytical_moe_combine_dtype,
                 "wideep_dispatch_dtype": analytical_wideep_dispatch_dtype,
                 "wideep_combine_dtype": analytical_wideep_combine_dtype,
+                "communication_placement": communication_placement,
             }
         if active_systems_paths is not None:
             database_kwargs["systems_paths"] = active_systems_paths
@@ -1258,6 +1264,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            communication_placement=communication_placement,
             nextn=nextn,
             nextn_accepted=nextn_accepted,
             stride=stride,
@@ -1292,6 +1299,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            communication_placement=communication_placement,
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
@@ -1360,6 +1368,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            communication_placement=communication_placement,
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
@@ -1415,6 +1424,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            communication_placement=communication_placement,
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
@@ -1458,6 +1468,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            communication_placement=communication_placement,
             nextn=nextn,
             nextn_accepted=nextn_accepted,
             stride=stride,
@@ -1517,6 +1528,7 @@ def _run_agg_estimate(
     prefix: int = 0,
     nextn: int = 0,
     nextn_accepted: float | None = None,
+    communication_placement: str = "independent",
 ) -> EstimateResult:
     """Run aggregated (IFB) estimation."""
     from aiconfigurator.sdk.config import RuntimeConfig
@@ -1538,6 +1550,7 @@ def _run_agg_estimate(
         moe_quant_mode,
         comm_quant_mode,
         enable_encoder_dp=enable_encoder_dp,
+        communication_placement=communication_placement,
     )
     _apply_nextn(model_config, nextn)
     # Agg workers run context attention → resolve fmha against the perf data
@@ -1648,6 +1661,7 @@ def _run_static_estimate(
     load_database,
     get_backend,
     get_model,
+    communication_placement: str = "independent",
 ) -> EstimateResult:
     """Run a single-pass static-batching estimation.
 
@@ -1678,6 +1692,7 @@ def _run_static_estimate(
         moe_quant_mode,
         comm_quant_mode,
         enable_encoder_dp=enable_encoder_dp,
+        communication_placement=communication_placement,
     )
     _apply_nextn(model_config, nextn)
     # static / static_ctx run context attention; static_gen is generation-only
@@ -1796,6 +1811,7 @@ def _run_disagg_estimate(
     nextn: int = 0,
     nextn_accepted: float | None = None,
     free_gpu_memory_fraction: float | None = None,
+    communication_placement: str = "independent",
 ) -> EstimateResult:
     """Run disaggregated estimation."""
     from aiconfigurator.sdk.config import RuntimeConfig
@@ -1829,6 +1845,7 @@ def _run_disagg_estimate(
         moe_quant_mode,
         comm_quant_mode,
         enable_encoder_dp=enable_encoder_dp,
+        communication_placement=communication_placement,
     )
     decode_model_config = _build_model_config(
         decode_tp_size,
@@ -1842,6 +1859,7 @@ def _run_disagg_estimate(
         moe_quant_mode,
         comm_quant_mode,
         enable_encoder_dp=enable_encoder_dp,
+        communication_placement=communication_placement,
     )
     # Apply common nextn/MTP overrides to *both* prefill and decode worker
     # configs so a single ``--nextn N`` reaches each side of the disagg pair.
@@ -2085,6 +2103,7 @@ def _run_afd_estimate(
     prefix: int = 0,
     nextn: int = 0,
     nextn_accepted: float | None = None,
+    communication_placement: str = "independent",
 ) -> EstimateResult:
     """Run AFD (Attention-FFN Disaggregated) estimation.
 
@@ -2137,6 +2156,7 @@ def _run_afd_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        communication_placement=communication_placement,
     )
     f_model_config = _build_model_config(
         f_tp_size,
@@ -2149,6 +2169,7 @@ def _run_afd_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        communication_placement=communication_placement,
     )
     # Pass speculative decode knobs through to A/F model configs. TODO:
     # AFDTransfer still models committed decode-token volume only; recalibrate

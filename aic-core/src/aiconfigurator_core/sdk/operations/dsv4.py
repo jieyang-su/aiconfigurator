@@ -1806,11 +1806,12 @@ class DeepSeekV4MegaMoEModule(Operation):
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query measured MegaMoE routed-module latency."""
-        sm_version = int(database.system_spec.get("gpu", {}).get("sm_version", -1))
-        if sm_version < 100:
+        from aiconfigurator_core.sdk.system_spec import is_blackwell_spec
+
+        if not is_blackwell_spec(database.system_spec):
             raise ValueError(
                 "DeepSeek-V4 MegaMoE is only supported on Blackwell-class GPUs "
-                f"(SM >= 100); got sm_version={sm_version}."
+                "with the NVIDIA-specific MegaMoE backend."
             )
 
         # DSv4 MegaMoE perf rows are indexed by local-rank tokens. Do not

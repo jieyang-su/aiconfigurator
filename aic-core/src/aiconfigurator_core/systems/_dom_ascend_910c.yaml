@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 AIC contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Domestic GPU estimate-only system profile.
+# SM-level fields are copied from H100 because Ascend-910C details are not
+# available in the source description. This is not an ISA compatibility claim.
+
+data_dir: data/_dom_ascend_910c
+gpu:
+  mem_bw: 3200000000000 # 3.2TB/s
+  mem_bw_empirical_scaling_factor: 0.8 # provisional generic correction
+  mem_empirical_constant_latency: 0.000003 # 3us provisional estimate
+  mem_capacity: 137438953472 # 128GiB; source description says 128GB
+  # AIC has no separate FP16 tensor-core field. The supplied FP16 peak is
+  # represented through BF16 for compatibility with the model API only.
+  bfloat16_tc_flops: 800000000000000 # 800TFLOPS FP16, compatibility proxy
+  power: 700 # provisional H100 proxy; Ascend board power not provided
+  sm_version: 90 # H100 proxy, not an Ascend ISA claim
+  architecture_family: domestic
+  capability_overrides:
+    fp8_mma: false
+    fp4_mma: false
+    mnnvl: false
+  sm_count: 132 # H100 proxy for analytical kernelsim
+  clock_hz: 1830000000 # H100 proxy
+  shared_memory_per_sm_bytes: 262144 # H100 proxy
+  l2_capacity_bytes: 52428800 # H100 proxy
+  l2_bandwidth_bytes_s: 9369600000000 # H100 proxy
+  vector_peak_flops: 123724800000000 # H100 proxy
+
+node:
+  topology_scope: single_supernode
+  num_gpus_per_node: 384 # Ascend-910C supernode size
+  inter_node_bw: 0 # cross-supernode link not modeled
+  intra_node_bw: 392000000000 # 392GB/s per GPU within the supernode
+  pcie_bw: 64000000000 # H100 proxy; host link not provided
+  p2p_latency: 0.00001 # provisional H100 proxy
+
+misc:
+  nccl_mem:
+    1: 0
+    2: 358612992
+    4: 411041792
+    8: 411041792
+  other_mem: 3758096384
+  nccl_version: '2.27.3' # placeholder; no domestic collective backend data yet

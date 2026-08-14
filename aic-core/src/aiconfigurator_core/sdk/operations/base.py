@@ -230,6 +230,11 @@ class Operation:
         """Return latency (scaled by ``scale_factor``) plus energy/source data."""
         raise NotImplementedError
 
+    def set_parallel_layout(self, layout, group: str | None = None) -> None:
+        """Bind immutable communication placement metadata to this op."""
+        self._parallel_layout = layout
+        self._communication_group = group
+
     def get_weights(self, **kwargs):
         raise NotImplementedError
 
@@ -275,6 +280,53 @@ class Operation:
         NOT on a cache hit. The instrumentation lets tests assert which op
         classes loaded for a given model run."""
         Operation._load_data_call_count[cls] += 1
+
+
+class CommunicationDatabaseView:
+    """Read-only database facade that annotates formula communication queries.
+
+    MoE dispatch/combine contains backend-specific query branches. Passing this
+    facade through those branches avoids mutating the shared PerfDatabase while
+    preserving every non-communication database method unchanged.
+    """
+
+    def __init__(self, database, parallel_layout, communication_group: str | None):
+        self._database = database
+        self._parallel_layout = parallel_layout
+        self._communication_group = communication_group
+
+    def __getattr__(self, name):
+        return getattr(self._database, name)
+
+    def query_custom_allreduce(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_custom_allreduce(*args, **kwargs)
+
+    def query_nccl(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_nccl(*args, **kwargs)
+
+    def query_p2p(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_p2p(*args, **kwargs)
+
+    def query_wideep_deepep_ll(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_wideep_deepep_ll(*args, **kwargs)
+
+    def query_wideep_deepep_normal(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_wideep_deepep_normal(*args, **kwargs)
+
+    def query_trtllm_alltoall(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_trtllm_alltoall(*args, **kwargs)
 
 
 def _all_operation_subclasses(root: type = Operation) -> set[type]:

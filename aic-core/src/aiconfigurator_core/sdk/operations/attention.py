@@ -221,7 +221,9 @@ def generation_attn_mode(system_spec: dict, kvcache_quant_mode: common.KVCacheQu
     under the strict per-dtype resolution. The single home for the derivation
     rule (mirrors Rust ``perf_database::attention::generation_attn_mode``).
     """
-    has_fp8_mma = (system_spec["gpu"].get("sm_version") or -1) >= 89
+    from aiconfigurator_core.sdk.system_spec import supports_fp8_mma
+
+    has_fp8_mma = supports_fp8_mma(system_spec)
     if kvcache_quant_mode == common.KVCacheQuantMode.fp8 and has_fp8_mma:
         return common.FMHAQuantMode.fp8
     return common.FMHAQuantMode.bfloat16

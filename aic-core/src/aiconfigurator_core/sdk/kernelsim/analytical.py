@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 _LEVELS = frozenset({"standard", "low", "high"})
 _FP8_GEMM_RECIPES = frozenset({"sglang", "deepgemm-hopper", "deepgemm-blackwell"})
 _COMMUNICATION_DTYPES = frozenset({"half", "fp8", "int8"})
+_COMMUNICATION_PLACEMENTS = frozenset({"independent", "tp_first"})
 
 
 @dataclass(frozen=True)
@@ -57,12 +58,14 @@ class AnalyticalConfig:
     moe_combine_dtype: str = "half"
     wideep_dispatch_dtype: str = "half"
     wideep_combine_dtype: str = "half"
+    communication_placement: str = "independent"
 
     def __post_init__(self) -> None:
         level = self.level.strip().lower()
         recipe = self.fp8_gemm_recipe.strip().lower().replace("_", "-")
         algorithm = self.attention_algorithm.strip().lower()
         communication_mode = self.communication_mode.strip().lower()
+        communication_placement = self.communication_placement.strip().lower()
         communication_dtypes = {
             "moe_dispatch_dtype": self.moe_dispatch_dtype.strip().lower(),
             "moe_combine_dtype": self.moe_combine_dtype.strip().lower(),
@@ -79,6 +82,8 @@ class AnalyticalConfig:
             raise ValueError("sparse attention head quantum must be omitted, 64, or 128")
         if communication_mode not in {"empirical", "silicon"}:
             raise ValueError("analytical communication mode must be empirical or silicon")
+        if communication_placement not in _COMMUNICATION_PLACEMENTS:
+            raise ValueError("communication placement must be independent or tp_first")
         for name, dtype in communication_dtypes.items():
             if dtype not in _COMMUNICATION_DTYPES:
                 raise ValueError(f"{name} must be half, fp8, or int8")
@@ -86,6 +91,7 @@ class AnalyticalConfig:
         object.__setattr__(self, "fp8_gemm_recipe", recipe)
         object.__setattr__(self, "attention_algorithm", algorithm)
         object.__setattr__(self, "communication_mode", communication_mode)
+        object.__setattr__(self, "communication_placement", communication_placement)
         for name, dtype in communication_dtypes.items():
             object.__setattr__(self, name, dtype)
 

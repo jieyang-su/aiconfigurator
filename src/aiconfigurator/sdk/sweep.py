@@ -52,6 +52,7 @@ from aiconfigurator.sdk.picking import parallel_dim, worker_gpus
 from aiconfigurator.sdk.predict import predict_agg_worker, predict_disagg_worker
 from aiconfigurator.sdk.speculative import SpeculativeDecodingProfile
 from aiconfigurator.sdk.utils import enumerate_ttft_tpot_constraints
+from aiconfigurator_core.sdk.system_spec import validate_parallelism
 
 logger = logging.getLogger(__name__)
 
@@ -449,6 +450,15 @@ def sweep_agg(
                 attention_dp_size=dp_size,
                 cp_size=cp_size,
             )
+            validate_parallelism(
+                database.system_spec,
+                tp=tp_size,
+                pp=pp_size,
+                attention_dp=dp_size,
+                cp=cp_size,
+                moe_tp=moe_tp_size,
+                moe_ep=moe_ep_size,
+            )
 
             # Build backend + model ONCE per parallel choice so the backend's
             # internal _agg_cache survives across the tpot sweep below.
@@ -595,6 +605,15 @@ def _get_disagg_worker_candidates(
                 moe_ep_size=moe_ep_size,
                 attention_dp_size=dp_size,
                 cp_size=cp_size,
+            )
+            validate_parallelism(
+                database.system_spec,
+                tp=tp_size,
+                pp=pp_size,
+                attention_dp=dp_size,
+                cp=cp_size,
+                moe_tp=moe_tp_size,
+                moe_ep=moe_ep_size,
             )
 
             model = get_model(model_path=model_path, model_config=point_mc, backend_name=backend_name)

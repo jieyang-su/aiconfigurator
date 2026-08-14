@@ -48,7 +48,6 @@ from aiconfigurator.sdk.models import (
 from aiconfigurator.sdk.perf_database import (
     get_latest_database_version,
     is_blackwell_system,
-    is_hopper_system,
     load_system_spec,
 )
 from aiconfigurator.sdk.speculative import (
@@ -56,6 +55,7 @@ from aiconfigurator.sdk.speculative import (
     normalize_speculative_decoding,
 )
 from aiconfigurator.sdk.utils import enumerate_parallel_config, get_model_config_from_model_path
+from aiconfigurator_core.sdk.system_spec import supports_fp4_mma
 
 logger = logging.getLogger(__name__)
 
@@ -491,6 +491,7 @@ class Task:
     analytical_moe_combine_dtype: str = "half"
     analytical_wideep_dispatch_dtype: str = "half"
     analytical_wideep_combine_dtype: str = "half"
+    communication_placement: Literal["independent", "tp_first"] = "independent"
     # Fine-grained HYBRID/EMPIRICAL transfer control: which empirical transfer kinds are
     # permitted (see common.TransferKind). None = all (default). Accepts a preset name
     # ("conservative"/"balanced"/"aggressive"/"off"), a kind ("xshape"), or a list thereof.
@@ -816,10 +817,10 @@ class Task:
         for role in roles:
             model = self._role_attr(role, "model_path")
             replacement = _DEEPSEEK_V4_NATIVE_FP4_TO_FP8_MODEL.get(model)
-            if replacement and is_hopper_system(self._role_attr(role, "system_name")):
+            if replacement and not supports_fp4_mma(load_system_spec(self._role_attr(role, "system_name"))):
                 raise ValueError(
                     f"{model} uses native FP4 routed-expert weights and is not supported on "
-                    f"Hopper systems. Use {replacement} instead."
+                    f"a system without FP4 tensor-core support. Use {replacement} instead."
                 )
 
     def _check_prefix_discipline(self) -> None:
@@ -1188,8 +1189,7 @@ class Task:
             return False
         return any(self._large_pipeline_system_supported(system) for system in systems)
 
-    @staticmethod
-    def _large_pipeline_system_supported(system: str) -> bool:
+    def _large_pipeline_system_supported(self, system: str) -> bool:
         # H100's 80-GiB memory requires PP for V3.2-class models. A worker may
         # span multiple 8-GPU nodes: the system spec and communication ops
         # already model inter-node bandwidth/latency. H200 remains on the
@@ -1228,6 +1228,24 @@ class Task:
     def _apply_total_gpus_budget(self) -> None:
         """Clamp the per-worker GPU-count search space to the total_gpus budget and
         validate it. Mirrors v1 _finalize_agg / _finalize_disagg."""
+        roles = ["agg"] if self.serving_mode in ("agg", "afd") else ["prefill", "decode"]
+        single_supernode_caps = []
+        for role in roles:
+            system = self._role_attr(role, "system_name")
+            if not system:
+                continue
+            node_spec = load_system_spec(system).get("node", {})
+            if node_spec.get("topology_scope") == "single_supernode":
+                single_supernode_caps.append(int(node_spec["num_gpus_per_node"]))
+        if single_supernode_caps:
+            capacity = min(single_supernode_caps)
+            if self.total_gpus is None:
+                self.total_gpus = capacity
+            elif self.total_gpus > capacity:
+                raise ValueError(
+                    f"total_gpus={self.total_gpus} exceeds the active single-supernode "
+                    f"deployment capacity {capacity}."
+                )
         if self.total_gpus is None:
             return
         if self.serving_mode == "agg":
@@ -1351,6 +1369,13 @@ class Task:
                 "AFD requires a valid system yaml spec."
             )
         self._afd_gpus_per_node = gpus_per_node
+        afd_spec = load_system_spec(self.system_name)
+        if afd_spec.get("node", {}).get("topology_scope") == "single_supernode":
+            raise ValueError(
+                "AFD is not supported for single-supernode systems: its current "
+                "node-granular A/F placement requires at least two communication domains, "
+                f"while {self.system_name!r} intentionally models no cross-supernode link."
+            )
 
         pinned_fields = {
             "afd_n_a_nodes": self.afd_n_a_nodes,
@@ -1561,6 +1586,7 @@ class Task:
             # None means "unspecified" -> fall back to flashinfer (matches v1 and ModelConfig's default).
             attention_backend=self.attention_backend or "flashinfer",
             wideep_num_slots=self.wideep_num_slots,
+            communication_placement=self.communication_placement,
         )
 
     def build_speculative_profile(self) -> SpeculativeDecodingProfile:
@@ -1577,6 +1603,14 @@ class Task:
 
         def _cands(dim: str) -> list[int]:
             return getattr(self, f"{prefix}{dim}_candidates")
+
+        system_spec = load_system_spec(self._role_attr(role, "system_name"))
+        node_spec = system_spec.get("node", {})
+        single_supernode_gpus = (
+            int(node_spec["num_gpus_per_node"])
+            if node_spec.get("topology_scope") == "single_supernode"
+            else None
+        )
 
         # CP is modeled for context/prefill only; decode must be cp=1. Fail loud
         # rather than silently coercing a user-supplied decode cp>1.
@@ -1600,6 +1634,7 @@ class Task:
                 backend=common.BackendName[self._role_attr(role, "backend_name")],
                 enable_wideep=self._role_attr(role, "enable_wideep"),
                 moe_backend=self.moe_backend,
+                single_supernode_gpus=single_supernode_gpus,
             )
         )
 
@@ -1648,7 +1683,29 @@ class Task:
             self._validate_afd()
         else:
             raise ValueError(f"Invalid serving_mode: {self.serving_mode!r}")
+        self._validate_single_supernode()
         self._validate_database_quant_modes()
+
+    def _validate_single_supernode(self) -> None:
+        roles = ["agg"] if self.serving_mode in ("agg", "afd") else ["prefill", "decode"]
+        for role in roles:
+            system = self._role_attr(role, "system_name")
+            if not system:
+                continue
+            node_spec = load_system_spec(system).get("node", {})
+            if node_spec.get("topology_scope") != "single_supernode":
+                continue
+            capacity = int(node_spec["num_gpus_per_node"])
+            if self.effective_total_gpus is not None and self.effective_total_gpus > capacity:
+                raise ValueError(
+                    f"total_gpus={self.effective_total_gpus} exceeds the single-supernode capacity "
+                    f"{capacity} for system {system!r}."
+                )
+            if self.serving_mode != "afd" and not list(self.iter_parallel(role)):
+                raise ValueError(
+                    f"No {role} parallel configuration fits the single-supernode capacity "
+                    f"{capacity} for system {system!r}."
+                )
 
     def _validate_agg(self) -> None:
         if not self.model_path:
@@ -2122,6 +2179,7 @@ class Task:
                 "moe_combine_dtype": self.analytical_moe_combine_dtype,
                 "wideep_dispatch_dtype": self.analytical_wideep_dispatch_dtype,
                 "wideep_combine_dtype": self.analytical_wideep_combine_dtype,
+                "communication_placement": self.communication_placement,
             }
         return get_database_view(
             system,

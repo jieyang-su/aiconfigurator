@@ -11,6 +11,7 @@ import torch
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.operations import MoEDispatch, PerformanceResult
 from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig
+from aiconfigurator_core.sdk.system_spec import ParallelLayout
 
 pytestmark = pytest.mark.unit
 
@@ -45,6 +46,7 @@ def _make_dispatch(
     hidden_size=7168,
     topk=8,
     num_experts=256,
+    attn_cp_size=1,
 ):
     """Helper to build MoEDispatch with given parallelism config."""
     return MoEDispatch(
@@ -60,6 +62,7 @@ def _make_dispatch(
         quant_mode=quant_mode,
         moe_backend=moe_backend,
         reduce_results=reduce_results,
+        attn_cp_size=attn_cp_size,
     )
 
 
@@ -497,6 +500,61 @@ class TestSGLangNonDeepEPAttentionTpDp:
             ]
         )
         db.query_custom_allreduce.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("pre_dispatch", "expected_groups"),
+        [
+            (True, ["tp", "attention"]),
+            (False, ["attention", "tp"]),
+        ],
+    )
+    def test_combined_path_propagates_placement_groups(self, pre_dispatch, expected_groups):
+        db = _make_mock_db(sm_version=90, backend="sglang")
+        db.query_nccl.side_effect = [PerformanceResult(2.0), PerformanceResult(3.0)]
+        dispatch = _make_dispatch(
+            moe_tp_size=4,
+            moe_ep_size=2,
+            attention_dp_size=2,
+            pre_dispatch=pre_dispatch,
+        )
+        layout = ParallelLayout(tp=4, dp=2, moe_tp=4, moe_ep=2, policy="tp_first")
+        dispatch.set_parallel_layout(layout, "moe_tp_ep")
+
+        dispatch.query(db, x=16)
+
+        assert [query.kwargs["communication_group"] for query in db.query_nccl.call_args_list] == expected_groups
+        assert all(query.kwargs["parallel_layout"] is layout for query in db.query_nccl.call_args_list)
+
+
+@pytest.mark.skipif(torch.xpu.is_available(), reason="skip for xpu")
+class TestSGLangPlacementGroups:
+    def test_dp_path_propagates_dp_group(self):
+        db = _make_mock_db(sm_version=90, backend="sglang")
+        dispatch = _make_dispatch(moe_tp_size=1, moe_ep_size=8, attention_dp_size=8, pre_dispatch=True)
+        layout = ParallelLayout(tp=1, dp=8, moe_tp=1, moe_ep=8, policy="tp_first")
+        dispatch.set_parallel_layout(layout, "moe_tp_ep")
+
+        dispatch.query(db, x=16)
+
+        assert db.query_nccl.call_args.kwargs["communication_group"] == "dp"
+        assert db.query_nccl.call_args.kwargs["parallel_layout"] is layout
+
+    def test_cp_path_propagates_cp_group(self):
+        db = _make_mock_db(sm_version=90, backend="sglang")
+        dispatch = _make_dispatch(
+            moe_tp_size=1,
+            moe_ep_size=4,
+            attention_dp_size=1,
+            pre_dispatch=True,
+            attn_cp_size=4,
+        )
+        layout = ParallelLayout(tp=4, cp=4, moe_tp=1, moe_ep=4, policy="tp_first")
+        dispatch.set_parallel_layout(layout, "moe_tp_ep")
+
+        dispatch.query(db, x=16)
+
+        assert db.query_nccl.call_args.kwargs["communication_group"] == "cp"
+        assert db.query_nccl.call_args.kwargs["parallel_layout"] is layout
 
 
 @pytest.mark.skipif(torch.xpu.is_available(), reason="skip for xpu")

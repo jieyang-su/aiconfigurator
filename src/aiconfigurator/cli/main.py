@@ -292,6 +292,14 @@ def _add_analytical_arguments(parser: argparse.ArgumentParser) -> None:
         choices=["empirical", "silicon"],
         default="empirical",
     )
+    parser.add_argument(
+        "--communication-placement",
+        "--analytical-communication-placement",
+        dest="communication_placement",
+        choices=["independent", "tp_first"],
+        default="independent",
+        help="Formula communication placement: legacy independent or TP-first logical layout.",
+    )
     for phase in ("moe-dispatch", "moe-combine", "wideep-dispatch", "wideep-combine"):
         parser.add_argument(
             f"--analytical-{phase}-dtype",
@@ -1523,6 +1531,7 @@ def build_default_tasks(
     analytical_moe_combine_dtype: str = "half",
     analytical_wideep_dispatch_dtype: str = "half",
     analytical_wideep_combine_dtype: str = "half",
+    communication_placement: str = "independent",
     isl: int = 4000,
     osl: int = 1000,
     image_height: int = 0,
@@ -1715,6 +1724,7 @@ def build_default_tasks(
         "analytical_moe_combine_dtype": analytical_moe_combine_dtype,
         "analytical_wideep_dispatch_dtype": analytical_wideep_dispatch_dtype,
         "analytical_wideep_combine_dtype": analytical_wideep_combine_dtype,
+        "communication_placement": communication_placement,
         "free_gpu_memory_fraction": free_gpu_memory_fraction,
         "max_seq_len": max_seq_len,
         "engine_step_backend": engine_step_backend,
@@ -2506,6 +2516,7 @@ def _run_estimate_mode(args):
         analytical_moe_combine_dtype=args.analytical_moe_combine_dtype,
         analytical_wideep_dispatch_dtype=args.analytical_wideep_dispatch_dtype,
         analytical_wideep_combine_dtype=args.analytical_wideep_combine_dtype,
+        communication_placement=args.communication_placement,
         isl=args.isl,
         osl=args.osl,
         image_height=args.image_height,
@@ -2817,6 +2828,7 @@ def _run_recommend(args) -> None:
             analytical_moe_combine_dtype=getattr(args, "analytical_moe_combine_dtype", "half"),
             analytical_wideep_dispatch_dtype=getattr(args, "analytical_wideep_dispatch_dtype", "half"),
             analytical_wideep_combine_dtype=getattr(args, "analytical_wideep_combine_dtype", "half"),
+            communication_placement=getattr(args, "communication_placement", "independent"),
             isl=args.isl,
             osl=args.osl,
             image_height=args.image_height,
@@ -2980,6 +2992,7 @@ def main(args):
             analytical_moe_combine_dtype=getattr(args, "analytical_moe_combine_dtype", "half"),
             analytical_wideep_dispatch_dtype=getattr(args, "analytical_wideep_dispatch_dtype", "half"),
             analytical_wideep_combine_dtype=getattr(args, "analytical_wideep_combine_dtype", "half"),
+            communication_placement=getattr(args, "communication_placement", "independent"),
             isl=args.isl,
             osl=args.osl,
             image_height=args.image_height,
