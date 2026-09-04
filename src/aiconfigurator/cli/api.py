@@ -170,7 +170,18 @@ def cli_default(
     backend: str = "trtllm",
     backend_version: str | None = None,
     database_mode: str = "SILICON",
+    pareto_algorithm: str = "v1",
     transfer_policy: str | list | None = None,
+    analytical_level: str = "standard",
+    analytical_fp8_gemm_recipe: str = "sglang",
+    analytical_attention_algorithm: str = "fa2",
+    analytical_sparse_attention_head_quantum: int | None = None,
+    analytical_communication_mode: str = "empirical",
+    analytical_moe_dispatch_dtype: str = "half",
+    analytical_moe_combine_dtype: str = "half",
+    analytical_wideep_dispatch_dtype: str = "half",
+    analytical_wideep_combine_dtype: str = "half",
+    communication_placement: str = "independent",
     isl: int = 4000,
     osl: int = 1000,
     image_height: int = 0,
@@ -188,7 +199,7 @@ def cli_default(
     nextn: int | str = 0,
     nextn_accepted: float | None = None,
     strict_sla: bool = False,
-    free_gpu_memory_fraction: float | None = None,
+    free_gpu_memory_fraction: float | None = 1.0,
     max_seq_len: int | None = None,
     top_n: int = 5,
     save_dir: str | None = None,
@@ -215,6 +226,8 @@ def cli_default(
         backend_version: Backend database version. Default is latest.
         database_mode: Database mode for performance estimation
             ('SILICON', 'HYBRID', 'EMPIRICAL', 'SOL'). Default is 'SILICON'.
+        analytical_communication_mode: Communication source when
+            ``database_mode='ANALYTICAL'``: empirical formula or silicon table.
         isl: Input sequence length. Default is 4000.
         osl: Output sequence length. Default is 1000.
         enable_encoder_dp: Model the vision encoder data-parallel (default True;
@@ -313,7 +326,18 @@ def cli_default(
         backend=backend,
         backend_version=backend_version,
         database_mode=database_mode,
+        pareto_algorithm=pareto_algorithm,
         transfer_policy=transfer_policy,
+        analytical_level=analytical_level,
+        analytical_fp8_gemm_recipe=analytical_fp8_gemm_recipe,
+        analytical_attention_algorithm=analytical_attention_algorithm,
+        analytical_sparse_attention_head_quantum=analytical_sparse_attention_head_quantum,
+        analytical_communication_mode=analytical_communication_mode,
+        analytical_moe_dispatch_dtype=analytical_moe_dispatch_dtype,
+        analytical_moe_combine_dtype=analytical_moe_combine_dtype,
+        analytical_wideep_dispatch_dtype=analytical_wideep_dispatch_dtype,
+        analytical_wideep_combine_dtype=analytical_wideep_combine_dtype,
+        communication_placement=communication_placement,
         isl=isl,
         osl=osl,
         image_height=image_height,
@@ -411,7 +435,18 @@ def cli_recommend(
     backend: str = "trtllm",
     backend_version: str | None = None,
     database_mode: str = "HYBRID",
+    pareto_algorithm: str = "v1",
     transfer_policy: str | list | None = None,
+    analytical_level: str = "standard",
+    analytical_fp8_gemm_recipe: str = "sglang",
+    analytical_attention_algorithm: str = "fa2",
+    analytical_sparse_attention_head_quantum: int | None = None,
+    analytical_communication_mode: str = "empirical",
+    analytical_moe_dispatch_dtype: str = "half",
+    analytical_moe_combine_dtype: str = "half",
+    analytical_wideep_dispatch_dtype: str = "half",
+    analytical_wideep_combine_dtype: str = "half",
+    communication_placement: str = "independent",
     isl: int = 4000,
     osl: int = 1000,
     image_height: int = 0,
@@ -547,7 +582,18 @@ def cli_recommend(
         backend=backend,
         backend_version=backend_version,
         database_mode=database_mode,
+        pareto_algorithm=pareto_algorithm,
         transfer_policy=transfer_policy,
+        analytical_level=analytical_level,
+        analytical_fp8_gemm_recipe=analytical_fp8_gemm_recipe,
+        analytical_attention_algorithm=analytical_attention_algorithm,
+        analytical_sparse_attention_head_quantum=analytical_sparse_attention_head_quantum,
+        analytical_communication_mode=analytical_communication_mode,
+        analytical_moe_dispatch_dtype=analytical_moe_dispatch_dtype,
+        analytical_moe_combine_dtype=analytical_moe_combine_dtype,
+        analytical_wideep_dispatch_dtype=analytical_wideep_dispatch_dtype,
+        analytical_wideep_combine_dtype=analytical_wideep_combine_dtype,
+        communication_placement=communication_placement,
         isl=isl,
         osl=osl,
         image_height=image_height,
@@ -1016,6 +1062,16 @@ def cli_estimate(
     backend_version: str | None = None,
     database_mode: str = "SILICON",
     transfer_policy: str | list | None = None,
+    analytical_level: str = "standard",
+    analytical_fp8_gemm_recipe: str = "sglang",
+    analytical_attention_algorithm: str = "fa2",
+    analytical_sparse_attention_head_quantum: int | None = None,
+    analytical_communication_mode: str = "empirical",
+    analytical_moe_dispatch_dtype: str = "half",
+    analytical_moe_combine_dtype: str = "half",
+    analytical_wideep_dispatch_dtype: str = "half",
+    analytical_wideep_combine_dtype: str = "half",
+    communication_placement: str = "independent",
     isl: int = 1024,
     osl: int = 1024,
     image_height: int = 0,
@@ -1277,6 +1333,19 @@ def cli_estimate(
             "database_mode": database_mode,
             "transfer_policy": transfer_policy,
         }
+        if database_mode.upper() == "ANALYTICAL":
+            database_kwargs["analytical_config"] = {
+                "level": analytical_level,
+                "fp8_gemm_recipe": analytical_fp8_gemm_recipe,
+                "attention_algorithm": analytical_attention_algorithm,
+                "sparse_attention_head_quantum": analytical_sparse_attention_head_quantum,
+                "communication_mode": analytical_communication_mode,
+                "moe_dispatch_dtype": analytical_moe_dispatch_dtype,
+                "moe_combine_dtype": analytical_moe_combine_dtype,
+                "wideep_dispatch_dtype": analytical_wideep_dispatch_dtype,
+                "wideep_combine_dtype": analytical_wideep_combine_dtype,
+                "communication_placement": communication_placement,
+            }
         if active_systems_paths is not None:
             database_kwargs["systems_paths"] = active_systems_paths
         db = get_database_view(
@@ -1318,6 +1387,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            communication_placement=communication_placement,
             nextn=nextn,
             nextn_accepted=nextn_accepted,
             stride=stride,
@@ -1354,6 +1424,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            communication_placement=communication_placement,
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
@@ -1429,6 +1500,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            communication_placement=communication_placement,
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
@@ -1491,6 +1563,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            communication_placement=communication_placement,
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
@@ -1535,6 +1608,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            communication_placement=communication_placement,
             nextn=nextn,
             nextn_accepted=nextn_accepted,
             stride=stride,
@@ -1597,6 +1671,7 @@ def _run_agg_estimate(
     prefix: int = 0,
     nextn: int = 0,
     nextn_accepted: float | None = None,
+    communication_placement: str = "independent",
 ) -> EstimateResult:
     """Run aggregated (IFB) estimation."""
     from aiconfigurator.sdk.config import RuntimeConfig
@@ -1619,7 +1694,7 @@ def _run_agg_estimate(
         comm_quant_mode,
         forward_model=forward_model,
         enable_encoder_dp=enable_encoder_dp,
-        attention_backend=attention_backend,
+        communication_placement=communication_placement,
     )
     _apply_nextn(model_config, nextn)
     # Agg workers run context attention → resolve fmha against the perf data
@@ -1732,8 +1807,7 @@ def _run_static_estimate(
     load_database,
     get_backend,
     get_model,
-    forward_model=None,
-    attention_backend: str | None = None,
+    communication_placement: str = "independent",
 ) -> EstimateResult:
     """Run a single-pass static-batching estimation.
 
@@ -1765,7 +1839,7 @@ def _run_static_estimate(
         comm_quant_mode,
         forward_model=forward_model,
         enable_encoder_dp=enable_encoder_dp,
-        attention_backend=attention_backend,
+        communication_placement=communication_placement,
     )
     _apply_nextn(model_config, nextn)
     database = load_database(system_name)
@@ -1905,11 +1979,7 @@ def _run_disagg_estimate(
     nextn: int = 0,
     nextn_accepted: float | None = None,
     free_gpu_memory_fraction: float | None = None,
-    prefill_free_gpu_memory_fraction: float | None = None,
-    decode_free_gpu_memory_fraction: float | None = None,
-    max_seq_len: int | None = None,
-    prefill_max_seq_len: int | None = None,
-    decode_max_seq_len: int | None = None,
+    communication_placement: str = "independent",
 ) -> EstimateResult:
     """Run disaggregated estimation."""
     from aiconfigurator.sdk.config import RuntimeConfig
@@ -1944,7 +2014,7 @@ def _run_disagg_estimate(
         comm_quant_mode,
         forward_model=forward_model,
         enable_encoder_dp=enable_encoder_dp,
-        attention_backend=attention_backend,
+        communication_placement=communication_placement,
     )
     decode_model_config = _build_model_config(
         decode_tp_size,
@@ -1959,7 +2029,7 @@ def _run_disagg_estimate(
         comm_quant_mode,
         forward_model=forward_model,
         enable_encoder_dp=enable_encoder_dp,
-        attention_backend=attention_backend,
+        communication_placement=communication_placement,
     )
     # Apply common nextn/MTP overrides to *both* prefill and decode worker
     # configs so a single ``--nextn N`` reaches each side of the disagg pair.
@@ -2245,6 +2315,7 @@ def _run_afd_estimate(
     prefix: int = 0,
     nextn: int = 0,
     nextn_accepted: float | None = None,
+    communication_placement: str = "independent",
 ) -> EstimateResult:
     """Run AFD (Attention-FFN Disaggregated) estimation.
 
@@ -2297,7 +2368,7 @@ def _run_afd_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
-        attention_backend=attention_backend,
+        communication_placement=communication_placement,
     )
     f_model_config = _build_model_config(
         f_tp_size,
@@ -2310,7 +2381,7 @@ def _run_afd_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
-        attention_backend=attention_backend,
+        communication_placement=communication_placement,
     )
     # Pass speculative decode knobs through to A/F model configs. TODO:
     # AFDTransfer still models committed decode-token volume only; recalibrate

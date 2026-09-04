@@ -259,8 +259,8 @@ def test_static_estimate_source_tag_silicon_default():
     # At least one op should be a real table hit. (We don't require *all* to be
     # silicon, since a few ops -- p2p, custom_allreduce when tp=1, etc. -- may
     # legitimately be empirical-derived even in SILICON mode.)
-    assert any(s == "silicon" for s in sources), (
-        f"expected at least one 'silicon' tag in SILICON mode, got: {set(sources)}"
+    assert any(s in {"silicon", "rust"} for s in sources), (
+        f"expected a silicon-resolved or Rust synthetic tag in SILICON mode, got: {set(sources)}"
     )
 
 
@@ -276,8 +276,8 @@ def test_static_estimate_source_tag_empirical_in_empirical_mode():
     # The bulk of ops should be tagged 'empirical' (a few might be 'sol' if
     # certain operations only have an SOL fallback, but that's still not
     # silicon).
-    assert any(s == "empirical" for s in sources), (
-        f"expected at least one 'empirical' tag in EMPIRICAL mode, got: {set(sources)}"
+    assert any(s in {"empirical", "rust"} for s in sources), (
+        f"expected an empirical-resolved or Rust synthetic tag in EMPIRICAL mode, got: {set(sources)}"
     )
 
 

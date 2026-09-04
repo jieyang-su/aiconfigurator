@@ -42,6 +42,10 @@ def _find_output_dir(save_dir: str) -> str:
 
 def _assert_dataframes_equal(api_df: pd.DataFrame, cli_df: pd.DataFrame, name: str) -> None:
     """Assert two DataFrames are equivalent (same data, allowing for floating point tolerance)."""
+    # Provenance is an in-memory object column. CLI persistence writes it to
+    # per-config JSON and deliberately strips it from the public CSV schema.
+    api_df = api_df.drop(columns=["_per_ops_source", "_task_key"], errors="ignore")
+    cli_df = cli_df.drop(columns=["_per_ops_source", "_task_key"], errors="ignore")
     if api_df.empty and cli_df.empty:
         return
 
@@ -71,10 +75,10 @@ def _assert_dataframes_equal(api_df: pd.DataFrame, cli_df: pd.DataFrame, name: s
                 atol=1e-10,
             )
         else:
-            # Non-numeric columns: exact match
+            # CSV round-tripping represents empty strings as NaN by default.
             pd.testing.assert_series_equal(
-                api_series,
-                cli_series,
+                api_series.fillna(""),
+                cli_series.fillna(""),
                 check_names=False,
                 check_dtype=False,
             )

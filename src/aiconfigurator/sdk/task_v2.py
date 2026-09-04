@@ -61,7 +61,6 @@ from aiconfigurator.sdk.operations.moe_comm import MOE_A2A_BACKENDS, nodes_for
 from aiconfigurator.sdk.perf_database import (
     get_latest_database_version,
     is_blackwell_system,
-    is_hopper_system,
     load_system_spec,
 )
 from aiconfigurator.sdk.performance_result import MOE_COMM_FALLBACKS_COLUMN, merge_moe_comm_fallbacks
@@ -71,6 +70,7 @@ from aiconfigurator.sdk.speculative import (
     normalize_speculative_decoding,
 )
 from aiconfigurator.sdk.utils import enumerate_parallel_config, get_model_config_from_model_path
+from aiconfigurator_core.sdk.system_spec import supports_fp4_mma
 
 logger = logging.getLogger(__name__)
 
@@ -132,10 +132,10 @@ def _default_cp_list_for(model_family: str, backend_name: str) -> list[int]:
 # Pareto frontier. Used when ``pareto_sweep=True`` (the default) so v2 matches v1.
 _LEGACY_TPOT_SWEEP: list[int] = list(range(1, 20, 1)) + list(range(20, 300, 5))
 
-# DeepSeek-V3.2 / V4 MoE on Blackwell get extra large-pipeline-parallel configs
-# (PP=2/TP=8/16-GPU). Mirrors v1 _LARGE_PIPELINE_PARALLEL_MODEL_FAMILIES (backends were
-# all three, i.e. unrestricted).
-_LARGE_PIPELINE_PARALLEL_MODEL_FAMILIES = {"DEEPSEEKV32", "DEEPSEEKV4"}
+# DeepSeek-V3.2 / V4-family MoE models need large pipeline-parallel candidates
+# on systems where the conservative 8-GPU/PP=1 template can exclude every
+# memory-feasible deployment. GLM-5.2 resolves to the DEEPSEEKV32 family.
+_LARGE_PIPELINE_PARALLEL_MODEL_FAMILIES = {"DEEPSEEKV32", "DEEPSEEKV4", "KIMIK3"}
 
 _QUANT_ENUM_TABLES: dict[str, type] = {
     "gemm_quant_mode": common.GEMMQuantMode,
@@ -576,9 +576,27 @@ class Task:
     # frontier (matches v1). Set False to evaluate only the single ``tpot`` target --
     # used by the Planner, where Pareto selection happens elsewhere.
     pareto_sweep: bool = True
+    # Keep the historical heuristic search as the default. ``v2`` selects the
+    # parallel, dominance-preserving PD-disaggregated Pareto implementation.
+    pareto_algorithm: Literal["v1", "v2"] = "v1"
     request_latency: float | None = None
     total_gpus: int | None = None
     database_mode: str | None = None
+    analytical_level: str = "standard"
+    analytical_fp8_gemm_recipe: str = "sglang"
+    analytical_attention_algorithm: str = "fa2"
+    analytical_sparse_attention_head_quantum: int | None = None
+    analytical_communication_mode: str = "empirical"
+    analytical_moe_dispatch_dtype: str = "half"
+    analytical_moe_combine_dtype: str = "half"
+    analytical_wideep_dispatch_dtype: str = "half"
+    analytical_wideep_combine_dtype: str = "half"
+    communication_placement: Literal["independent", "tp_first"] = "independent"
+    # MoE token distribution selects the matching silicon table slice and the
+    # corresponding analytical workload assumption. Keep the historical
+    # ModelConfig default while allowing reproducible experiments to request a
+    # measured distribution explicitly.
+    workload_distribution: str = "power_law"
     # Fine-grained HYBRID/EMPIRICAL transfer control: which empirical transfer kinds are
     # permitted (see common.TransferKind). None = all (default). Accepts a preset name
     # ("conservative"/"balanced"/"aggressive"/"off"), a kind ("xshape"), or a list thereof.
@@ -986,10 +1004,10 @@ class Task:
         for role in roles:
             model = self._role_attr(role, "model_path")
             replacement = _DEEPSEEK_V4_NATIVE_FP4_TO_FP8_MODEL.get(model)
-            if replacement and is_hopper_system(self._role_attr(role, "system_name")):
+            if replacement and not supports_fp4_mma(load_system_spec(self._role_attr(role, "system_name"))):
                 raise ValueError(
                     f"{model} uses native FP4 routed-expert weights and is not supported on "
-                    f"Hopper systems. Use {replacement} instead."
+                    f"a system without FP4 tensor-core support. Use {replacement} instead."
                 )
 
     def _check_prefix_discipline(self) -> None:
@@ -1654,13 +1672,7 @@ class Task:
         self._apply_total_gpus_budget()
 
     def _large_pipeline_parallel_applies(self) -> bool:
-        """v1 _large_pipeline_parallel_worker_defaults_apply: DeepSeek-V3.2/V4 MoE on
-        Blackwell with total_gpus>=16 get extra PP=2 / TP=8 / 16-GPU configs.
-
-        The wideep / deepep_moe exclusions are gone with the flags: large EP is
-        a per-tuple property now, and a PP>1 tuple simply finds no (ep, node)
-        comm data and stays fused. MegaMoE keeps its own parallel lists, so it
-        still opts out."""
+        """Whether at least one role needs large pipeline-parallel defaults."""
         if not self._is_moe or self._model_family not in _LARGE_PIPELINE_PARALLEL_MODEL_FAMILIES:
             return False
         if self.serving_mode == "agg":
@@ -1671,8 +1683,22 @@ class Task:
             return False
         if self.total_gpus is None or self.total_gpus < 16:
             return False
+        return any(self._large_pipeline_system_supported(system) for system in systems)
+
+    def _large_pipeline_system_supported(self, system: str) -> bool:
+        # H100's 80-GiB memory requires PP for V3.2-class models. A worker may
+        # span multiple 8-GPU nodes: the system spec and communication ops
+        # already model inter-node bandwidth/latency. H200 remains on the
+        # compact defaults because its 141-GiB memory has feasible PP=1 points.
+        # Kimi-K3 is substantially larger and needs cross-node candidates even
+        # on H200; all packaged systems can model that topology through their
+        # scale-out communication specification.
+        if self._model_family == "KIMIK3":
+            return True
+        if system == "h100_sxm":
+            return True
         try:
-            return all(is_blackwell_system(s) for s in systems)
+            return is_blackwell_system(system)
         except Exception:
             return False
 
@@ -1680,15 +1706,19 @@ class Task:
         if not self._large_pipeline_parallel_applies():
             return
         roles = ["agg"] if self.serving_mode == "agg" else ["prefill", "decode"]
-        merges = {
-            "num_gpu": [16],
-            "tp": [8],
-            "pp": [2],
-            "dp": [1],
-            "moe_tp": [1, 2, 4, 8],
-            "moe_ep": [1, 2, 4, 8],
-        }
         for role in roles:
+            system = self._role_attr(role, "system_name")
+            if not self._large_pipeline_system_supported(system):
+                continue
+            h100 = system == "h100_sxm"
+            merges = {
+                "num_gpu": [16, 32] if h100 else [16],
+                "tp": [8],
+                "pp": [2, 4] if h100 else [2],
+                "dp": [1],
+                "moe_tp": [1, 2, 4, 8],
+                "moe_ep": [1, 2, 4, 8],
+            }
             for dim, add in merges.items():
                 attr = f"{role}_{dim}_candidates"
                 if attr not in defaulted:
@@ -1699,6 +1729,24 @@ class Task:
     def _apply_total_gpus_budget(self) -> None:
         """Clamp the per-worker GPU-count search space to the total_gpus budget and
         validate it. Mirrors v1 _finalize_agg / _finalize_disagg."""
+        roles = ["agg"] if self.serving_mode in ("agg", "afd") else ["prefill", "decode"]
+        single_supernode_caps = []
+        for role in roles:
+            system = self._role_attr(role, "system_name")
+            if not system:
+                continue
+            node_spec = load_system_spec(system).get("node", {})
+            if node_spec.get("topology_scope") == "single_supernode":
+                single_supernode_caps.append(int(node_spec["num_gpus_per_node"]))
+        if single_supernode_caps:
+            capacity = min(single_supernode_caps)
+            if self.total_gpus is None:
+                self.total_gpus = capacity
+            elif self.total_gpus > capacity:
+                raise ValueError(
+                    f"total_gpus={self.total_gpus} exceeds the active single-supernode "
+                    f"deployment capacity {capacity}."
+                )
         if self.total_gpus is None:
             return
         if self.serving_mode == "agg":
@@ -1916,6 +1964,13 @@ class Task:
                 "AFD requires a valid system yaml spec."
             )
         self._afd_gpus_per_node = gpus_per_node
+        afd_spec = load_system_spec(self.system_name)
+        if afd_spec.get("node", {}).get("topology_scope") == "single_supernode":
+            raise ValueError(
+                "AFD is not supported for single-supernode systems: its current "
+                "node-granular A/F placement requires at least two communication domains, "
+                f"while {self.system_name!r} intentionally models no cross-supernode link."
+            )
 
         pinned_fields = {
             "afd_n_a_nodes": self.afd_n_a_nodes,
@@ -2140,28 +2195,13 @@ class Task:
             # moe_backend / attention_backend / wideep_num_slots are shared across roles
             # (Task has no per-role variant) and fed to ModelConfig so get_model selects the
             # right MoE kernel (deepep_moe / megamoe), MLA attention perf tables (fa3 vs
-            # flashinfer), and EPLB slot count. workload_distribution remains non-configurable
-            # in v2 and ModelConfig's default matches v1's.
-            #
-            # moe_backend="deepep_moe" is NOT forwarded: it used to select both the
-            # sglang wideEP model classes and the wideep MoE compute tables for the
-            # FUSED op. Large EP is coverage-driven per tuple now, so passing it on
-            # would make a fused tuple price itself off the large-EP tables. MegaMoE
-            # is a real DeepSeek-V4 kernel selection and passes through.
-            moe_backend=self.moe_backend if self.moe_backend != "deepep_moe" else None,
-            # None means "unspecified" and MUST stay None: the WideEP MLA ops apply
-            # their own "flashinfer" default, while dense attention (AIC-1715) reads
-            # this field as the kernel-LANE override — materializing a lane name here
-            # would silently pin every model to the flashinfer lane.
-            attention_backend=self.attention_backend,
+            # flashinfer), EPLB slot count, and explicit MoE token distribution.
+            workload_distribution=self.workload_distribution,
+            moe_backend=self.moe_backend,
+            # None means "unspecified" -> fall back to flashinfer (matches v1 and ModelConfig's default).
+            attention_backend=self.attention_backend or "flashinfer",
             wideep_num_slots=self.wideep_num_slots,
-            forward_model=self.forward_model or "op_level",
-            moe_comm_backend=None,
-            # Hardware fact, injected alongside the comm backend: the large-EP
-            # ops take the comm node span at construction and would otherwise
-            # have no channel to it (models.helpers.large_ep_gpus_per_node).
-            num_gpus_per_node=num_gpus_per_node,
-            system=self._role_attr(role, "system_name"),
+            communication_placement=self.communication_placement,
         )
         model_config._gemm_quant_mode_is_explicit = self._gemm_quant_mode_explicit_by_role.get(role, False)
         if parallel is not None:
@@ -2202,6 +2242,14 @@ class Task:
         def _cands(dim: str) -> list[int]:
             return getattr(self, f"{prefix}{dim}_candidates")
 
+        system_spec = load_system_spec(self._role_attr(role, "system_name"))
+        node_spec = system_spec.get("node", {})
+        single_supernode_gpus = (
+            int(node_spec["num_gpus_per_node"])
+            if node_spec.get("topology_scope") == "single_supernode"
+            else None
+        )
+
         # CP is modeled for context/prefill only; decode must be cp=1. Fail loud
         # rather than silently coercing a user-supplied decode cp>1.
         cp_list = _cands("cp") or [1]
@@ -2223,6 +2271,7 @@ class Task:
                 is_moe=self._is_moe,
                 backend=common.BackendName[self._role_attr(role, "backend_name")],
                 moe_backend=self.moe_backend,
+                single_supernode_gpus=single_supernode_gpus,
             )
         )
 
@@ -2261,24 +2310,11 @@ class Task:
             )
         if self.wideep_num_slots is not None and self.wideep_num_slots <= 0:
             raise ValueError(f"wideep_num_slots must be a positive integer, got {self.wideep_num_slots!r}.")
-        self._check_encoder_knobs_require_epd()
-        self._validate_rate_match_degradations()
-        if self.enable_epd:
-            for name in ("encoder_tp_candidates", "encoder_batch_candidates"):
-                values = getattr(self, name)
-                if values and any(not isinstance(v, int) or v <= 0 for v in values):
-                    raise ValueError(f"{name} must be a list of positive ints, got {values!r}.")
-            if self.encoder_batch_candidates:
-                from aiconfigurator.sdk.sweep import _MAX_ENCODER_BATCH
+        if self.pareto_algorithm not in {"v1", "v2"}:
+            raise ValueError("pareto_algorithm must be 'v1' or 'v2'")
+        if self.pareto_algorithm == "v2" and self.serving_mode != "disagg":
+            raise ValueError("pareto_algorithm='v2' is currently supported only for disagg serving")
 
-                if max(self.encoder_batch_candidates) > _MAX_ENCODER_BATCH:
-                    raise ValueError(
-                        f"encoder_batch_candidates must be <= {_MAX_ENCODER_BATCH} (SGLang's "
-                        f"SGLANG_ENCODER_MAX_BATCH_SIZE default), got {self.encoder_batch_candidates!r}."
-                    )
-            if self.max_encoder_workers is not None and self.max_encoder_workers <= 0:
-                raise ValueError(f"max_encoder_workers must be > 0, got {self.max_encoder_workers!r}.")
-            self._validate_epd_knob_values()
         if self.serving_mode == "agg":
             self._validate_agg()
         elif self.serving_mode == "disagg":
@@ -2287,32 +2323,29 @@ class Task:
             self._validate_afd()
         else:
             raise ValueError(f"Invalid serving_mode: {self.serving_mode!r}")
-        self._validate_sglang_wideep_attention_backend()
+        self._validate_single_supernode()
         self._validate_database_quant_modes()
 
-    def _validate_sglang_wideep_attention_backend(self) -> None:
-        """Reject dense-only attention backends when a role can reach WideEP.
-
-        SGLang's WideEP MLA operators accept only ``flashinfer`` and ``fa3``;
-        ``default`` means their established framework default (``flashinfer``).
-        The wider attention-lane vocabulary remains valid for tasks whose
-        enumerated tuples are all dense/fused.
-        """
-        if self.attention_backend in (None, "default", "flashinfer", "fa3"):
-            return
-        roles = ("agg",) if self.serving_mode in ("agg", "afd") else ("prefill", "decode")
+    def _validate_single_supernode(self) -> None:
+        roles = ["agg"] if self.serving_mode in ("agg", "afd") else ["prefill", "decode"]
         for role in roles:
-            if self._role_attr(role, "backend_name") != "sglang":
+            system = self._role_attr(role, "system_name")
+            if not system:
                 continue
-            if ("wideep_context_mla", "wideep_generation_mla") not in self._reachable_attention_op_keys(role):
+            node_spec = load_system_spec(system).get("node", {})
+            if node_spec.get("topology_scope") != "single_supernode":
                 continue
-            from aiconfigurator.sdk.errors import UnsupportedAttentionBackendError
-
-            raise UnsupportedAttentionBackendError(
-                f"SGLang WideEP MLA does not support attention_backend={self.attention_backend!r}; "
-                "supported values: ['fa3', 'flashinfer', 'default']. "
-                "Dense-only SGLang tasks may use the wider attention-backend vocabulary."
-            )
+            capacity = int(node_spec["num_gpus_per_node"])
+            if self.effective_total_gpus is not None and self.effective_total_gpus > capacity:
+                raise ValueError(
+                    f"total_gpus={self.effective_total_gpus} exceeds the single-supernode capacity "
+                    f"{capacity} for system {system!r}."
+                )
+            if self.serving_mode != "afd" and not list(self.iter_parallel(role)):
+                raise ValueError(
+                    f"No {role} parallel configuration fits the single-supernode capacity "
+                    f"{capacity} for system {system!r}."
+                )
 
     def _validate_agg(self) -> None:
         if not self.model_path:
@@ -2404,6 +2437,12 @@ class Task:
     ) -> None:
         """For one role, fetch its perf DB and verify each quant mode is supported."""
         from aiconfigurator.sdk.errors import UnsupportedWideepConfigError
+
+        # ANALYTICAL is explicitly table-free. KDA uses its calibrated model;
+        # the remaining current-branch operators use their SOL paths, so a
+        # support matrix describing collected tables is not an admission gate.
+        if self.database_mode == common.DatabaseMode.ANALYTICAL.name:
+            return
 
         system = self._role_attr(role, "system_name")
         backend = self._role_attr(role, "backend_name")
@@ -2860,6 +2899,20 @@ class Task:
         from aiconfigurator.sdk.perf_database import get_database_view
 
         allow_missing = self.database_mode is not None and self.database_mode != common.DatabaseMode.SILICON.name
+        analytical_config = None
+        if (self.database_mode or "").upper() == common.DatabaseMode.ANALYTICAL.name:
+            analytical_config = {
+                "level": self.analytical_level,
+                "fp8_gemm_recipe": self.analytical_fp8_gemm_recipe,
+                "attention_algorithm": self.analytical_attention_algorithm,
+                "sparse_attention_head_quantum": self.analytical_sparse_attention_head_quantum,
+                "communication_mode": self.analytical_communication_mode,
+                "moe_dispatch_dtype": self.analytical_moe_dispatch_dtype,
+                "moe_combine_dtype": self.analytical_moe_combine_dtype,
+                "wideep_dispatch_dtype": self.analytical_wideep_dispatch_dtype,
+                "wideep_combine_dtype": self.analytical_wideep_combine_dtype,
+                "communication_placement": self.communication_placement,
+            }
         return get_database_view(
             system,
             backend,
@@ -2867,6 +2920,7 @@ class Task:
             allow_missing_data=allow_missing,
             database_mode=self.database_mode,
             transfer_policy=self.transfer_policy,
+            analytical_config=analytical_config,
         )
 
     def run(self, *, autoscale: bool = False, validate: bool = True):
@@ -2922,13 +2976,13 @@ class Task:
             decode_database = self._load_database(
                 self.decode_system_name, self.decode_backend_name, self.decode_backend_version
             )
-            encoder_database = self._load_encoder_database(self.prefill_backend_name, self.prefill_backend_version)
-            return sweep_disagg(
-                **self.sweep_disagg_kwargs(
-                    prefill_database=prefill_database,
-                    decode_database=decode_database,
-                    encoder_database=encoder_database,
-                ),
+            sweep_fn = sweep_disagg
+            if self.pareto_algorithm == "v2":
+                from aiconfigurator.sdk.pareto_v2 import sweep_disagg_pareto_v2
+
+                sweep_fn = sweep_disagg_pareto_v2
+            return sweep_fn(
+                **self.sweep_disagg_kwargs(prefill_database=prefill_database, decode_database=decode_database),
                 autoscale=autoscale,
                 predictor=self.predictor,
                 speculative_profile=self.build_speculative_profile(),

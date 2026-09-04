@@ -42,12 +42,55 @@ def test_engine_step_backend_defaults_to_rust(monkeypatch) -> None:
         rust_engine_step.should_use_rust_engine_step(RuntimeConfig(engine_step_backend="auto"), database)
 
 
-def test_python_backend_value_is_removed(monkeypatch) -> None:
-    """The deprecated ``"python"`` no-op completed its one-release window
-    (deprecation-cleanup PR): the value now fails closed like any other
-    unknown backend, from both the config and the environment."""
+def _model_with_communication_placement(placement: str) -> SimpleNamespace:
+    return SimpleNamespace(config=ModelConfig(communication_placement=placement))
+
+
+def test_independent_placement_preserves_default_and_explicit_rust_routing(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.delenv("AICONFIGURATOR_ENGINE_STEP_BACKEND", raising=False)
-    database = _real_database()
+    monkeypatch.setattr(rust_engine_step, "_POWER_DATA_CACHE", {})
+    database = _power_probe_database(tmp_path, with_power=False)
+    model = _model_with_communication_placement("independent")
+
+    assert rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
+    assert rust_engine_step.should_use_rust_engine_step(
+        RuntimeConfig(engine_step_backend="rust"), database, model
+    )
+
+
+def test_tp_first_placement_delegates_default_and_explicit_rust_to_python(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("AICONFIGURATOR_ENGINE_STEP_BACKEND", raising=False)
+    monkeypatch.setattr(rust_engine_step, "_POWER_DATA_CACHE", {})
+    database = _power_probe_database(tmp_path, with_power=False)
+    model = _model_with_communication_placement("tp_first")
+
+    assert not rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
+    assert not rust_engine_step.should_use_rust_engine_step(
+        RuntimeConfig(engine_step_backend="rust"), database, model
+    )
+
+
+def test_tp_first_python_fallback_warning_is_emitted_once(monkeypatch, tmp_path: Path, caplog) -> None:
+    monkeypatch.delenv("AICONFIGURATOR_ENGINE_STEP_BACKEND", raising=False)
+    monkeypatch.setattr(rust_engine_step, "_POWER_DATA_CACHE", {})
+    rust_engine_step._warn_python_placement_fallback_once.cache_clear()
+    database = _power_probe_database(tmp_path, with_power=False)
+    model = _model_with_communication_placement("tp_first")
+
+    with caplog.at_level("WARNING", logger=rust_engine_step.__name__):
+        assert not rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
+        assert not rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
+
+    messages = [record.message for record in caplog.records if "communication placement tp_first" in record.message]
+    assert len(messages) == 1
+
+
+def _power_probe_database(tmp_path: Path, *, with_power: bool):
+    """A real ``PerfDatabase`` instance (loader bypassed) whose data tree the
+    power probe can scan. Default routing requires the real type: synthetic
+    database doubles delegate to the Python step."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
     with pytest.raises(ValueError, match=r"unknown engine_step_backend 'python'"):
         rust_engine_step.should_use_rust_engine_step(RuntimeConfig(engine_step_backend="python"), database)
@@ -1546,6 +1589,8 @@ def test_every_selectable_database_mode_routes_to_rust():
         HYBRID = "HYBRID"
         EMPIRICAL = "EMPIRICAL"
         SOL = "SOL"
+        SOL_FULL = "SOL_FULL"
+        ANALYTICAL = "ANALYTICAL"
 
     class _DB:
         def __init__(self, mode):
@@ -1558,7 +1603,9 @@ def test_every_selectable_database_mode_routes_to_rust():
     assert should_use_rust_engine_step(rc, _DB(_Mode.SILICON))
     assert should_use_rust_engine_step(rc, _DB(_Mode.HYBRID))
     assert should_use_rust_engine_step(rc, _DB(_Mode.EMPIRICAL))
-    assert should_use_rust_engine_step(rc, _DB(_Mode.SOL))
+    assert not should_use_rust_engine_step(rc, _DB(_Mode.SOL))
+    assert not should_use_rust_engine_step(rc, _DB(_Mode.SOL_FULL))
+    assert not should_use_rust_engine_step(rc, _DB(_Mode.ANALYTICAL))
     assert should_use_rust_engine_step(rc)  # no database context -> unchanged
 
 

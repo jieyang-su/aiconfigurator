@@ -18,6 +18,13 @@ gpu:
   fp4_tc_flops: 1871202139854795 # 1871.2 TFLOPS dense, scaled to 2430 MHz
   power: 600  # Watt
   sm_version: 120
+  # Analytical FA/MLA roofline capability profile (RTX PRO 6000 Blackwell Server).
+  sm_count: 188
+  clock_hz: 2430000000
+  shared_memory_per_sm_bytes: 131072
+  l2_capacity_bytes: 100663296
+  l2_bandwidth_bytes_s: 17700000000000
+  vector_peak_flops: 116951040000000
 
 node:
   num_gpus_per_node: 8 # 8x RTX PRO 6000 Blackwell Server per node (observed on the collection host, nvidia-smi topo 2026-07-25)

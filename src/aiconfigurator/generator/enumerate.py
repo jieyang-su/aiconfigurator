@@ -28,6 +28,7 @@ from aiconfigurator.generator.naive import (
 from aiconfigurator.generator.rendering.engine import render_backend_templates
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.models import check_is_moe
+from aiconfigurator.sdk.perf_database import load_system_spec
 from aiconfigurator.sdk.task_v2 import build_disagg_parallel_lists
 from aiconfigurator.sdk.utils import (
     enumerate_parallel_config,
@@ -535,6 +536,13 @@ def enumerate_profiling_configs(
         prefill_wc["moe_ep_list"],
     )
 
+    system_spec = load_system_spec(system)
+    single_supernode_gpus = (
+        num_gpus_per_node
+        if system_spec.get("node", {}).get("topology_scope") == "single_supernode"
+        else None
+    )
+
     prefill_parallel_configs = enumerate_parallel_config(
         num_gpu_list=prefill_wc["num_gpu_per_worker"],
         tp_list=prefill_wc["tp_list"],
@@ -549,6 +557,7 @@ def enumerate_profiling_configs(
         min_num_gpus=min_gpus,
         max_num_gpus=prefill_max_gpus,
         allow_moe_pure_tp=allow_moe_pure_tp,
+        single_supernode_gpus=single_supernode_gpus,
     )
 
     decode_parallel_configs = enumerate_parallel_config(
@@ -565,6 +574,7 @@ def enumerate_profiling_configs(
         min_num_gpus=min_gpus,
         max_num_gpus=decode_max_gpus,
         allow_moe_pure_tp=allow_moe_pure_tp,
+        single_supernode_gpus=single_supernode_gpus,
     )
 
     # For GQA+MoE models, wideep mode only produces DEP/TEP (moe_tp is always 1).
@@ -598,6 +608,7 @@ def enumerate_profiling_configs(
                 min_num_gpus=min_gpus,
                 max_num_gpus=max_gpus,
                 allow_moe_pure_tp=True,
+                single_supernode_gpus=single_supernode_gpus,
             )
             # Only keep pure TP configs (avoid duplicating DEP/TEP from wideep pass)
             for cfg in tp_configs:

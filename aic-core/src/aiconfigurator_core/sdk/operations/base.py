@@ -254,26 +254,17 @@ class OpShellKit:
             "imbalance_correction_scale": 1.0 if scale is None else float(scale),
         }
 
-    def _engine_query_is_context(self, kwargs: dict) -> bool:
-        """Phase for ``_ENGINE_QUERY_SHAPE = "module"`` ops: explicit
-        ``is_context=`` kwarg wins, then the instance's own phase marker.
-        Composites (Overlap/Fallback) override to infer from children."""
-        hint = kwargs.get("is_context")
-        if hint is not None:
-            return bool(hint)
-        is_context = getattr(self, "_is_context", None)
-        if is_context is not None:
-            return bool(is_context)
-        # Instance phase markers: the mamba/gdn kernels use context/generation
-        # (KDA adds "verify" — speculative multi-token decode, generation-like
-        # for evaluation-context routing; the serialized spec keeps the verify
-        # phase + draft_tokens), FPMForwardOp uses prefill/decode.
-        phase = getattr(self, "_phase", None)
-        if phase in ("context", "prefill"):
-            return True
-        if phase in ("generation", "decode", "verify"):
-            return False
-        raise ValueError(f"{type(self).__name__}.query cannot infer the evaluation phase; pass is_context=True/False.")
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """Return latency (scaled by ``scale_factor``) plus energy/source data."""
+        raise NotImplementedError
+
+    def set_parallel_layout(self, layout, group: str | None = None) -> None:
+        """Bind immutable communication placement metadata to this op."""
+        self._parallel_layout = layout
+        self._communication_group = group
+
+    def get_weights(self, **kwargs):
+        raise NotImplementedError
 
     @classmethod
     def load_data(cls, database: PerfDatabase) -> None:
@@ -319,42 +310,55 @@ class OpShellKit:
         Operation._load_data_call_count[cls] += 1
 
 
-class PythonOperation(OpShellKit):
-    """Base for the PYTHON-side orchestration ops (the AFD comm ops,
-    ``FPMForwardOp``) — the only op classes that are not Rust-backed: their
-    state includes things the engine wire cannot carry (a Python config
-    object, a retired callable slot) or their surface is pinned by the
-    public-SDK import contract. Carries the retired base class's
-    construction contract (audit gate + ``_name``/``_scale_factor``/
-    ``_seq_split``) without any engine identity."""
+class CommunicationDatabaseView:
+    """Read-only database facade that annotates formula communication queries.
 
-    # Context-parallel opt-in (the retired audit gate): constructing with
-    # ``seq_split > 1`` on a class that has NOT opted in raises.
-    _CP_AWARE: ClassVar[bool] = False
+    MoE dispatch/combine contains backend-specific query branches. Passing this
+    facade through those branches avoids mutating the shared PerfDatabase while
+    preserving every non-communication database method unchanged.
+    """
 
-    def __init__(self, name: str, scale_factor: float, *, seq_split: int = 1) -> None:
-        if seq_split > 1 and not self._CP_AWARE:
-            raise NotImplementedError(
-                f"{type(self).__name__} has not been audited for context parallelism "
-                f"(seq_split={seq_split}). Set ``_CP_AWARE = True`` on the class after "
-                f"verifying its token-count treatment (or handle CP at the model "
-                f"construction site)."
-            )
-        self._name = name
-        self._scale_factor = scale_factor
-        self._seq_split: int = seq_split
+    def __init__(self, database, parallel_layout, communication_group: str | None):
+        self._database = database
+        self._parallel_layout = parallel_layout
+        self._communication_group = communication_group
 
-    def get_weights(self, **kwargs):
-        raise NotImplementedError(f"{type(self).__name__} must define get_weights")
+    def __getattr__(self, name):
+        return getattr(self._database, name)
+
+    def query_custom_allreduce(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_custom_allreduce(*args, **kwargs)
+
+    def query_nccl(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_nccl(*args, **kwargs)
+
+    def query_p2p(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_p2p(*args, **kwargs)
+
+    def query_wideep_deepep_ll(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_wideep_deepep_ll(*args, **kwargs)
+
+    def query_wideep_deepep_normal(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_wideep_deepep_normal(*args, **kwargs)
+
+    def query_trtllm_alltoall(self, *args, **kwargs):
+        kwargs.setdefault("parallel_layout", self._parallel_layout)
+        kwargs.setdefault("communication_group", self._communication_group)
+        return self._database.query_trtllm_alltoall(*args, **kwargs)
 
 
-def _all_operation_subclasses(root: type | None = None) -> set[type]:
-    """Recursively collect every op subclass currently imported: everything
-    under the Rust ``Operation`` base (the shells AND the raw Rust family
-    classes) plus the Python orchestration ops under ``PythonOperation``.
-    Callers guard with ``getattr`` — the raw Rust classes carry none of the
-    shell kit."""
-    roots = [root] if root is not None else [Operation, PythonOperation]
+def _all_operation_subclasses(root: type = Operation) -> set[type]:
+    """Recursively collect every Operation subclass currently imported."""
     seen: set[type] = set()
     stack: list[type] = list(roots)
     while stack:

@@ -572,14 +572,6 @@ class DeepSeekModel(BaseModel):
         # keep the profiled-module primary with the granular fallback.
         context_mla_granular = [
             ops.GEMM(
-                "context_downscale_gemm",
-                self._num_layers,
-                2112,
-                h,
-                attn_downscale_gemm_quant_mode,
-                seq_split=cp,
-            ),
-            ops.GEMM(
                 "context_q_b_proj_gemm",
                 self._num_layers,
                 # heads x (qk_nope 128 + qk_rope 64); DSV3's 128 heads gave the old 24576 literal
@@ -588,7 +580,7 @@ class DeepSeekModel(BaseModel):
                 attn_q_gemm_quant_mode,
                 seq_split=cp,
             ),
-            ops.GEMM(
+            (ops.ContextKVBProjGEMM if self._backend_name == "sglang" else ops.GEMM)(
                 "context_kv_b_proj_gemm",
                 self._num_layers,
                 # heads x (qk_nope 128 + v_head_dim 128)
@@ -596,6 +588,18 @@ class DeepSeekModel(BaseModel):
                 512,
                 attn_kv_gemm_quant_mode,
                 seq_split=cp,
+            ),
+            *(
+                [
+                    ops.MLAConcatK(
+                        "context_mla_concat_k",
+                        self._num_layers,
+                        self._num_heads // tp_size,
+                        seq_split=cp,
+                    )
+                ]
+                if self._backend_name == "sglang"
+                else []
             ),
             ops.ContextAttention(
                 "context_attention",
@@ -645,6 +649,7 @@ class DeepSeekModel(BaseModel):
                         native_num_heads=self._num_heads,
                     ),
                     fallback=context_mla_granular,
+                    silicon_primary_only=True,
                 )
             ]
         else:
@@ -654,6 +659,16 @@ class DeepSeekModel(BaseModel):
             [
                 ops.Embedding("context_embedding", 1, self._vocab_size, h, 0.3, seq_split=cp),
                 ops.ElementWise("context_add_norm_1", self._num_layers, 2 * h, 2 * h, 0.8, seq_split=cp),
+                # The module collector receives prebuilt latent QKV, so this
+                # projection is outside both module and granular boundaries.
+                ops.GEMM(
+                    "context_downscale_gemm",
+                    self._num_layers,
+                    2112,
+                    h,
+                    attn_downscale_gemm_quant_mode,
+                    seq_split=cp,
+                ),
                 *context_mla_block_ops,
                 *self._cp_attn_comm_ops(),
                 ops.ElementWise("context_add_norm_2", self._num_layers, 2 * h, 2 * h, 0.8, seq_split=cp),
@@ -800,13 +815,6 @@ class DeepSeekModel(BaseModel):
         # Same mixed-identity gate as the context block above.
         generation_mla_granular = [
             ops.GEMM(
-                "generation_downscale_gemm",
-                self._num_layers * self._mtp_scale_factor,
-                2112,
-                h,
-                attn_downscale_gemm_quant_mode,
-            ),
-            ops.GEMM(
                 "generation_q_b_proj_gemm",
                 self._num_layers * self._mtp_scale_factor,
                 self._num_heads * 192 // tp_size,
@@ -826,6 +834,7 @@ class DeepSeekModel(BaseModel):
                         self._num_kv_heads // tp_size,
                         kvcache_quant_mode,
                         head_size=self._vllm_head_size,
+                        fmha_quant_mode=fmha_quant_mode,
                     )
                 ]
                 if self._backend_name == "vllm"
@@ -877,6 +886,7 @@ class DeepSeekModel(BaseModel):
                         native_num_heads=self._num_heads,
                     ),
                     fallback=generation_mla_granular,
+                    silicon_primary_only=True,
                 )
             ]
         else:
@@ -891,6 +901,13 @@ class DeepSeekModel(BaseModel):
                     2 * h,
                     2 * h,
                     0.8,
+                ),
+                ops.GEMM(
+                    "generation_downscale_gemm",
+                    self._num_layers * self._mtp_scale_factor,
+                    2112,
+                    h,
+                    attn_downscale_gemm_quant_mode,
                 ),
                 *generation_mla_block_ops,
                 ops.ElementWise(

@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 AIC contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Domestic GPU estimate-only system profile.
+# SM-level fields are copied from H200 because Ascend-950DT microarchitectural
+# details are not available in the source description. These fields are only
+# an analytical proxy and must not be read as Ascend ISA equivalence.
+
+data_dir: data/_dom_ascend_950dt
+gpu:
+  mem_bw: 4000000000000 # 4TB/s
+  mem_bw_empirical_scaling_factor: 0.8 # provisional generic correction
+  mem_empirical_constant_latency: 0.000003 # 3us provisional estimate
+  mem_capacity: 103079215104 # 96GiB; source description says 96GB
+  bfloat16_tc_flops: 495000000000000 # 495TFLOPS BF16
+  fp8_tc_flops: 890000000000000 # 890TFLOPS FP8
+  fp4_tc_flops: 1780000000000000 # 1780TFLOPS FP4
+  power: 700 # provisional H200 proxy; Ascend board power not provided
+  sm_version: 90 # H200 proxy, not an Ascend ISA claim
+  architecture_family: domestic
+  capability_overrides:
+    fp8_mma: true
+    fp4_mma: true
+    mnnvl: false
+  sm_count: 132 # H200 proxy for analytical kernelsim
+  clock_hz: 1830000000 # H200 proxy
+  shared_memory_per_sm_bytes: 262144 # H200 proxy
+  l2_capacity_bytes: 52428800 # H200 proxy
+  l2_bandwidth_bytes_s: 9369600000000 # H200 proxy
+  vector_peak_flops: 123724800000000 # H200 proxy
+
+node:
+  topology_scope: single_supernode
+  num_gpus_per_node: 96 # Ascend-950DT supernode size
+  inter_node_bw: 0 # cross-supernode link not modeled
+  intra_node_bw: 840000000000 # 840GB/s per GPU within the supernode
+  pcie_bw: 64000000000 # H200 proxy; host link not provided
+  p2p_latency: 0.00001 # provisional H200 proxy
+
+misc:
+  nccl_mem:
+    1: 0
+    2: 358612992
+    4: 411041792
+    8: 411041792
+  other_mem: 3758096384
+  nccl_version: '2.27.3' # placeholder; no domestic collective backend data yet

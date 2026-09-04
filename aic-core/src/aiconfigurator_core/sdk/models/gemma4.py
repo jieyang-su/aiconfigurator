@@ -437,6 +437,7 @@ class Gemma4MixModel(BaseModel):
                         kvcache_q,
                         window_size=cfg.sliding_window_size,
                         head_size=d["swa_hd"],
+                        fmha_quant_mode=self.config.fmha_quant_mode,
                     ),
                     ops.GEMM("generation_swa_proj_gemm", c, h, d["swa_proj_in"], gemm_q, low_precision_input=True),
                     ops.ElementWise("generation_swa_ffn_norm", c, 2 * h, 2 * h, 0.8),
@@ -460,6 +461,7 @@ class Gemma4MixModel(BaseModel):
                         kvcache_q,
                         window_size=0,
                         head_size=d["global_hd"],
+                        fmha_quant_mode=self.config.fmha_quant_mode,
                     ),
                     ops.GEMM(
                         "generation_global_proj_gemm", c, h, d["global_proj_in"], gemm_q, low_precision_input=True

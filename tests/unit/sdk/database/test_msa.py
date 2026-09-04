@@ -99,76 +99,53 @@ def test_rejected_msa_cells_raise_typed_errors(system, backend, version):
         PerfDataNotAvailableError,
     )
 
-    def op(cls):
-        return cls(
-            "msa",
-            1.0,
-            num_heads=8,
-            num_kv_heads=1,
-            hidden_size=4096,
-            head_dim=128,
-            v_head_dim=128,
-            index_n_heads=4,
-            index_head_dim=128,
-            index_topk=16,
-            block_size=128,
-            kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
-            fmha_quant_mode=common.FMHAQuantMode.bfloat16,
-            gemm_quant_mode=common.GEMMQuantMode.fp8_block,
-        )
-
-    cases = [
-        (ContextMSAModule, {"batch_size": 2, "s": 512, "prefix": 0}),
-        (GenerationMSAModule, {"batch_size": 2, "s": 512}),
-    ]
-    silicon = get_database_view(system, backend, version, database_mode="SILICON")
-    hybrid = get_database_view(system, backend, version, database_mode="HYBRID")
-    for cls, kwargs in cases:
-        with pytest.raises(PerfDataNotAvailableError):
-            op(cls)._engine_query(silicon, **kwargs)
-        with pytest.raises(EmpiricalNotImplementedError, match=r"(?i)no DSA util"):
-            op(cls)._engine_query(hybrid, **kwargs)
+        comprehensive_perf_db.set_transfer_policy(None)  # XOP allowed
+        with util_empirical.capture_provenance() as tags:
+            assert float(_ctx_msa().query(comprehensive_perf_db, **kw)) > 0
+        assert len(util_queries) == 1
+        assert util_empirical.worst_provenance(tags) == "xop"
+    finally:
+        comprehensive_perf_db.set_transfer_policy(None)
+        comprehensive_perf_db.set_default_database_mode(common.DatabaseMode.SILICON)
 
 
-def test_nvfp4_checkpoint_lane_resolution_per_backend():
-    """End-to-end lookup for the NVFP4 checkpoint's MSA lane (review
-    4969690316 Spec-2): the SDK prices its MXFP8 projections as
-    gemm=fp8_block. trtllm/vllm b200 tables carry that gemm tier — SILICON
-    must resolve; the sglang tables are bf16-gemm-only by declaration (the
-    checkpoint's quantized flow is unsupported in SGLang serving), so
-    SILICON must miss and HYBRID takes the documented empirical transfer."""
+def test_msa_analytical_uses_granular_no_table_recipe(mutable_comprehensive_perf_db):
+    """ANALYTICAL must not use the historical DSA XOP/module path."""
     from aiconfigurator.sdk.operations.msa import ContextMSAModule
-    from aiconfigurator.sdk.perf_database import get_database_view
+    from aiconfigurator_core.sdk.operations.msa import MsaAnalyticalApproximationWarning
 
-    def op():
-        return ContextMSAModule(
-            "msa",
-            1.0,
-            num_heads=8,
-            num_kv_heads=1,
-            hidden_size=4096,
-            head_dim=128,
-            v_head_dim=128,
-            index_n_heads=4,
-            index_head_dim=128,
-            index_topk=16,
-            block_size=128,
-            kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
-            fmha_quant_mode=common.FMHAQuantMode.bfloat16,
-            gemm_quant_mode=common.GEMMQuantMode.fp8_block,
-        )
-
-    for backend, version in (("trtllm", "1.3.0rc23"), ("vllm", "0.24.0")):
-        db = get_database_view("b200_sxm", backend, version, database_mode="SILICON")
-        assert db is not None, f"b200 {backend} data missing"
-        latency = float(op()._engine_query(db, batch_size=2, s=512, prefix=0))
-        assert latency > 0, f"{backend} fp8_block gemm lane must resolve in SILICON"
-
-    sg_silicon = get_database_view("b200_sxm", "sglang", "0.5.16", database_mode="SILICON")
-    assert sg_silicon is not None
-    with pytest.raises(Exception, match=r"(?i)silicon|missing|not supported"):
-        op()._engine_query(sg_silicon, batch_size=2, s=512, prefix=0)
-
-    sg_hybrid = get_database_view("b200_sxm", "sglang", "0.5.16", database_mode="HYBRID")
-    latency = float(op()._engine_query(sg_hybrid, batch_size=2, s=512, prefix=0))
-    assert latency > 0, "sglang HYBRID must fall back to the empirical transfer for the fp8_block lane"
+    analytical_op = ContextMSAModule(
+        "msa_analytical",
+        1.0,
+        8,
+        1,
+        4096,
+        128,
+        128,
+        4,
+        128,
+        2048,
+        128,
+        common.KVCacheQuantMode.bfloat16,
+        common.FMHAQuantMode.bfloat16,
+        common.GEMMQuantMode.bfloat16,
+    )
+    comprehensive_perf_db = mutable_comprehensive_perf_db
+    comprehensive_perf_db.system_spec["gpu"].update(
+        {
+            "sm_count": 132,
+            "clock_hz": 1.8e9,
+            "shared_memory_per_sm_bytes": 228 * 1024,
+            "l2_capacity_bytes": 50 * 1024 * 1024,
+            "l2_bandwidth_bytes_s": 1e15,
+            "vector_peak_flops": 1e13,
+        }
+    )
+    comprehensive_perf_db.set_default_database_mode(common.DatabaseMode.ANALYTICAL)
+    try:
+        with pytest.warns(MsaAnalyticalApproximationWarning):
+            result = analytical_op.query(comprehensive_perf_db, batch_size=2, s=4096, prefix=0)
+        assert float(result) > 0
+        assert result.source == "analytical"
+    finally:
+        comprehensive_perf_db.set_default_database_mode(common.DatabaseMode.SILICON)

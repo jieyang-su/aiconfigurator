@@ -82,6 +82,7 @@ fn moe_quant_util_level(quant: MoeQuantMode) -> f64 {
 /// into the enum (Python's table is keyed by enum members directly).
 const ALL_MOE_QUANTS: &[MoeQuantMode] = &[
     MoeQuantMode::Bfloat16,
+    MoeQuantMode::Int8Wo,
     MoeQuantMode::Fp8,
     MoeQuantMode::Int4Wo,
     MoeQuantMode::Fp8Block,

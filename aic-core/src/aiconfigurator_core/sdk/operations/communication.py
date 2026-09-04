@@ -16,9 +16,9 @@ engine (`perf_database/table_view.rs`).
   alongside NCCL data because ``query_nccl`` picks between them at query
   time (XPU systems load oneCCL when NCCL is empty).
 
-- ``P2P`` has no silicon table — latency is computed analytically from
-  ``inter_node_bw`` + ``p2p_latency``. The base ``Operation.load_data``
-  no-op default applies (the retired per-call lookup was factored out for
+- ``P2P`` has no silicon table — latency is computed analytically from the
+  topology-selected pipeline bandwidth + ``p2p_latency``. The base ``Operation.load_data``
+  no-op default applies; ``_query_p2p_table`` is factored out for
   parity with the other ops.
 
 Cache key matches every other migrated op: ``(systems_root, system,
@@ -59,7 +59,34 @@ def _cache_key(database: PerfDatabase) -> tuple:
     )
 
 
-class CustomAllReduce(_core.CustomAllReduce, OpShellKit):
+def _silicon_collective_topology_scale(
+    database: PerfDatabase,
+    anchor_num_gpus: int,
+    requested_num_gpus: int,
+    parallel_layout,
+    communication_group: str | None,
+) -> float:
+    """Transfer a measured collective from its table topology to the requested layout.
+
+    Communication tables are keyed by rank count, not placement. Preserve the
+    measured launch/algorithm behavior, then scale only the ring participation
+    fraction and the bandwidth selected for the requested logical group.
+    """
+    if anchor_num_gpus <= 1 or requested_num_gpus <= 1:
+        return 1.0
+
+    anchor_bw = database._get_p2p_bandwidth(anchor_num_gpus)
+    target_bw = (
+        parallel_layout.bandwidth(database.system_spec, communication_group, requested_num_gpus)
+        if parallel_layout is not None
+        else database._get_p2p_bandwidth(requested_num_gpus)
+    )
+    anchor_ring_fraction = (anchor_num_gpus - 1) / anchor_num_gpus
+    requested_ring_fraction = (requested_num_gpus - 1) / requested_num_gpus
+    return requested_ring_fraction / anchor_ring_fraction * anchor_bw / target_bw
+
+
+class CustomAllReduce(Operation):
     """
     Custom AllReduce operation with power tracking.
 
@@ -99,12 +126,201 @@ class CustomAllReduce(_core.CustomAllReduce, OpShellKit):
     # Query table (formerly PerfDatabase.query_custom_allreduce)
     # ------------------------------------------------------------------
 
+    @classmethod
+    def _query_custom_allreduce_table(
+        cls,
+        database: PerfDatabase,
+        quant_mode: common.CommQuantMode,
+        tp_size: int,
+        size: int,
+        database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = None,
+    ):
+        """Query custom_allreduce table. Verbatim port of the legacy body."""
+        from aiconfigurator_core.sdk.perf_database import PerfDataNotAvailableError
+
+        def get_sol(
+            quant_mode: common.CommQuantMode,
+            tp_size: int,
+            size: int,
+            *,
+            p2p_bw_override: float | None = None,
+        ) -> tuple[float, float, float]:
+            if tp_size == 1:
+                return 0, 0, 0
+            p2p_bw = p2p_bw_override
+            if p2p_bw is None:
+                p2p_bw = (
+                    parallel_layout.bandwidth(database.system_spec, communication_group, tp_size)
+                    if parallel_layout is not None
+                    else database._get_p2p_bandwidth(tp_size)
+                )
+            # ``size`` is an element count. Keep accepting the legacy string
+            # inputs used by the public SOL API while honoring explicit FP8/
+            # INT8 communication dtypes from Analytical MoE paths.
+            if isinstance(quant_mode, common.CommQuantMode):
+                type_bytes = quant_mode.value.memory
+            else:
+                type_bytes = 1 if str(quant_mode).lower() in {"fp8", "int8"} else 2
+            # assume all are ring allreduce, ignore constant latency
+            # (~1us for hopper, ~2us for two-die blackwell).
+            sol_time = 2 * size * type_bytes / tp_size * (tp_size - 1) / p2p_bw
+            return sol_time * 1000, 0, 0
+
+        def get_empirical(quant_mode: common.CommQuantMode, tp_size: int, size: int) -> float:
+            # Data-calibrated: util = SOL/measured read from the collected
+            # custom_allreduce curve (smooth in message size), reconstructed with
+            # this query's SOL. Falls back to the legacy 1/0.8 constant when the
+            # slice has no data. SOL uses the real tp_size; the util grid is built
+            # from the effective (node-capped) tp slice, so SOL ratio carries any
+            # multi-node bandwidth scaling.
+            sol_q = get_sol(quant_mode, tp_size, size)[0]
+            if tp_size <= 1 or sol_q <= 0:
+                return sol_q
+            eff = min(tp_size, database.system_spec["node"]["num_gpus_per_node"])
+
+            def _slice():
+                cls.load_data(database)
+                dw = database._custom_allreduce_data
+                dw.raise_if_not_loaded()
+                return util_empirical.require_data_slice(dw, quant_mode, eff, "AUTO")
+
+            grid = util_empirical.grid_for(
+                ("custom_allreduce", database.system, database.backend, database.version, quant_mode.value.name, eff),
+                _slice,
+                lambda c: get_sol(quant_mode, eff, int(c[0]))[0],
+                depth=1,
+            )
+            # Compatibility exception: rank-count overflow still borrows the
+            # node-boundary utilization even when XSHAPE is disabled, because
+            # rejecting it would remove support for common multi-node configs.
+            # TODO(#1260): define a strict policy where an unmeasured TP count
+            # fails accurately without regressing default model coverage.
+            prov = "xshape" if eff != tp_size else "empirical"
+            latency, _ = util_empirical.estimate(sol_q, (float(size),), grid, provenance=prov)
+            return latency
+
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        analytical_formula = (
+            database_mode == common.DatabaseMode.ANALYTICAL
+            and database._analytical_config.communication_mode == "empirical"
+        )
+        if database_mode == common.DatabaseMode.ANALYTICAL:
+            database_mode = (
+                common.DatabaseMode.EMPIRICAL
+                if database._analytical_config.communication_mode == "empirical"
+                else common.DatabaseMode.SILICON
+            )
+        if database_mode == common.DatabaseMode.SOL:
+            sol_latency = get_sol(quant_mode, tp_size, size)[0]
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
+        elif database_mode == common.DatabaseMode.SOL_FULL:
+            return get_sol(quant_mode, tp_size, size)
+        elif database_mode == common.DatabaseMode.EMPIRICAL:
+            if analytical_formula:
+                return PerformanceResult(get_sol(quant_mode, tp_size, size)[0] / 0.8, energy=0.0, source="empirical")
+            emp_latency = get_empirical(quant_mode, tp_size, size)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+
+        cls.load_data(database)
+        data_wrapper = database._custom_allreduce_data
+
+        def get_silicon():
+            if tp_size == 1:
+                return PerformanceResult(0.0, energy=0.0, source="empirical")
+            if database.system_spec["node"]["num_gpus_per_node"] == 72 and tp_size > 4:
+                # on GB200, we only have custom all reduce for up to tp4.
+                return database.query_nccl(
+                    quant_mode,
+                    tp_size,
+                    "all_reduce",
+                    size,
+                    parallel_layout=parallel_layout,
+                    communication_group=communication_group,
+                )
+
+            data_wrapper.raise_if_not_loaded()
+
+            # The loader returns a 4-deep defaultdict, so chained indexing silently
+            # synthesizes empty dicts for missing (quant_mode, tp_size, strategy)
+            # combinations. Validate explicitly so upstream callers see a structured
+            # PerfDataNotAvailableError instead of an opaque empty-table miss when
+            # the perf table has no rows for this bucket.
+            effective_tp = min(tp_size, database.system_spec["node"]["num_gpus_per_node"])
+            by_tp = data_wrapper.get(quant_mode, {})
+            strategy_dict = by_tp.get(effective_tp, {})
+            comm_dict = strategy_dict.get("AUTO", {})
+            if not comm_dict:
+                raise PerfDataNotAvailableError(
+                    f"No custom_allreduce silicon data for quant_mode={quant_mode.value.name}, "
+                    f"tp_size={effective_tp} (requested tp_size={tp_size}). "
+                    f"Available tp_sizes for this quant_mode: {sorted(by_tp.keys())}. "
+                    "Consider using HYBRID mode, or supply custom_allreduce_perf.parquet rows "
+                    "covering this tp_size."
+                )
+            # 1-D size curve on the raw table: RAW lerp in range (allreduce is
+            # bandwidth-bound ~linear in size); beyond the collected range hold
+            # the boundary util and let SOL carry the growth (the legacy raw
+            # two-point extrapolation could undershoot the launch floor or even
+            # go negative below the smallest collected size).
+            config = perf_interp.OpInterpConfig(
+                axes=("message_bytes",),
+                resolver=perf_interp.Grid(),
+                sol_fn=lambda sz: get_sol(
+                    quant_mode,
+                    effective_tp,
+                    sz,
+                    p2p_bw_override=database._get_p2p_bandwidth(effective_tp),
+                )[0],
+            )
+            result = perf_interp.query(config, comm_dict, size)
+            lat = perf_interp.get_value(result, "latency")
+            energy = perf_interp.get_value(result, "energy")
+
+            scale_factor = _silicon_collective_topology_scale(
+                database,
+                effective_tp,
+                tp_size,
+                parallel_layout,
+                communication_group,
+            )
+            lat = lat * scale_factor
+            energy = energy * scale_factor
+
+            return database._interp_pr(lat, energy=energy)
+
+        return database._query_silicon_or_hybrid(
+            get_silicon=get_silicon,
+            get_empirical=lambda: get_empirical(quant_mode, tp_size, size),
+            database_mode=database_mode,
+            error_msg=f"Failed to query custom allreduce data for {quant_mode=}, {tp_size=}, {size=}",
+        )
+
     # ------------------------------------------------------------------
     # Op contract
     # ------------------------------------------------------------------
 
 
-class NCCL(_core.NCCL, OpShellKit):
+        result = database.query_custom_allreduce(
+            common.CommQuantMode.half,
+            self._tp_size,
+            size,
+            parallel_layout=getattr(self, "_parallel_layout", None),
+            communication_group=getattr(self, "_communication_group", "tp"),
+        )
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", "silicon"),
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+class NCCL(Operation):
     """
     NCCL collective communication operation with power tracking.
 
@@ -189,12 +405,211 @@ class NCCL(_core.NCCL, OpShellKit):
     # Query table (formerly PerfDatabase.query_nccl)
     # ------------------------------------------------------------------
 
+    @classmethod
+    def _query_nccl_table(
+        cls,
+        database: PerfDatabase,
+        dtype: common.CommQuantMode,
+        num_gpus: int,
+        operation: str,
+        message_size: int,
+        database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = None,
+    ):
+        """Query NCCL table. Verbatim port of the legacy body."""
+
+        def require_nccl_bucket(node: object, description: str) -> Mapping:
+            if not isinstance(node, Mapping):
+                raise TypeError(
+                    f"Malformed NCCL performance data for {description}: expected a mapping, got {type(node).__name__}."
+                )
+            if not node:
+                raise PerfDataNotAvailableError(f"No NCCL performance data for {description}.")
+            return node
+
+        def get_sol(
+            dtype: common.CommQuantMode,
+            num_gpus: int,
+            operation: str,
+            message_size: int,
+            *,
+            p2p_bw_override: float | None = None,
+        ) -> tuple[float, float, float]:
+            sol_time = 0.0
+            p2p_bw = p2p_bw_override
+            if p2p_bw is None:
+                p2p_bw = (
+                    parallel_layout.bandwidth(database.system_spec, communication_group, num_gpus)
+                    if parallel_layout is not None
+                    else database._get_p2p_bandwidth(num_gpus)
+                )
+
+            if operation == "all_gather" or operation == "alltoall" or operation == "reduce_scatter":
+                sol_time = dtype.value.memory * message_size * (num_gpus - 1) / num_gpus / p2p_bw * 1000
+            elif operation == "all_reduce":
+                sol_time = 2 * dtype.value.memory * message_size * (num_gpus - 1) / num_gpus / p2p_bw * 1000
+            return sol_time, 0, sol_time
+
+        def get_empirical(dtype: common.CommQuantMode, num_gpus: int, operation: str, message_size: int) -> float:
+            # Data-calibrated: util = SOL/measured read from the collected NCCL
+            # curve for this (dtype, operation, num_gpus) slice, reconstructed with
+            # this query's SOL. Falls back to the legacy 1/0.8 constant when no
+            # data. The grid is built from the available (capped) num_gpus slice;
+            # SOL uses the real num_gpus so the SOL ratio carries scaling beyond
+            # the largest collected num_gpus.
+            sol_q = get_sol(dtype, num_gpus, operation, message_size)[0]
+            if num_gpus <= 1 or sol_q <= 0:
+                return sol_q  # no communication for a single rank -> 0, not a data gap
+            cls.load_data(database)
+            src = database._nccl_data
+            if not src.loaded and database._oneccl_data is not None and database._oneccl_data.loaded:
+                src = database._oneccl_data
+            if not src.loaded:
+                raise EmpiricalNotImplementedError(
+                    f"No NCCL data to estimate {operation} ({dtype.value.name}, num_gpus={num_gpus})."
+                )
+            try:
+                by_op = require_nccl_bucket(
+                    util_empirical.require_data_slice(src, dtype, operation),
+                    f"dtype={dtype.value.name}, operation={operation!r}",
+                )
+                eff = min(num_gpus, max(by_op.keys()))
+            except PerfDataNotAvailableError as exc:
+                raise EmpiricalNotImplementedError(
+                    f"No NCCL data for operation {operation!r} ({dtype.value.name}, num_gpus={num_gpus})."
+                ) from exc
+
+            def _slice():
+                return util_empirical.require_data_slice(by_op, eff)
+
+            grid = util_empirical.grid_for(
+                ("nccl", database.system, database.backend, database.version, dtype.value.name, operation, eff),
+                _slice,
+                lambda c: get_sol(dtype, eff, operation, int(c[0]))[0],
+                depth=1,
+            )
+            # Compatibility exception: rank-count overflow still borrows the
+            # largest collected utilization even when XSHAPE is disabled,
+            # preserving the existing NCCL boundary-correction coverage.
+            # TODO(#1260): define a strict policy where an unmeasured GPU count
+            # fails accurately without regressing default model coverage.
+            prov = "xshape" if eff != num_gpus else "empirical"
+            latency, _ = util_empirical.estimate(sol_q, (float(message_size),), grid, provenance=prov)
+            return latency
+
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        analytical_formula = (
+            database_mode == common.DatabaseMode.ANALYTICAL
+            and database._analytical_config.communication_mode == "empirical"
+        )
+        if database_mode == common.DatabaseMode.ANALYTICAL:
+            database_mode = (
+                common.DatabaseMode.EMPIRICAL
+                if database._analytical_config.communication_mode == "empirical"
+                else common.DatabaseMode.SILICON
+            )
+        if database_mode == common.DatabaseMode.SOL:
+            return PerformanceResult(get_sol(dtype, num_gpus, operation, message_size)[0], energy=0.0, source="sol")
+        elif database_mode == common.DatabaseMode.SOL_FULL:
+            return get_sol(dtype, num_gpus, operation, message_size)
+        elif database_mode == common.DatabaseMode.EMPIRICAL:
+            if analytical_formula:
+                return PerformanceResult(
+                    get_sol(dtype, num_gpus, operation, message_size)[0] / 0.8,
+                    energy=0.0,
+                    source="empirical",
+                )
+            return PerformanceResult(
+                get_empirical(dtype, num_gpus, operation, message_size), energy=0.0, source="empirical"
+            )
+
+        cls.load_data(database)
+
+        def get_silicon():
+            if num_gpus == 1:
+                return PerformanceResult(0.0, energy=0.0, source="empirical")
+
+            # Use oneCCL data as fallback when NCCL data is not available (e.g. XPU systems)
+            nccl_source = database._nccl_data
+            if not nccl_source.loaded and database._oneccl_data is not None and database._oneccl_data.loaded:
+                nccl_source = database._oneccl_data
+            nccl_source.raise_if_not_loaded()
+
+            by_num_gpus = require_nccl_bucket(
+                util_empirical.require_data_slice(nccl_source, dtype, operation),
+                f"dtype={dtype.value.name}, operation={operation!r}",
+            )
+            max_num_gpus = max(by_num_gpus.keys())
+            effective_num_gpus = min(num_gpus, max_num_gpus)
+            nccl_dict = require_nccl_bucket(
+                util_empirical.require_data_slice(by_num_gpus, effective_num_gpus),
+                f"dtype={dtype.value.name}, operation={operation!r}, num_gpus={effective_num_gpus}",
+            )
+            # 1-D size curve on the raw table (see custom_allreduce note): RAW
+            # lerp in range, boundary util-hold beyond it via the collective SOL.
+            config = perf_interp.OpInterpConfig(
+                axes=("message_bytes",),
+                resolver=perf_interp.Grid(),
+                sol_fn=lambda sz: get_sol(
+                    dtype,
+                    effective_num_gpus,
+                    operation,
+                    sz,
+                    p2p_bw_override=database._get_p2p_bandwidth(effective_num_gpus),
+                )[0],
+            )
+            result = perf_interp.query(config, nccl_dict, message_size)
+            lat = perf_interp.get_value(result, "latency")
+            energy = perf_interp.get_value(result, "energy")
+
+            if num_gpus > max_num_gpus:
+                logger.debug(f"nccl num_gpus {num_gpus} > max_num_gpus {max_num_gpus}, need to do some correction")
+
+            scaling_formula = _silicon_collective_topology_scale(
+                database,
+                effective_num_gpus,
+                num_gpus,
+                parallel_layout,
+                communication_group,
+            )
+            lat = lat * scaling_formula
+            energy = energy * scaling_formula
+
+            return database._interp_pr(lat, energy=energy)
+
+        return database._query_silicon_or_hybrid(
+            get_silicon=get_silicon,
+            get_empirical=lambda: get_empirical(dtype, num_gpus, operation, message_size),
+            database_mode=database_mode,
+            error_msg=f"Failed to query nccl data for {dtype=}, {num_gpus=}, {operation=}, {message_size=}",
+        )
+
     # ------------------------------------------------------------------
     # Op contract
     # ------------------------------------------------------------------
 
 
-class P2P(_core.P2P, OpShellKit):
+        result = database.query_nccl(
+            self._comm_quant_mode,
+            self._num_gpus,
+            self._nccl_op,
+            message_size,
+            parallel_layout=getattr(self, "_parallel_layout", None),
+            communication_group=getattr(self, "_communication_group", "collective"),
+        )
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", "silicon"),
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+class P2P(Operation):
     """
     P2P (point-to-point) communication operation with power tracking.
 
@@ -207,6 +622,227 @@ class P2P(_core.P2P, OpShellKit):
     # Query table (formerly PerfDatabase.query_p2p)
     # ------------------------------------------------------------------
 
+    @classmethod
+    def _query_p2p_table(
+        cls,
+        database: PerfDatabase,
+        message_bytes: int,
+        database_mode: common.DatabaseMode | None = None,
+        parallel_layout=None,
+        communication_group: str | None = "pp",
+        group_size: int = 2,
+    ):
+        """Query P2P latency analytically. Verbatim port of the legacy body."""
+
+        def get_sol(message_bytes: int) -> tuple[float, float, float]:
+            from aiconfigurator_core.sdk.system_spec import get_pipeline_p2p_bandwidth
+
+            bandwidth = (
+                parallel_layout.bandwidth(database.system_spec, communication_group, group_size)
+                if parallel_layout is not None
+                else get_pipeline_p2p_bandwidth(database.system_spec)
+            )
+            sol_time = message_bytes / bandwidth * 1000
+            return sol_time, 0, sol_time
+
+        def get_empirical(message_bytes: int) -> float:
+            from aiconfigurator_core.sdk.system_spec import get_pipeline_p2p_bandwidth
+
+            bandwidth = (
+                parallel_layout.bandwidth(database.system_spec, communication_group, group_size)
+                if parallel_layout is not None
+                else get_pipeline_p2p_bandwidth(database.system_spec)
+            )
+            return (
+                message_bytes / bandwidth
+                + database.system_spec["node"]["p2p_latency"]
+            ) * 1000
+
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        analytical_formula = (
+            database_mode == common.DatabaseMode.ANALYTICAL
+            and database._analytical_config.communication_mode == "empirical"
+        )
+        if database_mode == common.DatabaseMode.ANALYTICAL:
+            database_mode = (
+                common.DatabaseMode.EMPIRICAL
+                if database._analytical_config.communication_mode == "empirical"
+                else common.DatabaseMode.SILICON
+            )
+        if database_mode == common.DatabaseMode.SOL:
+            return PerformanceResult(get_sol(message_bytes)[0], energy=0.0, source="sol")
+        elif database_mode == common.DatabaseMode.SOL_FULL:
+            return get_sol(message_bytes)
+        elif database_mode == common.DatabaseMode.EMPIRICAL:
+            if analytical_formula:
+                return PerformanceResult(get_sol(message_bytes)[0] / 0.8, energy=0.0, source="empirical")
+            return PerformanceResult(get_empirical(message_bytes), energy=0.0, source="empirical")
+        # No silicon table for P2P — even SILICON/HYBRID modes use the
+        # empirical formula here, so tag the source accordingly.
+        return PerformanceResult(get_empirical(message_bytes), energy=0.0, source="empirical")
+
     # ------------------------------------------------------------------
     # Op contract
     # ------------------------------------------------------------------
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """Query P2P latency with power data."""
+        if self._pp_size == 1:
+            # No-op short-circuit: pp_size=1 has no P2P transfer. See note on
+            # CustomAllReduce.query for source-tag rationale.
+            return PerformanceResult(0.0, 0.0, source="empirical")
+
+        size = (-(-kwargs.get("x") // self._seq_split)) * self._h  # CP: ceil = busiest rank
+        p2p_bytes = size * 2
+
+        result = database.query_p2p(
+            p2p_bytes,
+            parallel_layout=getattr(self, "_parallel_layout", None),
+            communication_group=getattr(self, "_communication_group", "pp"),
+            # A pipeline transfer is point-to-point between adjacent stages;
+            # pp_size is used by the layout to inspect the stage edge, while
+            # the communicating group itself has two participants.
+            group_size=2,
+        )
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", "silicon"),
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+# ─────────────────────────────────────────────────────────
+# Perf-table loaders (moved here from perf_database.py so each op family owns its data + parser)
+# ─────────────────────────────────────────────────────────
+
+
+def load_custom_allreduce_data(custom_allreduce_file):
+    """
+    Load the custom allreduce data with power support (backward compatible).
+
+    Supports multiple data formats:
+    - TRTLLM: kernel_source="TRTLLM", last column="implementation"
+    - vLLM/SGLang: kernel_source="*_graph" or "*_eager", last column="backend"
+
+    For vLLM/SGLang with both graph and eager modes, only graph mode data is kept
+    (better performance for decode phase).
+
+    Returns:
+        dict: Nested dict structure where leaf values are dicts with 'latency' and 'power' keys.
+    """
+    rows = _read_filtered_rows(custom_allreduce_file)
+    if rows is None:
+        logger.debug(f"Custom allreduce data file {custom_allreduce_file} not found.")
+        return None
+    custom_allreduce_data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))
+
+    # Check if power columns exist (backward compatibility)
+    has_power = len(rows) > 0 and "power" in rows[0]
+    if not has_power:
+        logger.debug("Legacy database format detected (custom_allreduce) - power will default to 0.0")
+
+    if isinstance(custom_allreduce_file, str):
+        is_b60 = "b60" in custom_allreduce_file
+    else:
+        is_b60 = any("b60" in path for path, _ in custom_allreduce_file)
+
+    for row in rows:
+        # Check kernel_source to filter graph vs eager mode (for vLLM/SGLang)
+        kernel_source = row.get("kernel_source", "")
+        backend = row.get("backend", "")
+
+        # For vLLM/SGLang format: only keep graph mode data (skip eager mode)
+        # kernel_source patterns: "vLLM_custom_graph", "SGLang_CustomAllReduce_graph", etc.
+        # backend patterns: "vllm_graph", "sglang_graph", etc.
+        if (kernel_source.endswith("_eager") or backend.endswith("_eager")) and not is_b60:
+            continue  # Skip eager mode, use graph mode only
+
+        dtype, tp_size, message_size, latency = (
+            row["allreduce_dtype"],
+            row["num_gpus"],
+            row["message_size"],
+            row["latency"],
+        )
+        allreduce_strategy = "AUTO"
+        message_size = int(message_size)
+        latency = float(latency)
+        tp_size = int(tp_size)
+        dtype = common.CommQuantMode.half  # TODO
+
+        # NEW: Read power with backward compatibility
+        power = float(row.get("power", 0.0))
+
+        # NEW: Calculate energy from power and latency
+        energy = power * latency  # watt-milliseconds
+
+        try:
+            # Check for conflict
+            custom_allreduce_data[dtype][tp_size][allreduce_strategy][message_size]
+            logger.debug(
+                f"value conflict in custom allreduce data: {dtype} {tp_size} {allreduce_strategy} {message_size}"
+            )
+        except KeyError:
+            # Store all three values
+            custom_allreduce_data[dtype][tp_size][allreduce_strategy][message_size] = {
+                "latency": latency,
+                "power": power,
+                "energy": energy,  # NEW: precomputed energy
+            }
+
+    return custom_allreduce_data
+
+
+def load_nccl_data(nccl_file):
+    """
+    Load the nccl data with power support (backward compatible).
+
+    Returns:
+        dict: Nested dict structure where leaf values are dicts with 'latency' and 'power' keys.
+    """
+    rows = _read_filtered_rows(nccl_file)
+    if rows is None:
+        logger.debug(f"NCCL data file {nccl_file} not found.")
+        return None
+    nccl_data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))
+
+    # Check if power columns exist (backward compatibility)
+    has_power = len(rows) > 0 and "power" in rows[0]
+    if not has_power:
+        logger.debug("Legacy database format detected (nccl) - power will default to 0.0")
+
+    for row in rows:
+        dtype, num_gpus, message_size, op_name, latency = (
+            row["nccl_dtype"],
+            row["num_gpus"],
+            row["message_size"],
+            row["op_name"],
+            row["latency"],
+        )
+        message_size = int(message_size)
+        latency = float(latency)
+        num_gpus = int(num_gpus)
+
+        # NEW: Read power with backward compatibility
+        power = float(row.get("power", 0.0))
+
+        # NEW: Calculate energy from power and latency
+        energy = power * latency  # watt-milliseconds
+
+        dtype = common.CommQuantMode[dtype]
+        try:
+            # Check for conflict
+            nccl_data[dtype][op_name][num_gpus][message_size]
+            logger.debug(f"value conflict in nccl data: {dtype} {op_name} {num_gpus} {message_size}")
+        except KeyError:
+            # Store all three values
+            nccl_data[dtype][op_name][num_gpus][message_size] = {
+                "latency": latency,
+                "power": power,
+                "energy": energy,  # NEW: precomputed energy
+            }
+
+    return nccl_data

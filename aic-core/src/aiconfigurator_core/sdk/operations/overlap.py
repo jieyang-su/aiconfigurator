@@ -113,9 +113,36 @@ class FallbackOp(_core.FallbackOp, OpShellKit):
         Survives pickle via the default object state (``__dict__``)."""
         return self.__dict__.get("_py_seq_split", 1)
 
-    @_seq_split.setter
-    def _seq_split(self, value: int) -> None:
-        self.__dict__["_py_seq_split"] = int(value)
+    def __init__(
+        self,
+        name: str,
+        primary: Operation,
+        fallback: list[Operation],
+        *,
+        seq_split: int = 1,
+        silicon_primary_only: bool = False,
+        primary_excluded_modes: tuple[common.DatabaseMode, ...] = (),
+    ) -> None:
+        """
+        Args:
+            name: Operation name for latency breakdown reporting.
+            primary: Single operation to try first.
+            fallback: List of operations to sum if primary fails.
+            seq_split: Carried for API uniformity. The wrapper delegates to
+                inner ops which carry their own ``seq_split``; this one is
+                stored on the base class for completeness but not used here.
+            silicon_primary_only: Try the primary only for SILICON/HYBRID.
+                Theoretical modes use the granular sequence directly when the
+                module's SOL does not cover its complete profiled boundary.
+            primary_excluded_modes: Additional modes that must execute the
+                granular sequence. This allows a module to retain its existing
+                SOL/EMPIRICAL behavior while adding a no-table ANALYTICAL path.
+        """
+        super().__init__(name, 1.0, seq_split=seq_split)  # scale_factor handled by inner ops
+        self._primary = primary
+        self._fallback = fallback
+        self._silicon_primary_only = silicon_primary_only
+        self._primary_excluded_modes = frozenset(primary_excluded_modes)
 
     def _engine_query_plan(self, kwargs: dict):
         """Composites carry no phase of their own. A phase-marked descendant
@@ -136,14 +163,46 @@ class FallbackOp(_core.FallbackOp, OpShellKit):
             return self, {"is_context": True, "batch_size": 1, "s": 1, "x": int(x)}
         return super()._engine_query_plan(kwargs)
 
-    def _engine_query_is_context(self, kwargs: dict) -> bool:
-        hint = kwargs.get("is_context")
-        if hint is not None:
-            return bool(hint)
-        inferred = _infer_phase(self)
-        # Unreachable when inferred is None (the plan override takes the
-        # token-shaped path first); kept as a safe default.
-        return True if inferred is None else inferred
+        mode = database._default_database_mode
+        use_primary = not self._silicon_primary_only or mode in (
+            common.DatabaseMode.SILICON,
+            common.DatabaseMode.HYBRID,
+        )
+        use_primary = use_primary and mode not in self._primary_excluded_modes
+        primary_database = (
+            _get_configured_database_view(
+                database,
+                common.DatabaseMode.SILICON,
+                getattr(database, "transfer_policy", None),
+            )
+            if database._default_database_mode == common.DatabaseMode.HYBRID
+            else database
+        )
+
+        if use_primary:
+            try:
+                return self._primary.query(primary_database, **kwargs)
+            except PerfDataNotAvailableError as e:
+                logger.debug(
+                    "FallbackOp '%s': primary op '%s' failed (%s: %s), using fallback ops",
+                    self._name,
+                    self._primary._name,
+                    type(e).__name__,
+                    e,
+                )
+
+        total = PerformanceResult(0.0, energy=0.0, source="empirical")
+        for op in self._fallback:
+            total += op.query(database, **kwargs)
+        return total
+
+    def get_weights(self, **kwargs):
+        # Use primary weights if available, otherwise sum fallback weights.
+        # In practice both should be equivalent since they model the same block.
+        primary_w = self._primary.get_weights(**kwargs)
+        if primary_w > 0:
+            return primary_w
+        return sum(op.get_weights(**kwargs) for op in self._fallback)
 
 
 class OverlapOp(_core.OverlapOp, OpShellKit):

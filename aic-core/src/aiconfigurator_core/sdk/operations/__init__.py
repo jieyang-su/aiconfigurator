@@ -33,21 +33,24 @@ from aiconfigurator_core.sdk.operations.base import (
 )
 from aiconfigurator_core.sdk.operations.communication import NCCL, P2P, CustomAllReduce
 from aiconfigurator_core.sdk.operations.dsa import ContextDSAModule, GenerationDSAModule
+from aiconfigurator_core.sdk.operations.dsa_granular import DSAIndexScore, DSASparseAttention, DSATopKSelect
 from aiconfigurator_core.sdk.operations.dsv4 import (
     ContextDeepSeekV4AttentionModule,
+    DeepSeekV4KVAllGather,
     DeepSeekV4MegaMoEModule,
     DeepSeekV4MHCModule,
+    DeepSeekV4SparseAttention,
     GenerationDeepSeekV4AttentionModule,
 )
 from aiconfigurator_core.sdk.operations.elementwise import ElementWise
 from aiconfigurator_core.sdk.operations.embedding import Embedding
-from aiconfigurator_core.sdk.operations.fpm_forward import FPMForwardOp
-from aiconfigurator_core.sdk.operations.gemm import GEMM
-from aiconfigurator_core.sdk.operations.mamba import GDNKernel, KDAKernel, Mamba2Kernel
+from aiconfigurator_core.sdk.operations.gemm import GEMM, ContextKVBProjGEMM
+from aiconfigurator_core.sdk.operations.mamba import GDNKernel, KDAKernel, Mamba2, Mamba2Kernel
 from aiconfigurator_core.sdk.operations.mla import (
     ContextMLA,
     GenerationMLA,
     MLABmm,
+    MLAConcatK,
     MLAModule,
     WideEPContextMLA,
     WideEPGenerationMLA,
@@ -73,11 +76,17 @@ __all__ = [
     "ContextAttention",
     "ContextDSAModule",
     "ContextDeepSeekV4AttentionModule",
+    "ContextKVBProjGEMM",
     "ContextMLA",
     "ContextMSAModule",
     "CustomAllReduce",
+    "DSAIndexScore",
+    "DSASparseAttention",
+    "DSATopKSelect",
+    "DeepSeekV4KVAllGather",
     "DeepSeekV4MHCModule",
     "DeepSeekV4MegaMoEModule",
+    "DeepSeekV4SparseAttention",
     "ElementWise",
     "Embedding",
     "EncoderAttention",
@@ -91,6 +100,7 @@ __all__ = [
     "GenerationMSAModule",
     "KDAKernel",
     "MLABmm",
+    "MLAConcatK",
     "MLAModule",
     "Mamba2Kernel",
     "MoE",

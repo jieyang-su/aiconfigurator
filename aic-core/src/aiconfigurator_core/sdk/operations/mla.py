@@ -35,8 +35,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, ClassVar
 
-import aiconfigurator_core._aiconfigurator_core as _core
-from aiconfigurator_core.sdk.operations.base import OpShellKit
+from aiconfigurator_core.sdk import common, perf_interp
+from aiconfigurator_core.sdk.errors import InterpolationDataNotAvailableError, PerfDataNotAvailableError
+from aiconfigurator_core.sdk.operations import util_empirical
+from aiconfigurator_core.sdk.operations.attention import generation_attn_flops, generation_attn_mode
+from aiconfigurator_core.sdk.operations.base import Operation, _read_filtered_rows, resolve_op_data_path
+from aiconfigurator_core.sdk.performance_result import PerformanceResult
 
 if TYPE_CHECKING:
     from aiconfigurator_core.sdk.perf_database import PerfDatabase
@@ -57,6 +61,87 @@ def _cache_key(database: PerfDatabase) -> tuple:
         database.version,
         database.enable_shared_layer,
     )
+
+
+# Native-head pin for MLA *module* tables (#1458). Module rows are single-GPU
+# rank-local head sweeps (``tp_size`` is provenance, hardcoded 1 by the module
+# collectors), so native CANNOT be derived as ``num_heads * tp_size`` — it
+# comes from the ``model`` column via this pin. Unknown models fail the load;
+# extending this map (and its Rust twin) is part of landing new module data.
+_MLA_MODULE_NATIVE_HEADS = {
+    "deepseek-ai/DeepSeek-V3": 128,
+    # vllm 0.22.0 provenance aliases of the same 128-native DSV3 geometry —
+    # they collapse into one bucket (first source wins).
+    "deepseek-ai/DeepSeek-R1": 128,
+    "nvidia/DeepSeek-V3.1-NVFP4": 128,
+}
+
+
+def _resolve_mla_module_native_key(module_data: dict, native_heads: int | None):
+    """#1431 ladder: exact -> sole bucket -> nearest <= -> smallest.
+    ``None`` (legacy callers) resolves only a single-bucket table; returns
+    ``None`` when nothing resolves."""
+    native_keys = [k for k in module_data if isinstance(k, int)]
+    if not native_keys:
+        return None
+    if native_heads is None:
+        return native_keys[0] if len(native_keys) == 1 else None
+    if native_heads in module_data:
+        return native_heads
+    if len(native_keys) == 1:
+        return native_keys[0]
+    le = [k for k in native_keys if k <= native_heads]
+    return max(le) if le else min(native_keys)
+
+
+def _mla_module_native_heads(row: dict, mla_module_file, num_heads: int) -> int:
+    """Native identity of one module row via the model pin; fails loud on
+    missing/unpinned models. tp>1 rows must be rank-local (heads * tp ==
+    native — the #1429 stale fingerprint, checked per row)."""
+    model = str(row.get("model", "") or "")
+    if not model:
+        raise ValueError(
+            f"MLA module row in {mla_module_file} carries no model column; the module "
+            f"table keys its native-head identity off the model pin (#1458)."
+        )
+    native_heads = _MLA_MODULE_NATIVE_HEADS.get(model)
+    if native_heads is None:
+        raise ValueError(
+            f"MLA module row in {mla_module_file} names unpinned model {model!r}; add its "
+            f"native head count to _MLA_MODULE_NATIVE_HEADS when landing the data (#1458)."
+        )
+    tp_size = max(1, int(row.get("tp_size", 1) or 1))
+    if tp_size > 1 and num_heads * tp_size != native_heads:
+        raise ValueError(
+            f"MLA module row in {mla_module_file} for model {model!r} has "
+            f"num_heads={num_heads} at tp_size={tp_size}, inconsistent with native "
+            f"{native_heads} (num_heads must be rank-local, #1429/#1458)."
+        )
+    return native_heads
+
+
+def _require_native_bucket(mla_dict: dict, native_heads: int | None, phase: str):
+    """Descend the native-head level of a quant-sliced MLA module table."""
+    native_key = _resolve_mla_module_native_key(mla_dict, native_heads)
+    if native_key is None:
+        buckets = sorted(k for k in mla_dict if isinstance(k, int))
+        raise PerfDataNotAvailableError(
+            f"{phase} MLA module table holds native-head buckets {buckets} but the query "
+            f"resolves none for native_heads={native_heads}; pass the model-native head "
+            f"count (MLAModule native_num_heads, #1458)."
+        )
+    return mla_dict[native_key]
+
+
+def _prefix_axis_supports(data: dict, prefix: int) -> bool:
+    """Require an exact prefix or an interpolation bracket; never extrapolate it."""
+    keys: set[int] = set()
+    for per_head in data.values():
+        if isinstance(per_head, dict):
+            keys.update(int(key) for key in per_head)
+    if prefix in keys:
+        return True
+    return len(keys) >= 2 and min(keys) < prefix < max(keys)
 
 
 # fmt: on
@@ -100,12 +185,214 @@ class ContextMLA(_core.ContextMLA, OpShellKit):
     # Query table (formerly PerfDatabase.query_context_mla)
     # ------------------------------------------------------------------
 
+    @classmethod
+    def _query_context_mla_table(
+        cls,
+        database: PerfDatabase,
+        b: int,
+        s: int,
+        prefix: int,
+        num_heads: int,
+        kvcache_quant_mode: common.KVCacheQuantMode,
+        fmha_quant_mode: common.FMHAQuantMode,
+        database_mode: common.DatabaseMode | None = None,
+    ):
+        """Query context MLA table. Verbatim port of the legacy body."""
+        # Strict eager resolution (parity with the Rust engine, which resolves
+        # flops with `?` at query entry): reject a missing *_tc_flops entry up
+        # front — a SILICON exact hit never invokes the get_sol closure.
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        if database_mode == common.DatabaseMode.ANALYTICAL:
+            if fmha_quant_mode.value.compute_dtype == "fp8":
+                raise ValueError("ANALYTICAL MLA supports BF16 compute only; FP8 FMHA is intentionally unsupported")
+            common.get_quant_tc_flops(database.system_spec, common.FMHAQuantMode.bfloat16)
+        else:
+            common.get_quant_tc_flops(database.system_spec, fmha_quant_mode)
+
+        def get_sol(
+            b: int,
+            s: int,
+            prefix: int,
+            num_heads: int,
+            kvcache_quant_mode: common.KVCacheQuantMode,
+            fmha_quant_mode: common.FMHAQuantMode,
+        ) -> tuple[float, float, float]:
+            full_s = s + prefix
+            ops = (
+                b * num_heads * 2 / 2 * (192 + 128) * (full_s * full_s - prefix * prefix)
+            )  # 2 for fma, 2 for causality. num_heads, for local heads
+            mem_bytes = (
+                b * num_heads * (kvcache_quant_mode.value.memory * full_s * (192 + 128) + 2 * s * (192 + 128))
+            )  # 2 for qk, TODO
+            sol_math = ops / common.get_quant_tc_flops(database.system_spec, fmha_quant_mode) * 1000
+            sol_mem = mem_bytes / database.system_spec["gpu"]["mem_bw"] * 1000
+            sol_time = max(sol_math, sol_mem)
+            return sol_time, sol_math, sol_mem
+
+        def get_empirical(
+            b: int,
+            s: int,
+            prefix: int,
+            num_heads: int,
+            kvcache_quant_mode: common.KVCacheQuantMode,
+            fmha_quant_mode: common.FMHAQuantMode,
+        ) -> float:
+            # SOL / util from the measured prefix-aware module grid.
+            sol_time = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
+
+            def _slice():
+                cls.load_data(database)
+                wrapper = database._context_mla_data
+                wrapper.raise_if_not_loaded()
+                return util_empirical.require_data_slice(wrapper, fmha_quant_mode, kvcache_quant_mode)
+
+            grid = util_empirical.grid_for(
+                (
+                    "ctx_mla",
+                    database.system,
+                    database.backend,
+                    database.version,
+                    fmha_quant_mode.name,
+                    kvcache_quant_mode.name,
+                ),
+                _slice,
+                lambda c: get_sol(c[2], c[1], 0, c[0], kvcache_quant_mode, fmha_quant_mode)[
+                    0
+                ],  # c=(num_heads, full_s, b)
+                depth=3,
+            )
+            latency, _ = util_empirical.estimate(sol_time, (num_heads, s + prefix, b), grid)
+            return latency
+
+        if database_mode == common.DatabaseMode.SOL:
+            sol_latency = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
+        elif database_mode == common.DatabaseMode.SOL_FULL:
+            return get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
+        elif database_mode == common.DatabaseMode.EMPIRICAL:
+            emp_latency = get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            import math
+
+            from aiconfigurator_core.sdk.kernelsim.analytical import mla_latency_ms
+
+            # MLA KernelSim is calibrated for BF16 math. FP8 KV remains the
+            # model-level storage choice (used by memory/KV-cache sizing), but
+            # this compute proxy deliberately ignores its dequantization cost.
+            if s <= 0:
+                return PerformanceResult(0.0, energy=0.0, source="analytical")
+            return PerformanceResult(
+                mla_latency_ms(
+                    system=database.system,
+                    gpu=database.system_spec["gpu"],
+                    phase="prefill",
+                    batch=b,
+                    query_length=math.ceil(s),
+                    sequence_length=math.ceil(s + prefix),
+                    local_heads=num_heads,
+                    dtype="bf16",
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
+            )
+
+        cls.load_data(database)
+        data_wrapper = database._context_mla_data
+
+        def get_silicon():
+            data_wrapper.raise_if_not_loaded()
+            full_s = s + prefix
+            prefix_correction = (full_s * full_s - prefix * prefix) / (full_s * full_s)
+            mla_dict = util_empirical.require_data_slice(data_wrapper, fmha_quant_mode, kvcache_quant_mode)
+            # Context MLA ~ seq^2 -> context grid (sqrt on seq only); samples are prefix=0.
+            config = perf_interp.context_grid_config(
+                sol_fn=lambda n_v, s_v, b_v: get_sol(b_v, s_v, 0, n_v, kvcache_quant_mode, fmha_quant_mode)[0]
+            )
+            result = perf_interp.query(config, mla_dict, num_heads, full_s, b)
+            latency = perf_interp.get_value(result, "latency") * prefix_correction
+            energy = perf_interp.get_value(result, "energy") * prefix_correction
+            return database._interp_pr(latency, energy=energy)
+
+        return database._query_silicon_or_hybrid(
+            get_silicon=get_silicon,
+            get_empirical=lambda: get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode),
+            database_mode=database_mode,
+            error_msg=(
+                f"Failed to query context mla data for {b=}, {s=}, {prefix=}, {num_heads=}, "
+                f"{kvcache_quant_mode=}, {fmha_quant_mode=}"
+            ),
+        )
+
     # ------------------------------------------------------------------
     # Op contract
     # ------------------------------------------------------------------
 
 
-class GenerationMLA(_core.GenerationMLA, OpShellKit):
+        def _q(s, pfx):
+            return database.query_context_mla(
+                b=batch_size,
+                s=s,
+                prefix=pfx,
+                num_heads=self._num_heads,
+                kvcache_quant_mode=self._kvcache_quant_mode,
+                fmha_quant_mode=self._fmha_quant_mode,
+            )
+
+        if self._cp_size and self._cp_size > 1:
+            cp = self._cp_size
+            c = max(1, -(-isl // (2 * cp)))  # ceil(isl/(2*cp)) — rank-0 zigzag halves
+            result = _q(c, prefix) + _q(c, prefix + isl - c)
+        else:
+            result = _q(isl, prefix)
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", "silicon"),
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+class MLAConcatK(Operation):
+    """SGLang DeepSeek prefill K assembly between KV projection and MHA."""
+
+    _CP_AWARE: ClassVar[bool] = True
+
+    def __init__(self, name: str, scale_factor: float, num_heads: int, *, seq_split: int = 1) -> None:
+        super().__init__(name, scale_factor, seq_split=seq_split)
+        self._num_heads = num_heads
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        batch_size = int(kwargs.get("batch_size") or 0)
+        fresh = int(kwargs.get("s") or 0)
+        prefix = kwargs.get("prefix") or 0
+        prefix_tokens = int(sum(prefix)) if isinstance(prefix, (list, tuple)) else batch_size * int(prefix)
+        fresh_tokens = batch_size * fresh
+        num_tokens = -(-(fresh_tokens + prefix_tokens) // self._seq_split)
+        if num_tokens <= 0:
+            raise ValueError("MLAConcatK requires positive batch_size and sequence length")
+
+        # Read K-nope and shared K-rope, then write the assembled 192-wide K.
+        read_nope = num_tokens * self._num_heads * 128 * 2
+        read_rope = num_tokens * 64 * 2
+        write_k = num_tokens * self._num_heads * 192 * 2
+        result = database.query_mem_op(read_nope + read_rope + write_k)
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", "empirical"),
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights
+
+
+class GenerationMLA(Operation):
     """
     Generation MLA operation (MQA part). Owns ``_generation_mla_data``.
     """
@@ -142,6 +429,112 @@ class GenerationMLA(_core.GenerationMLA, OpShellKit):
     # ------------------------------------------------------------------
     # Query table (formerly PerfDatabase.query_generation_mla)
     # ------------------------------------------------------------------
+
+    @classmethod
+    def _query_generation_mla_table(
+        cls,
+        database: PerfDatabase,
+        b: int,
+        s: int,
+        num_heads: int,
+        kvcache_quant_mode: common.KVCacheQuantMode,
+        database_mode: common.DatabaseMode | None = None,
+    ):
+        """Query generation MLA table. Verbatim port of the legacy body."""
+        # Strict eager resolution (parity with the Rust engine, which resolves
+        # flops with `?` at query entry): reject a missing *_tc_flops entry up
+        # front — a SILICON exact hit never invokes the get_sol closure.
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        if database_mode == common.DatabaseMode.ANALYTICAL:
+            common.get_quant_tc_flops(database.system_spec, common.FMHAQuantMode.bfloat16)
+        else:
+            generation_attn_flops(database.system_spec, kvcache_quant_mode)
+
+        def get_sol(
+            b: int, s: int, num_heads: int, kvcache_quant_mode: common.KVCacheQuantMode
+        ) -> tuple[float, float, float]:
+            ops = 2 * b * num_heads * 1088 * s
+            mem_bytes = b * (num_heads * 1088 * 2 + (s - 1) * 576 * kvcache_quant_mode.value.memory)
+            sol_math = ops / generation_attn_flops(database.system_spec, kvcache_quant_mode) * 1000
+            sol_mem = mem_bytes / database.system_spec["gpu"]["mem_bw"] * 1000
+            sol_time = max(sol_math, sol_mem)
+            return sol_time, sol_math, sol_mem
+
+        def get_empirical(
+            b: int,
+            s: int,
+            num_heads: int,
+            kvcache_quant_mode: common.KVCacheQuantMode,
+        ) -> float:
+            # SOL / util from own (num_heads, b, s) grid; raises if no data.
+            sol_time = get_sol(b, s, num_heads, kvcache_quant_mode)[0]
+
+            def _slice():
+                cls.load_data(database)
+                wrapper = database._generation_mla_data
+                wrapper.raise_if_not_loaded()
+                return util_empirical.require_data_slice(wrapper, kvcache_quant_mode)
+
+            grid = util_empirical.grid_for(
+                ("gen_mla", database.system, database.backend, database.version, kvcache_quant_mode.name),
+                _slice,
+                lambda c: get_sol(c[1], c[2], c[0], kvcache_quant_mode)[0],  # c=(num_heads, b, s)
+                depth=3,
+            )
+            latency, _ = util_empirical.estimate(sol_time, (num_heads, b, s), grid)
+            return latency
+
+        if database_mode == common.DatabaseMode.SOL:
+            sol_latency = get_sol(b, s, num_heads, kvcache_quant_mode)[0]
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
+        elif database_mode == common.DatabaseMode.SOL_FULL:
+            return get_sol(b, s, num_heads, kvcache_quant_mode)
+        elif database_mode == common.DatabaseMode.EMPIRICAL:
+            emp_latency = get_empirical(b, s, num_heads, kvcache_quant_mode)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            import math
+
+            from aiconfigurator_core.sdk.kernelsim.analytical import mla_latency_ms
+
+            return PerformanceResult(
+                mla_latency_ms(
+                    system=database.system,
+                    gpu=database.system_spec["gpu"],
+                    phase="decode",
+                    batch=b,
+                    query_length=1,
+                    sequence_length=max(1, math.ceil(s)),
+                    local_heads=num_heads,
+                    dtype="bf16",
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
+            )
+
+        cls.load_data(database)
+        data_wrapper = database._generation_mla_data
+
+        def get_silicon():
+            data_wrapper.raise_if_not_loaded()
+            mla_dict = util_empirical.require_data_slice(data_wrapper, kvcache_quant_mode)
+            # Generation MLA ~ linear in seq -> raw generation grid.
+            config = perf_interp.generation_grid_config(
+                sol_fn=lambda n_v, b_v, s_v: get_sol(b_v, s_v, n_v, kvcache_quant_mode)[0]
+            )
+            result = perf_interp.query(config, mla_dict, num_heads, b, s)
+            latency = perf_interp.get_value(result, "latency")
+            energy = perf_interp.get_value(result, "energy")
+            return database._interp_pr(latency, energy=energy)
+
+        return database._query_silicon_or_hybrid(
+            get_silicon=get_silicon,
+            get_empirical=lambda: get_empirical(b, s, num_heads, kvcache_quant_mode),
+            database_mode=database_mode,
+            error_msg=f"Failed to query generation mla data for {b=}, {s=}, {num_heads=}, {kvcache_quant_mode=}",
+        )
 
     # ------------------------------------------------------------------
     # Op contract
@@ -183,6 +576,177 @@ class MLABmm(_core.MLABmm, OpShellKit):
     @classmethod
     def clear_cache(cls) -> None:
         cls._data_cache.clear()
+
+    # ------------------------------------------------------------------
+    # Query table (formerly PerfDatabase.query_mla_bmm)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _resolve_slice_heads(
+        cls,
+        database: PerfDatabase,
+        quant_mode: common.GEMMQuantMode,
+        op_name: str,
+        num_heads: int,
+    ) -> int:
+        """Head slice the mla_bmm table queries run against.
+
+        Exact-head-first: return ``num_heads`` when the table has rows for
+        the exact requested head count, else the next power of two — the
+        DeepSeek grid every dataset carries (exact rows for non-pow2 shards,
+        e.g. Kimi-K3's 96/48/24/12, exist only where re-collected). Callers
+        scale the slice's result by ``num_heads / slice_heads``. A missing
+        table/slice also resolves to the pow2 fallback so downstream misses
+        keep the legacy error shape. Rust twin:
+        ``operators/mla.rs::resolve_bmm_slice_heads``.
+        """
+        pow2 = 1
+        while pow2 < num_heads:
+            pow2 *= 2
+        if pow2 == num_heads:
+            return num_heads
+        try:
+            cls.load_data(database)
+            wrapper = database._mla_bmm_data
+            wrapper.raise_if_not_loaded()
+            qm = quant_mode if quant_mode in wrapper else common.GEMMQuantMode.bfloat16
+            util_empirical.require_data_slice(wrapper, qm, op_name, num_heads)
+        except PerfDataNotAvailableError:
+            return pow2
+        return num_heads
+
+    @classmethod
+    def _query_mla_bmm_table(
+        cls,
+        database: PerfDatabase,
+        num_tokens: int,
+        num_heads: int,
+        quant_mode: common.GEMMQuantMode,
+        if_pre: bool = True,
+        database_mode: common.DatabaseMode | None = None,
+    ):
+        """Query MLA BMM table (legacy body + exact-head-first routing)."""
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        # MLA KernelSim is calibrated for BF16 math. Keep the model-level FP8
+        # KV mode for cache-capacity accounting, but price the decode absorption
+        # BMMs with the same BF16-compute proxy as GenerationMLA. This also lets
+        # BF16-only systems evaluate FP8 KV storage without inventing FP8 MMA.
+        compute_quant_mode = (
+            common.GEMMQuantMode.bfloat16
+            if database_mode == common.DatabaseMode.ANALYTICAL
+            else quant_mode
+        )
+        # Strict eager resolution (parity with the Rust engine, which resolves
+        # flops with `?` at query entry): reject a missing *_tc_flops entry up
+        # front — a SILICON exact hit never invokes the get_sol closure.
+        common.get_quant_tc_flops(database.system_spec, compute_quant_mode)
+
+        def get_sol(
+            num_tokens: int, num_heads: int, quant_mode: common.GEMMQuantMode, if_pre: bool
+        ) -> tuple[float, float, float]:
+            ops = 2 * num_tokens * num_heads * 128 * 512
+            mem_bytes = num_heads * (num_tokens * 640 + 128 * 512) * quant_mode.value.memory
+            sol_math = ops / common.get_quant_tc_flops(database.system_spec, quant_mode) * 1000
+            sol_mem = mem_bytes / database.system_spec["gpu"]["mem_bw"] * 1000
+            sol_time = max(sol_math, sol_mem)
+            return sol_time, sol_math, sol_mem
+
+        def get_empirical(
+            num_tokens: int,
+            num_heads: int,
+            quant_mode: common.GEMMQuantMode,
+            if_pre: bool,
+        ) -> float:
+            # SOL / util from own num_tokens curve; raises if no data.
+            sol_time = get_sol(num_tokens, num_heads, quant_mode, if_pre)[0]
+            op_name = "mla_gen_pre" if if_pre else "mla_gen_post"
+
+            def _slice():
+                cls.load_data(database)
+                wrapper = database._mla_bmm_data
+                wrapper.raise_if_not_loaded()
+                qm = quant_mode if quant_mode in wrapper else common.GEMMQuantMode.bfloat16
+                return util_empirical.require_data_slice(wrapper, qm, op_name, num_heads)
+
+            grid = util_empirical.grid_for(
+                ("mla_bmm", database.system, database.backend, database.version, quant_mode.name, op_name, num_heads),
+                _slice,
+                lambda c: get_sol(c[0], num_heads, quant_mode, if_pre)[0],  # c=(num_tokens,)
+                depth=1,
+            )
+            latency, _ = util_empirical.estimate(sol_time, (num_tokens,), grid)
+            return latency
+
+        if database_mode == common.DatabaseMode.SOL:
+            sol_latency = get_sol(num_tokens, num_heads, quant_mode, if_pre)[0]
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
+        elif database_mode == common.DatabaseMode.SOL_FULL:
+            return get_sol(num_tokens, num_heads, quant_mode, if_pre)
+        elif database_mode == common.DatabaseMode.ANALYTICAL:
+            from aiconfigurator_core.sdk.kernelsim.analytical import bmm_latency_ms
+
+            gpu = database.system_spec["gpu"]
+            return PerformanceResult(
+                bmm_latency_ms(
+                    num_tokens=num_tokens,
+                    num_heads=num_heads,
+                    if_pre=if_pre,
+                    dtype="bf16",
+                    peak_flops_s=gpu["bfloat16_tc_flops"],
+                    mem_bandwidth_bytes_s=gpu["mem_bw"],
+                    config=database._analytical_config,
+                ),
+                energy=0.0,
+                source="analytical",
+            )
+
+        # Exact-head-first routing with a data-presence fallback: query the
+        # exact head slice at scale 1.0 when it has rows, otherwise the
+        # next-pow2 DeepSeek slice scaled linearly by the head ratio (BMM is
+        # per-head batched; reproduces the legacy count-ratio modeling for
+        # Kimi-K3's 96-family shards). The SOL modes above are exactly
+        # linear in num_heads and need no routing. Rust twin:
+        # ``operators/mla.rs::query_mla_bmm_table``.
+        op_name = "mla_gen_pre" if if_pre else "mla_gen_post"
+        slice_heads = cls._resolve_slice_heads(database, quant_mode, op_name, num_heads)
+        head_scale = num_heads / slice_heads
+
+        if database_mode == common.DatabaseMode.EMPIRICAL:
+            emp_latency = get_empirical(num_tokens, slice_heads, quant_mode, if_pre) * head_scale
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+
+        cls.load_data(database)
+        data_wrapper = database._mla_bmm_data
+
+        def get_silicon():
+            data_wrapper.raise_if_not_loaded()
+            quant_mode_lookup = quant_mode if quant_mode in data_wrapper else common.GEMMQuantMode.bfloat16
+            mla_bmm_dict = util_empirical.require_data_slice(
+                data_wrapper,
+                quant_mode_lookup,
+                op_name,
+                slice_heads,
+            )
+            # 1-D tokens curve on the raw table: RAW lerp in range (BMM is
+            # ~linear in tokens); boundary util-hold beyond it via the BMM SOL
+            # (replaces the legacy raw two-point extrapolation).
+            config = perf_interp.OpInterpConfig(
+                axes=("num_tokens",),
+                resolver=perf_interp.Grid(),
+                sol_fn=lambda t: get_sol(t, slice_heads, quant_mode, if_pre)[0],
+            )
+            result = perf_interp.query(config, mla_bmm_dict, num_tokens)
+            lat = perf_interp.get_value(result, "latency")
+            energy = perf_interp.get_value(result, "energy")
+            return database._interp_pr(lat * head_scale, energy=energy * head_scale)
+
+        return database._query_silicon_or_hybrid(
+            get_silicon=get_silicon,
+            get_empirical=lambda: get_empirical(num_tokens, slice_heads, quant_mode, if_pre) * head_scale,
+            database_mode=database_mode,
+            error_msg=f"Failed to query mla bmm data for {num_tokens=}, {num_heads=}, {quant_mode=}, {if_pre=}",
+        )
 
     # ------------------------------------------------------------------
     # Op contract
@@ -262,6 +826,264 @@ class MLAModule(_core.MLAModule, OpShellKit):
     # Query tables (formerly PerfDatabase.query_context_mla_module /
     # query_generation_mla_module)
     # ------------------------------------------------------------------
+
+    @classmethod
+    def _query_context_mla_module_table(
+        cls,
+        database: PerfDatabase,
+        b: int,
+        s: int,
+        prefix: int,
+        num_heads: int,
+        kvcache_quant_mode: common.KVCacheQuantMode,
+        fmha_quant_mode: common.FMHAQuantMode,
+        gemm_quant_mode: common.GEMMQuantMode = common.GEMMQuantMode.bfloat16,
+        *,
+        native_num_heads: int | None = None,
+        database_mode: common.DatabaseMode | None = None,
+    ):
+        """Query context MLA module table. ``num_heads`` is the rank-local
+        interp coordinate; ``native_num_heads`` selects the model-identity
+        bucket (#1458, None = legacy single-native behavior)."""
+        # Strict eager resolution (parity with the Rust engine, which resolves
+        # flops with `?` at query entry): reject a missing *_tc_flops entry up
+        # front — a SILICON exact hit never invokes the get_sol closure.
+        common.get_quant_tc_flops(database.system_spec, fmha_quant_mode)
+
+        def get_sol(
+            b: int,
+            s: int,
+            prefix: int,
+            num_heads: int,
+            kvcache_quant_mode: common.KVCacheQuantMode,
+            fmha_quant_mode: common.FMHAQuantMode,
+        ) -> tuple[float, float, float]:
+            # Reuse the same SOL model as query_context_mla
+            full_s = s + prefix
+            ops = b * num_heads * 2 / 2 * (192 + 128) * (full_s * full_s - prefix * prefix)
+            mem_bytes = b * num_heads * (kvcache_quant_mode.value.memory * full_s * (192 + 128) + 2 * s * (192 + 128))
+            sol_math = ops / common.get_quant_tc_flops(database.system_spec, fmha_quant_mode) * 1000
+            sol_mem = mem_bytes / database.system_spec["gpu"]["mem_bw"] * 1000
+            sol_time = max(sol_math, sol_mem)
+            return sol_time, sol_math, sol_mem
+
+        def get_empirical(
+            b: int,
+            s: int,
+            prefix: int,
+            num_heads: int,
+            kvcache_quant_mode: common.KVCacheQuantMode,
+            fmha_quant_mode: common.FMHAQuantMode,
+        ) -> float:
+            # SOL / util from own (num_heads, full_s, b) grid; raises if no data.
+            sol_time = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
+
+            def _slice():
+                cls.load_data(database)
+                wrapper = database._context_mla_module_data
+                wrapper.raise_if_not_loaded()
+                sliced = util_empirical.require_data_slice(
+                    wrapper,
+                    fmha_quant_mode,
+                    kvcache_quant_mode,
+                    gemm_quant_mode,
+                )
+                table = _require_native_bucket(sliced, native_num_heads, "context")
+                if not _prefix_axis_supports(table, prefix):
+                    raise PerfDataNotAvailableError(
+                        f"Context MLA module has no reliable prefix bracket for prefix={prefix}."
+                    )
+                return table
+
+            grid = util_empirical.grid_for(
+                (
+                    "ctx_mla_mod",
+                    database.system,
+                    database.backend,
+                    database.version,
+                    fmha_quant_mode.name,
+                    kvcache_quant_mode.name,
+                    gemm_quant_mode.name,
+                    native_num_heads,
+                ),
+                _slice,
+                lambda c: get_sol(c[3], c[2], c[1], c[0], kvcache_quant_mode, fmha_quant_mode)[0],
+                depth=4,
+            )
+            latency, _ = util_empirical.estimate(sol_time, (num_heads, prefix, s, b), grid)
+            return latency
+
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        if database_mode == common.DatabaseMode.SOL:
+            sol_latency = get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)[0]
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
+        elif database_mode == common.DatabaseMode.SOL_FULL:
+            return get_sol(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
+        elif database_mode == common.DatabaseMode.EMPIRICAL:
+            emp_latency = get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+
+        cls.load_data(database)
+        data_wrapper = database._context_mla_module_data
+
+        def get_silicon():
+            data_wrapper.raise_if_not_loaded()
+            mla_dict = util_empirical.require_data_slice(
+                data_wrapper,
+                fmha_quant_mode,
+                kvcache_quant_mode,
+                gemm_quant_mode,
+            )
+            mla_dict = _require_native_bucket(mla_dict, native_num_heads, "context")
+            if not _prefix_axis_supports(mla_dict, prefix):
+                raise PerfDataNotAvailableError(
+                    "Context MLA module has no reliable prefix bracket for "
+                    f"prefix={prefix}, system='{database.system}', backend='{database.backend}', "
+                    f"version='{database.version}'."
+                )
+            config = perf_interp.OpInterpConfig(
+                axes=("num_heads", "prefix", "fresh_seq_len", "batch"),
+                resolver=perf_interp.Grid(),
+                sol_fn=lambda n_v, p_v, s_v, b_v: get_sol(b_v, s_v, p_v, n_v, kvcache_quant_mode, fmha_quant_mode)[0],
+            )
+            try:
+                result = perf_interp.query(config, mla_dict, num_heads, prefix, s, b)
+            except InterpolationDataNotAvailableError as exc:
+                raise PerfDataNotAvailableError(
+                    f"Context MLA module data cannot resolve {num_heads=}, {prefix=}, {s=}, {b=}."
+                ) from exc
+            latency = perf_interp.get_value(result, "latency")
+            energy = perf_interp.get_value(result, "energy")
+            return database._interp_pr(latency, energy=energy)
+
+        return database._query_silicon_or_hybrid(
+            get_silicon=get_silicon,
+            get_empirical=lambda: get_empirical(b, s, prefix, num_heads, kvcache_quant_mode, fmha_quant_mode),
+            database_mode=database_mode,
+            error_msg=(
+                f"Failed to query context MLA module data for {b=}, {s=}, {prefix=}, "
+                f"{num_heads=}, {kvcache_quant_mode=}, {fmha_quant_mode=}, {gemm_quant_mode=}"
+            ),
+        )
+
+    @classmethod
+    def _query_generation_mla_module_table(
+        cls,
+        database: PerfDatabase,
+        b: int,
+        s: int,
+        num_heads: int,
+        kv_cache_dtype: common.KVCacheQuantMode,
+        gemm_quant_mode: common.GEMMQuantMode = common.GEMMQuantMode.bfloat16,
+        *,
+        native_num_heads: int | None = None,
+        database_mode: common.DatabaseMode | None = None,
+    ):
+        """Query generation MLA module table.
+
+        Same ``[native][local]`` contract as the context variant (#1458).
+        """
+        # Strict eager resolution (parity with the Rust engine, which resolves
+        # flops with `?` at query entry): reject a missing *_tc_flops entry up
+        # front — a SILICON exact hit never invokes the get_sol closure.
+        generation_attn_flops(database.system_spec, kv_cache_dtype)
+        common.get_quant_tc_flops(database.system_spec, gemm_quant_mode)
+
+        # Reuse the same SOL model as query_generation_mla — the module captures
+        # the same operations, just profiled together. For a proper SOL we'd
+        # also include BMM pre/post, but that's a refinement for later; the
+        # primary purpose here is SILICON mode with real data.
+        def get_sol(
+            b: int, s: int, num_heads: int, kv_cache_dtype: common.KVCacheQuantMode
+        ) -> tuple[float, float, float]:
+            # MLA attention ops
+            attn_ops = 2 * b * num_heads * 1088 * s
+            mem_bytes = b * (num_heads * 1088 * 2 + (s - 1) * 576 * kv_cache_dtype.value.memory)
+            sol_math = attn_ops / generation_attn_flops(database.system_spec, kv_cache_dtype) * 1000
+            sol_mem = mem_bytes / database.system_spec["gpu"]["mem_bw"] * 1000
+            # Add BMM pre + post SOL (same as query_mla_bmm)
+            bmm_ops = 2 * 2 * b * num_heads * 128 * 512  # pre + post
+            bmm_mem = 2 * num_heads * (b * 640 + 128 * 512) * gemm_quant_mode.value.memory
+            bmm_math = bmm_ops / common.get_quant_tc_flops(database.system_spec, gemm_quant_mode) * 1000
+            bmm_mem_time = bmm_mem / database.system_spec["gpu"]["mem_bw"] * 1000
+            sol_math += bmm_math
+            sol_mem += bmm_mem_time
+            sol_time = max(sol_math, sol_mem)
+            return sol_time, sol_math, sol_mem
+
+        def get_empirical(b: int, s: int, num_heads: int, kv_cache_dtype: common.KVCacheQuantMode) -> float:
+            # SOL / util from own (num_heads, b, s) grid; raises if no data.
+            sol_time = get_sol(b, s, num_heads, kv_cache_dtype)[0]
+
+            def _slice():
+                cls.load_data(database)
+                wrapper = database._generation_mla_module_data
+                wrapper.raise_if_not_loaded()
+                sliced = util_empirical.require_data_slice(
+                    wrapper,
+                    kv_cache_dtype,
+                    gemm_quant_mode,
+                )
+                return _require_native_bucket(sliced, native_num_heads, "generation")
+
+            grid = util_empirical.grid_for(
+                (
+                    "gen_mla_mod",
+                    database.system,
+                    database.backend,
+                    database.version,
+                    kv_cache_dtype.name,
+                    gemm_quant_mode.name,
+                    native_num_heads,
+                ),
+                _slice,
+                lambda c: get_sol(c[1], c[2], c[0], kv_cache_dtype)[0],  # c=(num_heads, b, s)
+                depth=3,
+            )
+            latency, _ = util_empirical.estimate(sol_time, (num_heads, b, s), grid)
+            return latency
+
+        if database_mode is None:
+            database_mode = database._default_database_mode
+        if database_mode == common.DatabaseMode.SOL:
+            sol_latency = get_sol(b, s, num_heads, kv_cache_dtype)[0]
+            return PerformanceResult(sol_latency, energy=0.0, source="sol")
+        elif database_mode == common.DatabaseMode.SOL_FULL:
+            return get_sol(b, s, num_heads, kv_cache_dtype)
+        elif database_mode == common.DatabaseMode.EMPIRICAL:
+            emp_latency = get_empirical(b, s, num_heads, kv_cache_dtype)
+            return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+
+        cls.load_data(database)
+        data_wrapper = database._generation_mla_module_data
+
+        def get_silicon():
+            data_wrapper.raise_if_not_loaded()
+            mla_dict = util_empirical.require_data_slice(
+                data_wrapper,
+                kv_cache_dtype,
+                gemm_quant_mode,
+            )
+            mla_dict = _require_native_bucket(mla_dict, native_num_heads, "generation")
+            # Generation MLA module ~ linear in seq -> raw generation grid.
+            config = perf_interp.generation_grid_config(
+                sol_fn=lambda n_v, b_v, s_v: get_sol(b_v, s_v, n_v, kv_cache_dtype)[0]
+            )
+            result = perf_interp.query(config, mla_dict, num_heads, b, s)
+            latency = perf_interp.get_value(result, "latency")
+            energy = perf_interp.get_value(result, "energy")
+            return database._interp_pr(latency, energy=energy)
+
+        return database._query_silicon_or_hybrid(
+            get_silicon=get_silicon,
+            get_empirical=lambda: get_empirical(b, s, num_heads, kv_cache_dtype),
+            database_mode=database_mode,
+            error_msg=(
+                f"Failed to query generation MLA module data for {b=}, {s=}, "
+                f"{num_heads=}, {kv_cache_dtype=}, {gemm_quant_mode=}"
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Op contract
@@ -367,3 +1189,489 @@ class WideEPContextMLA(_core.WideEPContextMLA, OpShellKit):
     # ------------------------------------------------------------------
     # Op contract
     # ------------------------------------------------------------------
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """Query WideEP context MLA latency with power data."""
+        batch_size = kwargs.get("batch_size")
+        isl = kwargs.get("s")
+        prefix = kwargs.get("prefix")
+
+        def _q(s, pfx):
+            return database.query_wideep_context_mla(
+                b=batch_size,
+                s=s,
+                prefix=pfx,
+                tp_size=self._tp_size,
+                kvcache_quant_mode=self._kvcache_quant_mode,
+                fmha_quant_mode=self._fmha_quant_mode,
+                attention_backend=self._attn_backend,
+            )
+
+        if self._cp_size and self._cp_size > 1:
+            cp = self._cp_size
+            c = max(1, -(-isl // (2 * cp)))  # ceil(isl/(2*cp)) — rank-0 zigzag halves
+            result = _q(c, prefix) + _q(c, prefix + isl - c)
+        else:
+            result = _q(isl, prefix)
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", "silicon"),
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights * self._scale_factor
+
+
+# ─────────────────────────────────────────────────────────
+# CSV loaders (moved here from perf_database.py so each op family owns its data + parser)
+# ─────────────────────────────────────────────────────────
+
+
+def load_context_mla_data(context_mla_file):
+    """
+    Load the context mla data for trtllm with power support (backward compatible).
+
+    Returns:
+        dict: Nested dict structure where leaf values are dicts with 'latency' and 'power' keys.
+    """
+    rows = _read_filtered_rows(context_mla_file)
+    if rows is None:
+        logger.debug(f"Context mla data file {context_mla_file} not found.")
+        return None
+    context_mla_data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict()))))
+
+    # Check if power columns exist (backward compatibility)
+    has_power = len(rows) > 0 and "power" in rows[0]
+    if not has_power:
+        logger.debug("Legacy database format detected (context_mla) - power will default to 0.0")
+
+    for row in rows:
+        (
+            quant_mode,
+            kv_cache_dtype,
+            b,
+            s,
+            latency,
+        ) = row["mla_dtype"], row["kv_cache_dtype"], row["batch_size"], row["isl"], row["latency"]
+
+        if "num_heads" not in row:
+            # Retired ``128 // tp_size`` backfill: it silently mislabeled any
+            # non-128-native MLA model (#1458). Fail like the DSV4 loaders do.
+            raise ValueError(
+                f"context MLA row in {context_mla_file} carries no num_heads column; "
+                f"the rank-local head count is mandatory (#1458). Migrate the file: "
+                f"num_heads = model_native_heads // tp_size."
+            )
+        num_heads = int(row["num_heads"])
+
+        b = int(b)
+        s = int(s)
+        latency = float(latency)
+
+        # NEW: Read power with backward compatibility
+        power = float(row.get("power", 0.0))
+
+        # NEW: Calculate energy from power and latency
+        energy = power * latency  # watt-milliseconds
+
+        quant_mode = common.FMHAQuantMode[quant_mode]
+        kv_cache_dtype = common.KVCacheQuantMode[kv_cache_dtype]
+
+        try:
+            # Check for conflict
+            context_mla_data[quant_mode][kv_cache_dtype][num_heads][s][b]
+            logger.debug(f"value conflict in context mla data: {quant_mode} {kv_cache_dtype} {num_heads} {s} {b}")
+        except KeyError:
+            # Store all three values
+            context_mla_data[quant_mode][kv_cache_dtype][num_heads][s][b] = {
+                "latency": latency,
+                "power": power,
+                "energy": energy,  # NEW: precomputed energy
+            }
+
+    return context_mla_data
+
+
+def load_generation_mla_data(generation_mla_file):
+    """
+    Load the generation mla data for trtllm with power support (backward compatible).
+
+    Returns:
+        dict: Nested dict structure where leaf values are dicts with 'latency' and 'power' keys.
+    """
+    rows = _read_filtered_rows(generation_mla_file)
+    if rows is None:
+        logger.debug(f"Generation mla data file {generation_mla_file} not found.")
+        return None
+    generation_mla_data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))
+
+    # Check if power columns exist (backward compatibility)
+    has_power = len(rows) > 0 and "power" in rows[0]
+    if not has_power:
+        logger.debug("Legacy database format detected (generation_mla) - power will default to 0.0")
+
+    for row in rows:
+        quant_mode, kv_cache_dtype, b, s, step, latency = (  # noqa: F841
+            row["mla_dtype"],
+            row["kv_cache_dtype"],
+            row["batch_size"],
+            row["isl"],
+            row["step"],
+            row["latency"],
+        )
+
+        if "num_heads" not in row:
+            # Retired ``128 // tp_size`` backfill — see load_context_mla_data.
+            raise ValueError(
+                f"generation MLA row in {generation_mla_file} carries no num_heads column; "
+                f"the rank-local head count is mandatory (#1458). Migrate the file: "
+                f"num_heads = model_native_heads // tp_size."
+            )
+        num_heads = int(row["num_heads"])
+
+        b = int(b)
+        s = int(s)
+        step = int(step)
+        latency = float(latency)
+
+        # NEW: Read power with backward compatibility
+        power = float(row.get("power", 0.0))
+
+        # NEW: Calculate energy from power and latency
+        energy = power * latency  # watt-milliseconds
+
+        s = s + step
+
+        kv_cache_dtype = common.KVCacheQuantMode[kv_cache_dtype]
+
+        try:
+            # Check for conflict
+            generation_mla_data[kv_cache_dtype][num_heads][b][s]
+            logger.debug(f"value conflict in generation mla data: {kv_cache_dtype} {num_heads} {b} {s} ")
+        except KeyError:
+            # Store all three values
+            generation_mla_data[kv_cache_dtype][num_heads][b][s] = {
+                "latency": latency,
+                "power": power,
+                "energy": energy,  # NEW: precomputed energy
+            }
+
+    return generation_mla_data
+
+
+def load_mla_bmm_data(mla_bmm_file):
+    """
+    Load the mla bmm data for trtllm with power support (backward compatible).
+
+    Returns:
+        dict: Nested dict structure where leaf values are dicts with 'latency' and 'power' keys.
+    """
+    rows = _read_filtered_rows(mla_bmm_file)
+    if rows is None:
+        logger.debug(f"MLA BMM data file {mla_bmm_file} not found.")
+        return None
+    mla_bmm_data = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))
+
+    # Check if power columns exist (backward compatibility)
+    has_power = len(rows) > 0 and "power" in rows[0]
+    if not has_power:
+        logger.debug("Legacy database format detected (mla_bmm) - power will default to 0.0")
+
+    for row in rows:
+        quant_mode, num_tokens, num_heads, latency, op_name = (
+            row["bmm_dtype"],
+            row["num_tokens"],
+            row["num_heads"],
+            row["latency"],
+            row["op_name"],
+        )
+        num_tokens = int(num_tokens)
+        num_heads = int(num_heads)
+        latency = float(latency)
+
+        # NEW: Read power with backward compatibility
+        power = float(row.get("power", 0.0))
+
+        # NEW: Calculate energy from power and latency
+        energy = power * latency  # watt-milliseconds
+
+        quant_mode = common.GEMMQuantMode[quant_mode]
+
+        try:
+            # Check for conflict
+            mla_bmm_data[quant_mode][op_name][num_heads][num_tokens]
+            logger.debug(f"value conflict in mla bmm data: {op_name} {quant_mode} {num_heads} {num_tokens} ")
+        except KeyError:
+            # Store all three values
+            mla_bmm_data[quant_mode][op_name][num_heads][num_tokens] = {
+                "latency": latency,
+                "power": power,
+                "energy": energy,  # NEW: precomputed energy
+            }
+
+    return mla_bmm_data
+
+
+def load_wideep_context_mla_data(wideep_context_mla_file):
+    """
+    Load the SGLang WideEP context MLA data from wideep_context_mla_perf.parquet
+    with power support (backward compatible).
+
+    Returns:
+        dict: Nested dict structure where leaf values are dicts with 'latency' and 'power' keys.
+    """
+    rows = _read_filtered_rows(wideep_context_mla_file)
+    if rows is None:
+        logger.debug(f"SGLang wideep context mla data file {wideep_context_mla_file} not found.")
+        return None
+    wideep_context_mla_data = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict()))))
+    )
+
+    # Check if power columns exist (backward compatibility)
+    has_power = len(rows) > 0 and "power" in rows[0]
+    if not has_power:
+        logger.debug("Legacy database format detected (wideep_context_mla) - power will default to 0.0")
+
+    for row in rows:
+        (
+            quant_mode,
+            kv_cache_dtype,
+            b,
+            s,
+            latency,
+        ) = row["mla_dtype"], row["kv_cache_dtype"], row["batch_size"], row["isl"], row["latency"]
+
+        kernel_source = row.get("kernel_source", "flashinfer")
+
+        if "num_heads" not in row:
+            # Retired ``128 // tp_size`` backfill — see load_context_mla_data.
+            raise ValueError(
+                f"WideEP context MLA row in {wideep_context_mla_file} carries no num_heads "
+                f"column; the rank-local head count is mandatory (#1458). Migrate the file: "
+                f"num_heads = model_native_heads // tp_size."
+            )
+        num_heads = int(row["num_heads"])
+
+        b = int(b)
+        s = int(s)
+        latency = float(latency)
+
+        # NEW: Read power with backward compatibility
+        power = float(row.get("power", 0.0))
+
+        # NEW: Calculate energy from power and latency
+        energy = power * latency  # watt-milliseconds
+
+        quant_mode = common.FMHAQuantMode[quant_mode]
+        kv_cache_dtype = common.KVCacheQuantMode[kv_cache_dtype]
+
+        try:
+            # Check for conflict
+            wideep_context_mla_data[kernel_source][quant_mode][kv_cache_dtype][num_heads][s][b]
+            logger.debug(
+                f"value conflict in context mla data: {kernel_source} {quant_mode} {kv_cache_dtype} {num_heads} {s} {b}"
+            )
+        except KeyError:
+            # Store all three values
+            wideep_context_mla_data[kernel_source][quant_mode][kv_cache_dtype][num_heads][s][b] = {
+                "latency": latency,
+                "power": power,
+                "energy": energy,  # NEW: precomputed energy
+            }
+
+    return wideep_context_mla_data
+
+
+def load_wideep_generation_mla_data(wideep_generation_mla_file):
+    """
+    Load the SGLang WideEP generation MLA data from wideep_generation_mla_perf.parquet
+    with power support (backward compatible).
+
+    Returns:
+        dict: Nested dict structure where leaf values are dicts with 'latency' and 'power' keys.
+    """
+    rows = _read_filtered_rows(wideep_generation_mla_file)
+    if rows is None:
+        logger.debug(f"SGLang wideep generation mla data file {wideep_generation_mla_file} not found.")
+        return None
+    wideep_generation_mla_data = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))
+    )
+
+    # Check if power columns exist (backward compatibility)
+    has_power = len(rows) > 0 and "power" in rows[0]
+    if not has_power:
+        logger.debug("Legacy database format detected (wideep_generation_mla) - power will default to 0.0")
+
+    for row in rows:
+        kv_cache_dtype, b, s, step, latency = (
+            row["kv_cache_dtype"],
+            row["batch_size"],
+            row["isl"],
+            row["step"],
+            row["latency"],
+        )
+
+        kernel_source = row.get("kernel_source", "flashinfer")
+
+        if "num_heads" not in row:
+            # Retired ``128 // tp_size`` backfill — see load_context_mla_data.
+            raise ValueError(
+                f"WideEP generation MLA row in {wideep_generation_mla_file} carries no "
+                f"num_heads column; the rank-local head count is mandatory (#1458). Migrate "
+                f"the file: num_heads = model_native_heads // tp_size."
+            )
+        num_heads = int(row["num_heads"])
+
+        b = int(b)
+        s = int(s)
+        step = int(step)
+        latency = float(latency)
+
+        # NEW: Read power with backward compatibility
+        power = float(row.get("power", 0.0))
+
+        # NEW: Calculate energy from power and latency
+        energy = power * latency  # watt-milliseconds
+
+        s = s + step
+
+        kv_cache_dtype = common.KVCacheQuantMode[kv_cache_dtype]
+
+        try:
+            # Check for conflict
+            wideep_generation_mla_data[kernel_source][kv_cache_dtype][num_heads][b][s]
+            logger.debug(
+                f"value conflict in generation mla data: {kernel_source} {kv_cache_dtype} {num_heads} {b} {s} "
+            )
+        except KeyError:
+            # Store all three values
+            wideep_generation_mla_data[kernel_source][kv_cache_dtype][num_heads][b][s] = {
+                "latency": latency,
+                "power": power,
+                "energy": energy,  # NEW: precomputed energy
+            }
+
+    return wideep_generation_mla_data
+
+
+def load_context_mla_module_data(mla_module_file: str):
+    """
+    Load context MLA module-level performance data.
+
+    CSV columns: framework, version, device, op_name, kernel_source, model,
+    architecture, mla_dtype, kv_cache_dtype, gemm_type, num_heads,
+    batch_size, isl, tp_size, step, latency [, power]
+
+    Dict structure (#1458 — native level between quant keys and the local
+    head-sweep axis; native is the model identity from ``model`` via
+    ``_MLA_MODULE_NATIVE_HEADS``, num_heads stays the rank-local interp axis):
+        data[fmha][kv][gemm][native][num_heads][prefix][fresh_s][batch]
+    """
+    rows = _read_filtered_rows(mla_module_file)
+    if rows is None:
+        logger.debug(f"MLA context module data file {mla_module_file} not found.")
+        return None
+
+    mla_data = defaultdict(
+        lambda: defaultdict(
+            lambda: defaultdict(
+                lambda: defaultdict(
+                    lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict())))
+                )
+            )
+        )
+    )
+
+    has_power = len(rows) > 0 and "power" in rows[0]
+
+    for row in rows:
+        num_heads = int(row["num_heads"])
+        native_heads = _mla_module_native_heads(row, mla_module_file, num_heads)
+        b = int(row["batch_size"])
+        s = int(row["isl"])
+        prefix = int(row.get("step", 0))
+        latency = float(row["latency"])
+        power = float(row.get("power", 0.0)) if has_power else 0.0
+        energy = power * latency
+
+        fmha_mode = common.FMHAQuantMode[row["mla_dtype"]]
+        kv_dtype = common.KVCacheQuantMode[row["kv_cache_dtype"]]
+        gemm_mode = common.GEMMQuantMode[row["gemm_type"]]
+
+        try:
+            # Check for conflict: first source wins (shared-layer contract,
+            # _read_filtered_rows orders primary before sibling fallbacks).
+            mla_data[fmha_mode][kv_dtype][gemm_mode][native_heads][num_heads][prefix][s][b]
+            logger.debug(
+                f"value conflict in context mla module data: {fmha_mode} {kv_dtype} {gemm_mode} "
+                f"{native_heads} {num_heads} {prefix} {s} {b}"
+            )
+        except KeyError:
+            mla_data[fmha_mode][kv_dtype][gemm_mode][native_heads][num_heads][prefix][s][b] = {
+                "latency": latency,
+                "power": power,
+                "energy": energy,
+            }
+
+    return mla_data
+
+
+def load_generation_mla_module_data(mla_module_file: str):
+    """
+    Load generation MLA module-level performance data.
+
+    CSV columns: framework, version, device, op_name, kernel_source, model,
+    architecture, mla_dtype, kv_cache_dtype, gemm_type, num_heads,
+    batch_size, isl, tp_size, step, latency [, power]
+
+    Dict structure (#1458 — native level between quant keys and the local
+    head-sweep axis, same as the context loader):
+        data[kv_cache_quant_mode][gemm_quant_mode][native][num_heads][b][s]
+
+    The ``mla_dtype`` column is ignored: decode MLA compute dtype follows the
+    KV cache dtype (collectors hardcode ``bfloat16`` in that column), so it is
+    not a real axis — mirroring ``load_generation_mla_data``, which likewise
+    drops it.
+    """
+    rows = _read_filtered_rows(mla_module_file)
+    if rows is None:
+        logger.debug(f"MLA generation module data file {mla_module_file} not found.")
+        return None
+
+    mla_data = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict()))))
+    )
+
+    has_power = len(rows) > 0 and "power" in rows[0]
+
+    for row in rows:
+        num_heads = int(row["num_heads"])
+        native_heads = _mla_module_native_heads(row, mla_module_file, num_heads)
+        b = int(row["batch_size"])
+        s = int(row["isl"]) + int(row["step"])
+        latency = float(row["latency"])
+        power = float(row.get("power", 0.0)) if has_power else 0.0
+        energy = power * latency
+
+        gemm_mode = common.GEMMQuantMode[row["gemm_type"]]
+        kv_dtype = common.KVCacheQuantMode[row["kv_cache_dtype"]]
+
+        try:
+            # Check for conflict: first source wins (shared-layer contract,
+            # _read_filtered_rows orders primary before sibling fallbacks).
+            mla_data[kv_dtype][gemm_mode][native_heads][num_heads][b][s]
+            logger.debug(
+                f"value conflict in generation mla module data: {kv_dtype} {gemm_mode} "
+                f"{native_heads} {num_heads} {b} {s}"
+            )
+        except KeyError:
+            mla_data[kv_dtype][gemm_mode][native_heads][num_heads][b][s] = {
+                "latency": latency,
+                "power": power,
+                "energy": energy,
+            }
+
+    return mla_data

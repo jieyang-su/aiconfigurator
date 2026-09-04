@@ -303,23 +303,45 @@ def _parse_afd_max_candidates(value: str) -> int:
     return parsed
 
 
-def _add_attention_backend_argument(parser: argparse.ArgumentParser) -> None:
+def _add_analytical_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the configuration knobs shared by analytical CLI workflows."""
+    parser.add_argument("--analytical-level", choices=["standard", "low", "high"], default="standard")
     parser.add_argument(
-        "--attention-backend",
-        type=str,
-        choices=ATTENTION_BACKEND_CHOICES,
-        default=None,
-        help="Attention kernel backend used by the deployment. Applies to every model graph with standard "
-        "dense ContextAttention/GenerationAttention ops and to supported DeepSeek MLA/WideEP paths. "
-        "Support depends on the serving backend, performance tables, and backend version; unsupported named "
-        "values fail closed. For modeling, unset/default uses the mapped framework default when available and "
-        "otherwise the safe default fallback. SGLang WideEP maps unset/default to flashinfer and also supports "
-        "fa3. The deployment generator emits supported named SGLang values, omits unset/default, and rejects "
-        "fla for SGLang 0.5.14.",
+        "--analytical-fp8-gemm-recipe",
+        choices=["sglang", "deepgemm-hopper", "deepgemm-blackwell"],
+        default="sglang",
     )
+    parser.add_argument("--analytical-attention-algorithm", choices=["fa2", "fa3"], default="fa2")
+    parser.add_argument(
+        "--analytical-sparse-attention-head-quantum",
+        type=int,
+        choices=[64, 128],
+        default=None,
+        help="Optional SGLang sparse-attention execution-head quantum; omit to disable padding.",
+    )
+    parser.add_argument(
+        "--analytical-communication-mode",
+        choices=["empirical", "silicon"],
+        default="empirical",
+    )
+    parser.add_argument(
+        "--communication-placement",
+        "--analytical-communication-placement",
+        dest="communication_placement",
+        choices=["independent", "tp_first"],
+        default="independent",
+        help="Formula communication placement: legacy independent or TP-first logical layout.",
+    )
+    for phase in ("moe-dispatch", "moe-combine", "wideep-dispatch", "wideep-combine"):
+        parser.add_argument(
+            f"--analytical-{phase}-dtype",
+            choices=["half", "fp8", "int8"],
+            default="half",
+        )
 
 
 def _add_default_mode_arguments(parser):
+    _add_analytical_arguments(parser)
     parser.add_argument(
         "--model-path",
         "--model",
@@ -328,6 +350,13 @@ def _add_default_mode_arguments(parser):
         required=True,
         help="Model path: HuggingFace model path (e.g., 'Qwen/Qwen3-32B') or "
         "local path to directory containing config.json.",
+    )
+    parser.add_argument(
+        "--pareto-algorithm",
+        choices=["v1", "v2"],
+        default="v1",
+        help="PD-disaggregated Pareto implementation. v1 preserves the historical heuristic; "
+        "v2 retains the complete two-objective frontier. Aggregated serving remains on v1.",
     )
     parser.add_argument(
         "--total-gpus",
@@ -591,6 +620,7 @@ def _add_default_mode_arguments(parser):
 
 
 def _add_recommend_mode_arguments(parser):
+    _add_analytical_arguments(parser)
     parser.add_argument(
         "--model-path",
         "--model",
@@ -821,6 +851,7 @@ def _add_generate_mode_arguments(parser):
 
 def _add_estimate_mode_arguments(parser):
     """Add arguments for the estimate mode (single-point TTFT/TPOT/power estimation)."""
+    _add_analytical_arguments(parser)
     parser.add_argument(
         "--model-path",
         "--model",
@@ -1613,7 +1644,18 @@ def build_default_tasks(
     backend: str = "trtllm",
     backend_version: str | None = None,
     database_mode: str = "SILICON",
+    pareto_algorithm: str = "v1",
     transfer_policy: str | list | None = None,
+    analytical_level: str = "standard",
+    analytical_fp8_gemm_recipe: str = "sglang",
+    analytical_attention_algorithm: str = "fa2",
+    analytical_sparse_attention_head_quantum: int | None = None,
+    analytical_communication_mode: str = "empirical",
+    analytical_moe_dispatch_dtype: str = "half",
+    analytical_moe_combine_dtype: str = "half",
+    analytical_wideep_dispatch_dtype: str = "half",
+    analytical_wideep_combine_dtype: str = "half",
+    communication_placement: str = "independent",
     isl: int = 4000,
     osl: int = 1000,
     image_height: int = 0,
@@ -1827,6 +1869,16 @@ def build_default_tasks(
         "total_gpus": total_gpus,
         "database_mode": database_mode,
         "transfer_policy": transfer_policy,
+        "analytical_level": analytical_level,
+        "analytical_fp8_gemm_recipe": analytical_fp8_gemm_recipe,
+        "analytical_attention_algorithm": analytical_attention_algorithm,
+        "analytical_sparse_attention_head_quantum": analytical_sparse_attention_head_quantum,
+        "analytical_communication_mode": analytical_communication_mode,
+        "analytical_moe_dispatch_dtype": analytical_moe_dispatch_dtype,
+        "analytical_moe_combine_dtype": analytical_moe_combine_dtype,
+        "analytical_wideep_dispatch_dtype": analytical_wideep_dispatch_dtype,
+        "analytical_wideep_combine_dtype": analytical_wideep_combine_dtype,
+        "communication_placement": communication_placement,
         "free_gpu_memory_fraction": free_gpu_memory_fraction,
         "max_seq_len": max_seq_len,
         "attention_backend": attention_backend,
@@ -1872,6 +1924,7 @@ def build_default_tasks(
     def _make_disagg(backend_name: str, moe_backend_value: str | None) -> Task:
         return Task(
             serving_mode="disagg",
+            pareto_algorithm=pareto_algorithm,
             prefill_model_path=model_path,
             decode_model_path=model_path,
             prefill_system_name=system,
@@ -2765,6 +2818,16 @@ def _run_estimate_mode(args):
         backend_version=args.backend_version,
         database_mode=args.database_mode,
         transfer_policy=args.transfer_policy,
+        analytical_level=args.analytical_level,
+        analytical_fp8_gemm_recipe=args.analytical_fp8_gemm_recipe,
+        analytical_attention_algorithm=args.analytical_attention_algorithm,
+        analytical_sparse_attention_head_quantum=args.analytical_sparse_attention_head_quantum,
+        analytical_communication_mode=args.analytical_communication_mode,
+        analytical_moe_dispatch_dtype=args.analytical_moe_dispatch_dtype,
+        analytical_moe_combine_dtype=args.analytical_moe_combine_dtype,
+        analytical_wideep_dispatch_dtype=args.analytical_wideep_dispatch_dtype,
+        analytical_wideep_combine_dtype=args.analytical_wideep_combine_dtype,
+        communication_placement=args.communication_placement,
         isl=args.isl,
         osl=args.osl,
         image_height=args.image_height,
@@ -3078,7 +3141,18 @@ def _run_recommend(args) -> None:
             backend=args.backend,
             backend_version=args.backend_version,
             database_mode=args.database_mode,
+            pareto_algorithm=getattr(args, "pareto_algorithm", "v1"),
             transfer_policy=args.transfer_policy,
+            analytical_level=getattr(args, "analytical_level", "standard"),
+            analytical_fp8_gemm_recipe=getattr(args, "analytical_fp8_gemm_recipe", "sglang"),
+            analytical_attention_algorithm=getattr(args, "analytical_attention_algorithm", "fa2"),
+            analytical_sparse_attention_head_quantum=getattr(args, "analytical_sparse_attention_head_quantum", None),
+            analytical_communication_mode=getattr(args, "analytical_communication_mode", "empirical"),
+            analytical_moe_dispatch_dtype=getattr(args, "analytical_moe_dispatch_dtype", "half"),
+            analytical_moe_combine_dtype=getattr(args, "analytical_moe_combine_dtype", "half"),
+            analytical_wideep_dispatch_dtype=getattr(args, "analytical_wideep_dispatch_dtype", "half"),
+            analytical_wideep_combine_dtype=getattr(args, "analytical_wideep_combine_dtype", "half"),
+            communication_placement=getattr(args, "communication_placement", "independent"),
             isl=args.isl,
             osl=args.osl,
             image_height=args.image_height,
@@ -3245,7 +3319,18 @@ def main(args):
             backend=args.backend,
             backend_version=args.backend_version,
             database_mode=args.database_mode,
+            pareto_algorithm=getattr(args, "pareto_algorithm", "v1"),
             transfer_policy=args.transfer_policy,
+            analytical_level=getattr(args, "analytical_level", "standard"),
+            analytical_fp8_gemm_recipe=getattr(args, "analytical_fp8_gemm_recipe", "sglang"),
+            analytical_attention_algorithm=getattr(args, "analytical_attention_algorithm", "fa2"),
+            analytical_sparse_attention_head_quantum=getattr(args, "analytical_sparse_attention_head_quantum", None),
+            analytical_communication_mode=getattr(args, "analytical_communication_mode", "empirical"),
+            analytical_moe_dispatch_dtype=getattr(args, "analytical_moe_dispatch_dtype", "half"),
+            analytical_moe_combine_dtype=getattr(args, "analytical_moe_combine_dtype", "half"),
+            analytical_wideep_dispatch_dtype=getattr(args, "analytical_wideep_dispatch_dtype", "half"),
+            analytical_wideep_combine_dtype=getattr(args, "analytical_wideep_combine_dtype", "half"),
+            communication_placement=getattr(args, "communication_placement", "independent"),
             isl=args.isl,
             osl=args.osl,
             image_height=args.image_height,

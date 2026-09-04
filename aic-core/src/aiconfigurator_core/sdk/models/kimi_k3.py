@@ -515,7 +515,49 @@ class KimiK3Model(BaseModel):
                 [
                     ops.ElementWise("generation_mla_norm", c, 2 * h, 2 * h, 0.8),
                     ops.GEMM("generation_mla_downscale_gemm", c, mla["fused_qkv_a_out"], h, gemm_q),
-                    *generation_mla_block,
+                    ops.GEMM("generation_mla_q_b_gemm", c, mla["q_b_out"] // tp, cfg.q_lora_rank, gemm_q),
+                    # The absorb BMMs are priced per exact local head count
+                    # (96-family for K3). The mla_bmm query routes
+                    # exact-first: systems without exact rows (only b200
+                    # sglang carries them today) fall back to the next-pow2
+                    # DeepSeek slice scaled by the head ratio — see
+                    # operations/mla.py::MLABmm._query_mla_bmm_table.
+                    *(
+                        [
+                            ops.GenerationAttention(
+                                "generation_attention",
+                                c,
+                                self._num_heads // tp,
+                                self._num_kv_heads // tp,
+                                kvcache_q,
+                                head_size=cfg.v_head_dim,
+                                fmha_quant_mode=self.config.fmha_quant_mode,
+                            )
+                        ]
+                        if self._backend_name == "vllm"
+                        else [
+                            ops.MLABmm(
+                                "generation_bmm_pre",
+                                c,
+                                self._num_heads // tp,
+                                mla_bmm_q,
+                                if_pre=True,
+                            ),
+                            ops.GenerationMLA(
+                                "generation_attention",
+                                c,
+                                self._num_heads // tp,
+                                kvcache_q,
+                            ),
+                            ops.MLABmm(
+                                "generation_bmm_post",
+                                c,
+                                self._num_heads // tp,
+                                mla_bmm_q,
+                                if_pre=False,
+                            ),
+                        ]
+                    ),
                     ops.GEMM("generation_mla_gate_gemm", c, mla["o_in"] // tp, h, gemm_q),
                     ops.ElementWise("generation_mla_gate_mul", c, 2 * mla["o_in"] // tp, mla["o_in"] // tp, 0.8),
                     ops.CustomAllReduce("generation_mla_ar", c, h, tp),
@@ -576,6 +618,7 @@ class KimiK3Model(BaseModel):
                         n_q // tp,
                         kvcache_q,
                         head_size=v_dim,
+                        fmha_quant_mode=self.config.fmha_quant_mode,
                     ),
                     ops.GEMM("draft_proj_gemm", dc * dsf, h, n_q * v_dim // tp, gemm_q, low_precision_input=True),
                 ]
@@ -596,6 +639,7 @@ class KimiK3Model(BaseModel):
                         max(1, n_kv // tp),
                         kvcache_q,
                         head_size=hd,
+                        fmha_quant_mode=self.config.fmha_quant_mode,
                     ),
                     ops.GEMM("draft_proj_gemm", dc * dsf, h, n_q * hd // tp, gemm_q, low_precision_input=True),
                 ]

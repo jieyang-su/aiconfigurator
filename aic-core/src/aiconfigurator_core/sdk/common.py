@@ -666,6 +666,7 @@ SupportMatrixHFModels = DefaultHFModels - RetiredSupportMatrixHFModels
 Supported systems (GPU types)
 """
 SupportedSystems = {
+    "h20_sxm",
     "h100_sxm",
     "h100_pcie",
     "h200_sxm",
@@ -1075,11 +1076,8 @@ class DatabaseMode(Enum):
     HYBRID = 1  # use silicon data when available, otherwise use SOL+empirical factor
     EMPIRICAL = 2  # SOL+empirical factor
     SOL = 3  # Provide SOL time only
-    # Python-side PER-CALL diagnostic only (permanently, per the freeze plan):
-    # query_*(..., database_mode=SOL_FULL) returns the raw (sol_time, sol_math,
-    # sol_mem) tuple the sanity-check notebook plots. Never valid as a
-    # database's DEFAULT mode — mode entry raises (perf_database).
-    SOL_FULL = 4
+    SOL_FULL = 4  # Provide SOL time and details
+    ANALYTICAL = 5  # table-free calibrated kernel models
 
 
 class TransferKind(Enum):
@@ -1270,6 +1268,7 @@ class MoEQuantMode(Enum):
     """
 
     bfloat16 = QuantMapping(2, 1, "bfloat16", "bfloat16")  # w16a16
+    int8_wo = QuantMapping(1, 1, "int8_wo", "bfloat16")  # w8a16
     fp8 = QuantMapping(1, 2, "fp8", "fp8")  # w8fp8
     int4_wo = QuantMapping(0.5, 1, "int4_wo", "bfloat16")  # w4a16
     fp8_block = QuantMapping(1, 2, "fp8_block", "fp8")  # specific for trtllm torch ds fp8

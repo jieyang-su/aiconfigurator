@@ -58,7 +58,8 @@ from aiconfigurator.sdk.performance_result import MOE_COMM_FALLBACKS_COLUMN, mer
 from aiconfigurator.sdk.picking import parallel_dim, worker_gpus
 from aiconfigurator.sdk.predict import predict_agg_worker, predict_disagg_worker
 from aiconfigurator.sdk.speculative import SpeculativeDecodingProfile
-from aiconfigurator.sdk.utils import enumerate_ttft_tpot_constraints, get_model_config_from_model_path
+from aiconfigurator.sdk.utils import enumerate_ttft_tpot_constraints
+from aiconfigurator_core.sdk.system_spec import validate_parallelism
 
 logger = logging.getLogger(__name__)
 
@@ -575,6 +576,15 @@ def sweep_agg(
                 attention_dp_size=dp_size,
                 cp_size=cp_size,
             )
+            validate_parallelism(
+                database.system_spec,
+                tp=tp_size,
+                pp=pp_size,
+                attention_dp=dp_size,
+                cp=cp_size,
+                moe_tp=moe_tp_size,
+                moe_ep=moe_ep_size,
+            )
 
             # Build backend + model ONCE per parallel choice so the backend's
             # internal _agg_cache survives across the tpot sweep below.
@@ -746,6 +756,15 @@ def _get_disagg_worker_candidates(
                 attention_dp_size=dp_size,
                 cp_size=cp_size,
             )
+            validate_parallelism(
+                database.system_spec,
+                tp=tp_size,
+                pp=pp_size,
+                attention_dp=dp_size,
+                cp=cp_size,
+                moe_tp=moe_tp_size,
+                moe_ep=moe_ep_size,
+            )
 
             model = get_model(model_path=model_path, model_config=point_mc, backend_name=backend_name)
 
@@ -771,9 +790,14 @@ def _get_disagg_worker_candidates(
                 if not summary.check_oom() and not summary.check_kv_cache_oom():
                     all_configs_oom = False
                     summary_df = summary.get_summary_df().copy()
-                    summary_df[MOE_COMM_FALLBACKS_COLUMN] = [
-                        merge_moe_comm_fallbacks(summary.get_moe_comm_fallbacks())
-                    ] * len(summary_df)
+                    phase_sources = summary.get_per_ops_source()
+                    if phase_sources is None:
+                        phase_sources = (
+                            summary.get_context_source_dict()
+                            if role == "prefill"
+                            else summary.get_generation_source_dict()
+                        )
+                    summary_df["_per_ops_source"] = [phase_sources]
                     result_rows.append(summary_df)
                 else:
                     # Larger b will always OOM. check_kv_cache_oom covers the

@@ -12,6 +12,320 @@ from aiconfigurator_core.sdk.models.base import BaseModel, register_model
 from aiconfigurator_core.sdk.models.helpers import mtp_scale_factor
 
 
+def _dsv4_attention_granular_ops(
+    *,
+    phase: str,
+    scale_factor: float,
+    local_heads: int,
+    hidden_size: int,
+    q_lora_rank: int,
+    o_lora_rank: int,
+    head_dim: int,
+    rope_head_dim: int,
+    index_n_heads: int,
+    index_head_dim: int,
+    index_topk: int,
+    window_size: int,
+    compress_ratio: int,
+    local_o_groups: int,
+    kvcache_quant_mode,
+    fmha_quant_mode,
+    gemm_quant_mode,
+    cp_size: int = 1,
+) -> list:
+    """Build the SGLang V4 attention boundary from existing analytical ops."""
+    is_context = phase == "context"
+    layout = "ragged" if is_context else "paged"
+    seq_split = cp_size if is_context else 1
+    ops_list = [
+        ops.GEMM(
+            f"{phase}_dsv4_q_a_proj_c{compress_ratio}",
+            scale_factor,
+            q_lora_rank,
+            hidden_size,
+            gemm_quant_mode,
+            seq_split=seq_split,
+        ),
+        ops.GEMM(
+            f"{phase}_dsv4_wkv_proj_c{compress_ratio}",
+            scale_factor,
+            head_dim,
+            hidden_size,
+            gemm_quant_mode,
+            seq_split=seq_split,
+        ),
+        ops.ElementWise(
+            f"{phase}_dsv4_q_kv_norm_c{compress_ratio}",
+            scale_factor,
+            q_lora_rank + head_dim,
+            q_lora_rank + head_dim,
+            0.8,
+            seq_split=seq_split,
+        ),
+        ops.GEMM(
+            f"{phase}_dsv4_q_b_proj_c{compress_ratio}",
+            scale_factor,
+            local_heads * head_dim,
+            q_lora_rank,
+            gemm_quant_mode,
+            seq_split=seq_split,
+        ),
+    ]
+
+    if compress_ratio:
+        compressor_mult = 2 if compress_ratio == 4 else 1
+        for kind in ("kv", "gate"):
+            ops_list.append(
+                ops.GEMM(
+                    f"{phase}_dsv4_main_compressor_{kind}_c{compress_ratio}",
+                    scale_factor,
+                    compressor_mult * head_dim,
+                    hidden_size,
+                    gemm_quant_mode,
+                    seq_split=seq_split,
+                )
+            )
+        ops_list.append(
+            ops.ElementWise(
+                f"{phase}_dsv4_main_compress_store_c{compress_ratio}",
+                scale_factor,
+                compressor_mult * compress_ratio * head_dim,
+                head_dim + common.deepseek_v4_indexer_cache_entry_bytes(head_dim),
+                0.65,
+                seq_split=seq_split,
+            )
+        )
+
+    if compress_ratio == 4:
+        # The V4 indexer has an independent overlap compressor and projection
+        # path. Its score/TopK operate on the c4 cache, hence context_stride=4.
+        ops_list.extend(
+            [
+                ops.GEMM(
+                    f"{phase}_dsv4_index_q_proj",
+                    scale_factor,
+                    index_n_heads * index_head_dim,
+                    q_lora_rank,
+                    gemm_quant_mode,
+                    seq_split=seq_split,
+                ),
+                ops.GEMM(
+                    f"{phase}_dsv4_index_weight_proj",
+                    scale_factor,
+                    index_n_heads,
+                    hidden_size,
+                    common.GEMMQuantMode.bfloat16,
+                    seq_split=seq_split,
+                ),
+                ops.GEMM(
+                    f"{phase}_dsv4_index_compressor_kv",
+                    scale_factor,
+                    2 * index_head_dim,
+                    hidden_size,
+                    gemm_quant_mode,
+                    seq_split=seq_split,
+                ),
+                ops.GEMM(
+                    f"{phase}_dsv4_index_compressor_gate",
+                    scale_factor,
+                    2 * index_head_dim,
+                    hidden_size,
+                    gemm_quant_mode,
+                    seq_split=seq_split,
+                ),
+                ops.ElementWise(
+                    f"{phase}_dsv4_index_norm_rope_quant",
+                    scale_factor,
+                    index_n_heads * index_head_dim + 2 * 4 * index_head_dim,
+                    index_n_heads * index_head_dim + common.deepseek_v4_indexer_cache_entry_bytes(index_head_dim),
+                    0.65,
+                    seq_split=seq_split,
+                ),
+                ops.DSAIndexScore(
+                    f"{phase}_dsv4_index_score",
+                    scale_factor,
+                    layout=layout,
+                    index_heads=index_n_heads,
+                    index_head_dim=index_head_dim,
+                    index_topk=index_topk,
+                    cp_size=cp_size,
+                    context_stride=4,
+                ),
+                ops.DSATopKSelect(
+                    f"{phase}_dsv4_topk",
+                    scale_factor,
+                    layout=layout,
+                    index_topk=index_topk,
+                    cp_size=cp_size,
+                    context_stride=4,
+                    kernel_recipe="dsv4",
+                ),
+            ]
+        )
+
+    if is_context and cp_size > 1:
+        if compress_ratio == 4:
+            ops_list.append(
+                ops.DeepSeekV4KVAllGather(
+                    f"{phase}_dsv4_index_k_all_gather",
+                    scale_factor,
+                    kind="index",
+                    width=index_head_dim,
+                    cp_size=cp_size,
+                )
+            )
+        else:
+            ops_list.append(
+                ops.DeepSeekV4KVAllGather(
+                    f"{phase}_dsv4_window_kv_all_gather_c{compress_ratio}",
+                    scale_factor,
+                    kind="window",
+                    width=head_dim,
+                    cp_size=cp_size,
+                    window_size=window_size,
+                )
+            )
+        if compress_ratio:
+            ops_list.append(
+                ops.DeepSeekV4KVAllGather(
+                    f"{phase}_dsv4_compressed_kv_all_gather_c{compress_ratio}",
+                    scale_factor,
+                    kind="compressed",
+                    width=head_dim,
+                    cp_size=cp_size,
+                    compress_ratio=compress_ratio,
+                )
+            )
+
+    ops_list.extend(
+        [
+            ops.DeepSeekV4SparseAttention(
+                f"{phase}_dsv4_attention_core_c{compress_ratio}",
+                scale_factor,
+                layout=layout,
+                local_heads=local_heads,
+                head_dim=head_dim,
+                window_size=window_size,
+                compress_ratio=compress_ratio,
+                index_topk=index_topk,
+                kvcache_quant_mode=kvcache_quant_mode,
+                fmha_quant_mode=fmha_quant_mode,
+                cp_size=cp_size,
+            ),
+            ops.ElementWise(
+                f"{phase}_dsv4_output_rope_c{compress_ratio}",
+                scale_factor,
+                local_heads * rope_head_dim,
+                local_heads * rope_head_dim,
+                0.8,
+                seq_split=seq_split,
+            ),
+            # wo_a is grouped einsum. Flattening its independent groups into
+            # GEMM preserves FLOPs and weight bytes for the analytical model.
+            ops.GEMM(
+                f"{phase}_dsv4_wo_a_c{compress_ratio}",
+                scale_factor,
+                local_o_groups * o_lora_rank,
+                local_heads * head_dim // local_o_groups,
+                common.GEMMQuantMode.bfloat16,
+                seq_split=seq_split,
+            ),
+            ops.GEMM(
+                f"{phase}_dsv4_wo_b_c{compress_ratio}",
+                scale_factor,
+                hidden_size,
+                local_o_groups * o_lora_rank,
+                gemm_quant_mode,
+                seq_split=seq_split,
+            ),
+        ]
+    )
+    return ops_list
+
+
+def _dsv4_attention_with_granular(
+    *,
+    is_context: bool,
+    name: str,
+    scale_factor: float,
+    num_heads: int,
+    native_heads: int,
+    tp_size: int,
+    hidden_size: int,
+    q_lora_rank: int,
+    o_lora_rank: int,
+    head_dim: int,
+    rope_head_dim: int,
+    index_n_heads: int,
+    index_head_dim: int,
+    index_topk: int,
+    window_size: int,
+    compress_ratio: int,
+    o_groups: int,
+    kvcache_quant_mode,
+    fmha_quant_mode,
+    gemm_quant_mode,
+    cp_size: int = 1,
+    silicon_compress_ratio: int | None = None,
+):
+    phase = "context" if is_context else "generation"
+    op_cls = ops.ContextDeepSeekV4AttentionModule if is_context else ops.GenerationDeepSeekV4AttentionModule
+    primary_kwargs = dict(
+        num_heads=num_heads,
+        native_heads=native_heads,
+        tp_size=tp_size,
+        hidden_size=hidden_size,
+        q_lora_rank=q_lora_rank,
+        o_lora_rank=o_lora_rank,
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        index_n_heads=index_n_heads,
+        index_head_dim=index_head_dim,
+        index_topk=index_topk,
+        window_size=window_size,
+        compress_ratio=(compress_ratio if silicon_compress_ratio is None else silicon_compress_ratio),
+        o_groups=o_groups,
+        kvcache_quant_mode=kvcache_quant_mode,
+        fmha_quant_mode=fmha_quant_mode,
+        gemm_quant_mode=gemm_quant_mode,
+    )
+    if is_context:
+        primary_kwargs["cp_size"] = cp_size
+    primary = op_cls(name, scale_factor, **primary_kwargs)
+    fallback = _dsv4_attention_granular_ops(
+        phase=phase,
+        scale_factor=scale_factor,
+        local_heads=num_heads,
+        hidden_size=hidden_size,
+        q_lora_rank=q_lora_rank,
+        o_lora_rank=o_lora_rank,
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        index_n_heads=index_n_heads,
+        index_head_dim=index_head_dim,
+        index_topk=index_topk,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+        local_o_groups=o_groups,
+        kvcache_quant_mode=kvcache_quant_mode,
+        fmha_quant_mode=fmha_quant_mode,
+        gemm_quant_mode=gemm_quant_mode,
+        cp_size=cp_size,
+    )
+    wrapper = ops.FallbackOp(
+        name,
+        primary=primary,
+        fallback=fallback,
+        primary_excluded_modes=(common.DatabaseMode.ANALYTICAL,),
+    )
+    # FallbackOp delegates scaling to children, but model/SDK callers inspect
+    # this metadata to recover the number of represented layers.
+    wrapper._scale_factor = scale_factor
+    wrapper._gemm_quant_mode = gemm_quant_mode
+    wrapper._compress_ratio = compress_ratio
+    return wrapper
+
+
 @register_model("DEEPSEEKV4")
 class DeepSeekV4Model(BaseModel):
     """DeepSeek-V4 model with mHC plus SWA/CSA/HCA compressed attention."""
@@ -120,37 +434,33 @@ class DeepSeekV4Model(BaseModel):
 
         def _attention_ops(is_context: bool, scale_factor: float):
             ratio_counts = Counter(self._compress_ratios)
-            # Some DeepSeek-V4 configs include pure SWA layers (compress_ratio=0).
-            # Approximate their module latency with HCA (compress_ratio=128) so
-            # the model reuses DeepSeek-V4 HCA perf data instead of requiring a
-            # dedicated SWA collector. KV cache capacity below still uses the
-            # real per-layer ratios.
-            ratio_counts[128] += ratio_counts.pop(0, 0)
-            op_cls = ops.ContextDeepSeekV4AttentionModule if is_context else ops.GenerationDeepSeekV4AttentionModule
             name = "context_attention" if is_context else "generation_attention"
             return [
-                op_cls(
-                    name,
-                    count * scale_factor,
-                    local_heads,
-                    self._num_heads,
-                    tp_size,
-                    h,
-                    deepseek_v4_cfg.q_lora_rank,
-                    deepseek_v4_cfg.o_lora_rank,
-                    deepseek_v4_cfg.head_dim,
-                    deepseek_v4_cfg.qk_rope_head_dim,
-                    deepseek_v4_cfg.index_n_heads,
-                    deepseek_v4_cfg.index_head_dim,
-                    deepseek_v4_cfg.index_topk,
-                    deepseek_v4_cfg.sliding_window,
-                    ratio,
-                    local_o_groups,
-                    kvcache_quant_mode,
-                    fmha_quant_mode,
-                    gemm_quant_mode,
+                _dsv4_attention_with_granular(
+                    is_context=is_context,
+                    name=name,
+                    scale_factor=count * scale_factor,
+                    num_heads=local_heads,
+                    native_heads=self._num_heads,
+                    tp_size=tp_size,
+                    hidden_size=h,
+                    q_lora_rank=deepseek_v4_cfg.q_lora_rank,
+                    o_lora_rank=deepseek_v4_cfg.o_lora_rank,
+                    head_dim=deepseek_v4_cfg.head_dim,
+                    rope_head_dim=deepseek_v4_cfg.qk_rope_head_dim,
+                    index_n_heads=deepseek_v4_cfg.index_n_heads,
+                    index_head_dim=deepseek_v4_cfg.index_head_dim,
+                    index_topk=deepseek_v4_cfg.index_topk,
+                    window_size=deepseek_v4_cfg.sliding_window,
+                    compress_ratio=ratio,
+                    o_groups=local_o_groups,
+                    kvcache_quant_mode=kvcache_quant_mode,
+                    fmha_quant_mode=fmha_quant_mode,
+                    gemm_quant_mode=gemm_quant_mode,
                     cp_size=(cp if is_context else 1),
-                    architecture=self.architecture,
+                    # Keep the historical silicon approximation for pure SWA;
+                    # ANALYTICAL always executes the true ratio-0 fallback.
+                    silicon_compress_ratio=(128 if ratio == 0 else ratio),
                 )
                 for ratio, count in ratio_counts.items()
                 if count > 0

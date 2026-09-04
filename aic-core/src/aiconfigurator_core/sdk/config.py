@@ -66,20 +66,10 @@ class ModelConfig:
     enable_wideep: bool = False
     enable_eplb: bool = False  # Expert Parallel Load Balancing
     wideep_num_slots: int = None  # EPLB num_slots, defaults to num_experts if None
-    # Forward-pass modeling switch. "op_level" (default) keeps the granular op
-    # lists; "fpm" replaces each phase list with a single whole-model
-    # fpm_forward op backed by collected forward-pass data (see
-    # operations/fpm_forward.py). Validated in models.get_model.
-    forward_model: str = "op_level"
-    # internal — per-phase comm backend {"context": ..., "generation": ...}; set by the enumerator, never a user flag
-    moe_comm_backend: dict | None = None
-    # internal — set alongside moe_comm_backend by the enumerator (system topology).
-    # No default: a wrong node width silently mis-prices cross-node all-to-all, so
-    # large-EP construction raises when it is missing (models.helpers.large_ep_gpus_per_node).
-    num_gpus_per_node: int | None = None
-    # Internal system identity used by phase/quantization-specific communication
-    # dtype selection.  It travels with ModelConfig through sweep replacements.
-    system: str | None = None
+    # Communication placement policy. ``independent`` preserves the historical
+    # size-only bandwidth selection; ``tp_first`` is an explicit analytical
+    # what-if layout and is not a claim about NCCL rank placement.
+    communication_placement: str = "independent"
 
     def resolve_moe_parallelism(self) -> tuple[int, int]:
         """Resolve and validate MoE parallelism dimensions in-place.

@@ -754,9 +754,7 @@ class Qwen35Model(BaseModel):
                         n_kv_per_tp,
                         kvcache_q,
                         head_size=self._head_size,
-                        use_qk_norm=True,
-                        # lane_order resolves at spec-build time; see the
-                        # context_attention twin above.
+                        fmha_quant_mode=self.config.fmha_quant_mode,
                     ),
                     ops.GEMM(
                         "generation_proj_gemm",

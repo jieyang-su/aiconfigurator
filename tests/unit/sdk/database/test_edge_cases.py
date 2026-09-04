@@ -7,14 +7,233 @@ import pytest
 
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.perf_database import PerfDatabase, databases_cache, get_database
+from aiconfigurator_core.sdk.system_spec import ParallelLayout
 
 pytestmark = pytest.mark.unit
 
 
-# Retired with #1357 PR-5: the NCCL / custom-allreduce / GEMM query edge-case
-# math this file pinned on the synthetic fixture (single-GPU zero, silicon
-# interpolation, tp scaling, extrapolation) moved to the compiled engine and
-# is anchored by the frozen parity goldens.
+class TestNcclEdgeCases:
+    """Test edge cases for query_nccl method."""
+
+    def test_query_nccl_silicon_single_gpu(self, comprehensive_perf_db):
+        """Test NCCL with single GPU returns 0."""
+        result = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half, 1, "all_gather", 1024, database_mode=common.DatabaseMode.SILICON
+        )
+        assert result == 0.0
+
+    def test_query_nccl_silicon_interpolation(self, comprehensive_perf_db):
+        """Test NCCL SILICON mode with interpolation."""
+        # Use values that exist in our test data
+        result = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half, 4, "all_gather", 1024, database_mode=common.DatabaseMode.SILICON
+        )
+
+        # Should use interpolation from nccl_data
+        expected = comprehensive_perf_db._nccl_data[common.CommQuantMode.half]["all_gather"][4][1024]
+        assert math.isclose(result, expected, rel_tol=1e-6)
+
+    def test_query_nccl_silicon_large_gpu_count(self, comprehensive_perf_db):
+        """Test NCCL with more than 8 GPUs applies scaling."""
+        # First get baseline with 8 GPUs
+        baseline = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half, 8, "all_gather", 1024, database_mode=common.DatabaseMode.SILICON
+        )
+
+        # Test with 16 GPUs
+        result = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half, 16, "all_gather", 1024, database_mode=common.DatabaseMode.SILICON
+        )
+
+        node_info = comprehensive_perf_db.system_spec["node"]
+        intra_node_slowdown = node_info["intra_node_bw"] / node_info["inter_node_bw"]
+        baseline_transfers_per_gpu = (8 - 1) / 8
+        result_transfers_per_gpu = (16 - 1) / 16
+        correction_factor = intra_node_slowdown * result_transfers_per_gpu / baseline_transfers_per_gpu
+
+        expected = baseline * correction_factor
+        assert math.isclose(result, expected, rel_tol=1e-6)
+
+    def test_query_nccl_silicon_honors_tp_first_stride(self, comprehensive_perf_db):
+        local_layout = ParallelLayout(tp=4, cp=1, policy="tp_first")
+        crossing_layout = ParallelLayout(tp=4, cp=4, policy="tp_first")
+        baseline = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half,
+            4,
+            "all_gather",
+            1024,
+            database_mode=common.DatabaseMode.SILICON,
+        )
+        local = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half,
+            4,
+            "all_gather",
+            1024,
+            database_mode=common.DatabaseMode.SILICON,
+            parallel_layout=local_layout,
+            communication_group="tp",
+        )
+        crossing = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half,
+            4,
+            "all_gather",
+            1024,
+            database_mode=common.DatabaseMode.SILICON,
+            parallel_layout=crossing_layout,
+            communication_group="cp",
+        )
+
+        node = comprehensive_perf_db.system_spec["node"]
+        assert local == baseline
+        assert float(crossing) == pytest.approx(baseline * node["intra_node_bw"] / node["inter_node_bw"])
+        assert crossing.source == "silicon"
+
+    def test_query_nccl_silicon_tp_first_rank_overflow_matches_legacy(self, comprehensive_perf_db):
+        legacy = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half,
+            16,
+            "all_gather",
+            1024,
+            database_mode=common.DatabaseMode.SILICON,
+        )
+        independent = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half,
+            16,
+            "all_gather",
+            1024,
+            database_mode=common.DatabaseMode.SILICON,
+            parallel_layout=ParallelLayout(tp=8, dp=2, policy="independent"),
+            communication_group="attention",
+        )
+        tp_first = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half,
+            16,
+            "all_gather",
+            1024,
+            database_mode=common.DatabaseMode.SILICON,
+            parallel_layout=ParallelLayout(tp=8, dp=2, policy="tp_first"),
+            communication_group="attention",
+        )
+
+        assert independent == legacy
+        assert tp_first == legacy
+        assert tp_first.source == "silicon"
+
+    def test_query_nccl_edge_message_sizes(self, comprehensive_perf_db):
+        """Test NCCL with very small and very large message sizes."""
+        # Very small message
+        result_small = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half, 4, "alltoall", 1, database_mode=common.DatabaseMode.SILICON
+        )
+        assert result_small > 0
+
+        # Very large message (extrapolation)
+        result_large = comprehensive_perf_db.query_nccl(
+            common.CommQuantMode.half,
+            4,
+            "reduce_scatter",
+            1_000_000,
+            database_mode=common.DatabaseMode.SILICON,
+        )
+        assert result_large > 0
+
+
+class TestAllreduceEdgeCases:
+    """Test edge cases for query_custom_allreduce method."""
+
+    def test_query_custom_allreduce_single_gpu(self, comprehensive_perf_db):
+        """Test allreduce with single GPU returns 0."""
+        # SOL mode
+        result_sol = comprehensive_perf_db.query_custom_allreduce(
+            common.CommQuantMode.half, 1, 1024, database_mode=common.DatabaseMode.SOL
+        )
+        assert result_sol == 0.0
+
+        # SILICON mode
+        result_silicon = comprehensive_perf_db.query_custom_allreduce(
+            common.CommQuantMode.half, 1, 1024, database_mode=common.DatabaseMode.SILICON
+        )
+        assert result_silicon == 0.0
+
+    def test_query_custom_allreduce_large_tp_scaling(self, comprehensive_perf_db):
+        """Test allreduce with TP > 8 applies scaling factor."""
+        # Get baseline with TP=8
+        baseline = comprehensive_perf_db.query_custom_allreduce(
+            common.CommQuantMode.half, 8, 2048, database_mode=common.DatabaseMode.SILICON
+        )
+
+        # Test with TP=16
+        result = comprehensive_perf_db.query_custom_allreduce(
+            common.CommQuantMode.half, 16, 2048, database_mode=common.DatabaseMode.SILICON
+        )
+        independent = comprehensive_perf_db.query_custom_allreduce(
+            common.CommQuantMode.half,
+            16,
+            2048,
+            database_mode=common.DatabaseMode.SILICON,
+            parallel_layout=ParallelLayout(tp=16, policy="independent"),
+            communication_group="tp",
+        )
+
+        # Should apply scaling: lat * (tp_size-1)/tp_size * 8/7
+        node_info = comprehensive_perf_db.system_spec["node"]
+        intra_node_slowdown = node_info["intra_node_bw"] / node_info["inter_node_bw"]
+        expected_scaling = (16 - 1) / 16 * intra_node_slowdown
+        baseline_unscaled = baseline / ((8 - 1) / 8)  # Remove 8 GPU scaling
+        expected = baseline_unscaled * expected_scaling
+        assert math.isclose(result, expected, rel_tol=1e-6)
+        assert independent == result
+
+    def test_query_custom_allreduce_silicon_honors_tp_first_stride(self, comprehensive_perf_db):
+        local_layout = ParallelLayout(tp=4, cp=1, policy="tp_first")
+        crossing_layout = ParallelLayout(tp=4, cp=4, policy="tp_first")
+        baseline = comprehensive_perf_db.query_custom_allreduce(
+            common.CommQuantMode.half,
+            4,
+            2048,
+            database_mode=common.DatabaseMode.SILICON,
+        )
+        local = comprehensive_perf_db.query_custom_allreduce(
+            common.CommQuantMode.half,
+            4,
+            2048,
+            database_mode=common.DatabaseMode.SILICON,
+            parallel_layout=local_layout,
+            communication_group="tp",
+        )
+        crossing = comprehensive_perf_db.query_custom_allreduce(
+            common.CommQuantMode.half,
+            4,
+            2048,
+            database_mode=common.DatabaseMode.SILICON,
+            parallel_layout=crossing_layout,
+            communication_group="cp",
+        )
+
+        node = comprehensive_perf_db.system_spec["node"]
+        assert local == baseline
+        assert float(crossing) == pytest.approx(baseline * node["intra_node_bw"] / node["inter_node_bw"])
+        assert crossing.source == "silicon"
+
+    def test_query_custom_allreduce_extrapolation(self, comprehensive_perf_db):
+        """Test allreduce with message size requiring extrapolation."""
+        # Use a size not in our test data
+        result = comprehensive_perf_db.query_custom_allreduce(
+            common.CommQuantMode.half,
+            4,
+            3000,  # 3000 is between 2048 and 4096
+            database_mode=common.DatabaseMode.SILICON,
+        )
+        assert result > 0
+
+        # Should be between the two surrounding values
+        lower = comprehensive_perf_db.query_custom_allreduce(
+            common.CommQuantMode.half, 4, 2048, database_mode=common.DatabaseMode.SILICON
+        )
+        upper = comprehensive_perf_db.query_custom_allreduce(
+            common.CommQuantMode.half, 4, 4096, database_mode=common.DatabaseMode.SILICON
+        )
+        assert lower < result < upper
 
 
 class TestInitializationEdgeCases:

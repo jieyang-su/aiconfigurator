@@ -86,6 +86,7 @@ def filter_real_silicon_configs(
     min_num_gpus: int | None = None,
     max_num_gpus: int | None = None,
     allow_moe_pure_tp: bool = True,
+    single_supernode_gpus: int | None = None,
 ) -> list[list[int]]:
     """Filter parallel configs for real-silicon sweep runs.
 
@@ -108,6 +109,13 @@ def filter_real_silicon_configs(
     for cfg in parallel_config_list:
         tp, pp, dp, _moe_tp, _moe_ep, cp = cfg
         total_gpus = tp * pp * dp * cp
+
+        if single_supernode_gpus is not None and (
+            total_gpus > single_supernode_gpus
+            or tp * dp * cp > single_supernode_gpus
+            or _moe_tp * _moe_ep > single_supernode_gpus
+        ):
+            continue
 
         # GPU count bounds
         if min_num_gpus is not None and total_gpus < min_num_gpus:
@@ -153,6 +161,7 @@ def enumerate_parallel_config(
     min_num_gpus: int | None = None,
     max_num_gpus: int | None = None,
     allow_moe_pure_tp: bool = True,
+    single_supernode_gpus: int | None = None,
 ) -> list[list[int]]:
     """
     Enumerate parallel configurations based on parallel list.
@@ -214,6 +223,12 @@ def enumerate_parallel_config(
                                     continue
                                 if dp * tp * cp != moe_tp * moe_ep:
                                     continue
+                                if single_supernode_gpus is not None and (
+                                    dp * tp * pp * cp > single_supernode_gpus
+                                    or dp * tp * cp > single_supernode_gpus
+                                    or moe_tp * moe_ep > single_supernode_gpus
+                                ):
+                                    continue
                                 # backend specific filters
                                 # trtllm
                                 if (
@@ -222,15 +237,23 @@ def enumerate_parallel_config(
                                     continue
                                 # sglang
                                 elif backend == common.BackendName.sglang:
-                                    if moe_backend == "megamoe" and moe_tp > 1:
-                                        continue  # SGLang MegaMoE is EP-only (moe_tp=1).
+                                    # SGLang context parallelism shards the sequence axis
+                                    # and is mutually exclusive with attention TP/DP.
+                                    # Filter these combinations before model construction
+                                    # instead of reporting them as per-point failures.
+                                    if cp > 1 and (tp > 1 or dp > 1):
+                                        continue
+                                    if (enable_wideep or moe_backend in {"deepep_moe", "megamoe"}) and moe_tp > 1:
+                                        continue  # SGLang EP-only MoE backends require moe_tp=1.
                                 elif backend == common.BackendName.vllm:  # noqa: SIM102
                                     if moe_tp > 1 and moe_ep > 1:
                                         continue  # vllm does not support MoE TP and MoE EP simultaneously
                                 parallel_config_list.append([tp, pp, dp, moe_tp, moe_ep, cp])
             else:
                 for cp in cp_list:
-                    if tp * pp * cp in num_gpu_list:
+                    if tp * pp * cp in num_gpu_list and (
+                        single_supernode_gpus is None or tp * pp * cp <= single_supernode_gpus
+                    ):
                         parallel_config_list.append([tp, pp, 1, 1, 1, cp])
 
     # Apply real silicon sweep filters to reduce sweep time on real silicon
@@ -241,6 +264,7 @@ def enumerate_parallel_config(
             min_num_gpus=min_num_gpus,
             max_num_gpus=max_num_gpus,
             allow_moe_pure_tp=allow_moe_pure_tp,
+            single_supernode_gpus=single_supernode_gpus,
         )
 
     return parallel_config_list
