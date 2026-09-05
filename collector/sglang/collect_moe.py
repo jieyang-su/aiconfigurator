@@ -363,15 +363,11 @@ def benchmark_config(
         else:
             current_hidden_states = workloads[i % num_iters]["hidden_states"]
             current_topk_output = workloads[i % num_iters]["topk_output"]
-            # build_rank0_local_workload sets remote expert IDs to -1
-            # and their weights to 0. The Triton fused_moe kernel indexes
-            # weight tensors by expert ID without masking, so clamp -1 to 0;
-            # the zero weight still ensures no contribution.
-            current_topk_output = StandardTopKOutput(
-                topk_weights=current_topk_output.topk_weights,
-                topk_ids=current_topk_output.topk_ids.clamp(min=0),
-                router_logits=current_topk_output.router_logits,
-            )
+            # build_rank0_local_workload marks remote EP experts as -1 and
+            # sets their weights to zero. SGLang's EP-aware alignment and
+            # Triton kernels use -1 as the filtered-expert sentinel; keeping
+            # it here prevents remote slots from becoming local expert 0
+            # workload.
 
         with override_config(config):
             fused_moe(
