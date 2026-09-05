@@ -9,11 +9,13 @@ owns SGLang kernel compatibility, server-args mocking, routing-logit synthesis,
 rank-local workload construction, quantized weight setup, and perf logging.
 """
 
-__compat__ = "sglang==0.5.14"
+__compat__ = "sglang==0.5.18"
 
 import gc
+import csv
 import importlib
 import itertools
+import json
 import os
 import tempfile
 from contextlib import contextmanager
@@ -29,18 +31,42 @@ import pkg_resources
 import sglang.srt.server_args as _server_args_module
 import torch
 
-if _server_args_module._global_server_args is None:
-    _mock_server_args = MagicMock()
+try:
+    _global_server_args = _server_args_module.get_global_server_args()
+except (AttributeError, RuntimeError, ValueError):
+    _global_server_args = None
+
+if _global_server_args is None:
+    # SGLang 0.5.18 projects runtime namespaces from a real ServerArgs
+    # dataclass.  A bare MagicMock publishes no ``exec`` namespace, which
+    # makes FusedMoE fail when it reads runtime_context.get_exec().
+    try:
+        _mock_server_args = _server_args_module.ServerArgs(model_path="dummy")
+    except (AttributeError, TypeError):
+        _mock_server_args = MagicMock()
     _mock_server_args.enable_deterministic_inference = False
     _mock_server_args.enable_fused_moe_sum_all_reduce = (
-        False  # SGLang 0.5.14; prevents fused all-reduce in single-GPU benchmarks
+        False  # Prevent fused all-reduce in single-GPU benchmarks.
     )
     _mock_server_args.kt_weight_path = None
     _mock_server_args.flashinfer_mxfp4_moe_precision = "default"
-    _server_args_module._global_server_args = _mock_server_args
+    if hasattr(_server_args_module, "set_global_server_args_for_scheduler"):
+        # SGLang 0.5.18 stores process-wide args in runtime_context; the
+        # setter is the public compatibility shim for the old private global.
+        _server_args_module.set_global_server_args_for_scheduler(_mock_server_args)
+    else:
+        _server_args_module._global_server_args = _mock_server_args
 
 import sglang.srt.layers.moe.fused_moe_triton.layer as _moe_layer_mod
-import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels as _fmoe_kernels_mod
+try:
+    import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels as _fmoe_kernels_mod
+except ModuleNotFoundError:
+    # SGLang 0.5.18 moved the Triton kernel cache module.  Keep the collector
+    # source-compatible with older images while using the new module when the
+    # old compatibility path is absent.
+    import sglang.srt.layers.moe.moe_runner.triton_kernels as _fmoe_kernels_mod
+    if not hasattr(_fmoe_kernels_mod, "_B_DESC_CACHE"):
+        _fmoe_kernels_mod._B_DESC_CACHE = {}
 import sglang.srt.layers.moe.token_dispatcher.standard as _std_dispatch_mod
 import sglang.srt.layers.moe.topk as _topk_mod
 import sglang.srt.layers.moe.utils as _moe_utils
@@ -79,6 +105,21 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config, Mod
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.utils import is_hip
 
+
+def _get_moe_runner_backend():
+    """Read the runner backend across SGLang's old and runtime-context APIs."""
+    if hasattr(_moe_utils, "MOE_RUNNER_BACKEND"):
+        return _moe_utils.MOE_RUNNER_BACKEND
+    return _moe_utils.get_flags().moe.runner_backend
+
+
+def _set_moe_runner_backend(backend):
+    """Set the runner backend across SGLang's old and runtime-context APIs."""
+    if hasattr(_moe_utils, "MOE_RUNNER_BACKEND"):
+        _moe_utils.MOE_RUNNER_BACKEND = backend
+    else:
+        _moe_utils.get_flags().moe.runner_backend = backend
+
 try:
     from case_generator import (
         get_common_moe_test_cases,
@@ -97,6 +138,7 @@ try:
         log_perf,
         power_law_logits_v3,
     )
+
 except ModuleNotFoundError:
     import os
     import sys
@@ -119,6 +161,138 @@ except ModuleNotFoundError:
         log_perf,
         power_law_logits_v3,
     )
+
+
+def _recorded_distribution_file() -> str:
+    """Locate the distribution sidecar produced by moe_token_distribution."""
+    for name in ("COLLECTOR_MOE_RECORDED_DISTRIBUTION_FILE", "COLLECTOR_MOE_TOKEN_DISTRIBUTION_FILE"):
+        value = os.environ.get(name)
+        if value:
+            if not os.path.isfile(value):
+                raise FileNotFoundError(f"{name} points to missing file: {value}")
+            return value
+    output_dir = os.environ.get("COLLECTOR_CURRENT_OUTPUT_DIR")
+    if output_dir:
+        path = os.path.join(output_dir, "moe_token_distribution_perf.txt")
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "recorded MoE requires moe_token_distribution_perf.txt; run "
+        "moe_token_distribution first or set COLLECTOR_MOE_RECORDED_DISTRIBUTION_FILE"
+    )
+
+
+def _recorded_counts(num_tokens: int, topk: int, num_experts: int, ep: int) -> list[float]:
+    path = _recorded_distribution_file()
+    distribution = os.environ.get("COLLECTOR_MOE_RECORDED_DISTRIBUTION", "recorded")
+    candidates = []
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            row_distribution = row.get("distribution", "")
+            if row.get("phase", "context") != "context":
+                continue
+            if row_distribution != distribution and not (
+                distribution == "recorded" and row_distribution.startswith("recorded_")
+            ):
+                continue
+            try:
+                if (int(float(row.get("num_tokens", 0))) != num_tokens
+                        or int(float(row.get("topk", topk))) != topk
+                        or int(float(row.get("num_experts", num_experts))) != num_experts):
+                    continue
+                counts = json.loads(row.get("expert_assignments_json") or "")
+                if len(counts) != num_experts or sum(max(0.0, float(x)) for x in counts) <= 0:
+                    continue
+                recorder_ep = int(float(row.get("recorder_ep_size", -1)))
+                assignments = float(row.get("total_assignments", 0) or 0)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            candidates.append((recorder_ep == ep, assignments, [max(0.0, float(x)) for x in counts]))
+    if not candidates:
+        raise ValueError(f"No recorded distribution for tokens={num_tokens}, topk={topk}, experts={num_experts}")
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _recorded_rank0_info(num_tokens: int, num_experts: int, topk: int, ep: int):
+    """Create deterministic router logits from recorded expert frequencies."""
+    import torch.nn.functional as F
+
+    # ``run_moe_torch`` sets the process default device to CUDA.  Keep the
+    # deterministic routing synthesis on CPU so its CPU generator matches the
+    # tensor device; callers move the resulting logits to the benchmark device.
+    probabilities = torch.tensor(
+        _recorded_counts(num_tokens, topk, num_experts, ep),
+        dtype=torch.float32,
+        device="cpu",
+    )
+    # A small-token aggregate may contain fewer distinct experts than top-k
+    # even though each original token had a valid top-k assignment.  Add a
+    # deterministic epsilon floor to unseen experts so synthetic replay can
+    # still form a legal distinct top-k selection without changing the
+    # measured tensor shape or materially changing the observed hot-expert
+    # preference.
+    active_experts = int(torch.count_nonzero(probabilities))
+    if active_experts < topk:
+        if topk > num_experts:
+            raise ValueError(f"Recorded topk={topk} exceeds num_experts={num_experts}")
+        positive = probabilities[probabilities > 0]
+        epsilon = (positive.min() * 1e-6) if positive.numel() else torch.tensor(1e-6, dtype=probabilities.dtype)
+        probabilities = probabilities.clone()
+        probabilities[probabilities <= 0] = epsilon
+    probabilities /= probabilities.sum()
+    generator = torch.Generator(device="cpu")
+    seed = int(os.environ.get("COLLECTOR_MOE_RECORDED_ROUTING_SEED", "20260615"))
+    generator.manual_seed(seed + num_tokens + topk + num_experts + ep)
+    selected = torch.stack([
+        torch.multinomial(probabilities, topk, replacement=False, generator=generator)
+        for _ in range(num_tokens)
+    ])
+    router_logits = F.one_hot(selected, num_classes=num_experts).sum(1).bfloat16()
+    experts_per_rank = num_experts // ep
+    rank_mask = (selected < experts_per_rank).any(dim=1)
+    return router_logits, {
+        "rank0_selected_slots": selected[rank_mask],
+        "rank0_logits": router_logits[rank_mask],
+        "rank0_num_tokens": int(rank_mask.sum().item()),
+        "slots_per_rank": experts_per_rank,
+    }
+
+
+def recorded_logits(num_tokens: int, num_experts: int, topk: int, ep: int):
+    return _recorded_rank0_info(num_tokens, num_experts, topk, ep)[0]
+
+
+def _has_recorded_distribution() -> bool:
+    try:
+        _recorded_distribution_file()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _recorded_case_available(*, num_tokens: int, topk: int, num_experts: int) -> bool:
+    """Return whether the distribution sidecar contains a matching case."""
+    try:
+        path = _recorded_distribution_file()
+        distribution = os.environ.get("COLLECTOR_MOE_RECORDED_DISTRIBUTION", "recorded")
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                row_distribution = row.get("distribution", "")
+                if row.get("phase", "context") != "context":
+                    continue
+                if row_distribution != distribution and not (
+                    distribution == "recorded" and row_distribution.startswith("recorded_")
+                ):
+                    continue
+                if (
+                    int(float(row.get("num_tokens", 0))) == num_tokens
+                    and int(float(row.get("topk", topk))) == topk
+                    and int(float(row.get("num_experts", num_experts))) == num_experts
+                ):
+                    return True
+    except (FileNotFoundError, TypeError, ValueError):
+        pass
+    return False
 
 
 _is_hip = is_hip()
@@ -170,10 +344,13 @@ def get_moe_test_cases():
         for moe_type, num_tokens in itertools.product(moe_list, num_tokens_list):
             if not moe_model_allows_quantization("sglang", model_name, moe_type):
                 continue
-            is_fp4_experts = common_moe_testcase.architecture == "DeepseekV4ForCausalLM" and moe_type in {
-                "w4a16_mxfp4",
-                "w4a8_mxfp4_mxfp8",
-            }
+            # DeepSeek-V4's W4A16 path uses SGLang's Mxfp4Config and can be
+            # served by Marlin on SM90.  Only the W4A8/MXFP8 activation path
+            # needs the special FP8 config with ``is_fp4_experts=True``.
+            is_fp4_experts = (
+                common_moe_testcase.architecture == "DeepseekV4ForCausalLM"
+                and moe_type == "w4a8_mxfp4_mxfp8"
+            )
             moe_backend = get_sglang_moe_backend(common_moe_testcase, moe_type, sm_version)
             base_case = [
                 moe_type,
@@ -244,6 +421,22 @@ def get_moe_test_cases():
             if previous_signature is None:
                 seen_physical_cases[physical_key] = execution_signature
                 test_cases.append(base_case)
+                if (
+                    _has_recorded_distribution()
+                    and common_moe_testcase.token_expert_distribution != "recorded"
+                    and _recorded_case_available(
+                        num_tokens=num_tokens,
+                        topk=common_moe_testcase.topk,
+                        num_experts=common_moe_testcase.num_experts,
+                    )
+                ):
+                    recorded_case = list(base_case)
+                    recorded_case[9] = "recorded"
+                    recorded_case[10] = 0
+                    recorded_key = physical_key[:-2] + ("recorded", 0)
+                    if recorded_key not in seen_physical_cases:
+                        seen_physical_cases[recorded_key] = execution_signature
+                        test_cases.append(recorded_case)
 
     return test_cases
 
@@ -294,8 +487,11 @@ def benchmark_config(
         gating_output = [balanced_logits(num_tokens, num_experts, topk).to(device) for _ in range(num_iters)]
     elif distributed == "power_law":
         gating_output = [
-            power_law_logits_v3(num_tokens, num_experts, topk, 1, power_law_alpha).to(device) for _ in range(num_iters)
+            power_law_logits_v3(num_tokens, num_experts, topk, 1, power_law_alpha).to(device)
+            for _ in range(num_iters)
         ]
+    elif distributed == "recorded":
+        gating_output = [recorded_logits(num_tokens, num_experts, topk, 1).to(device) for _ in range(num_iters)]
     else:
         raise ValueError(f"Unsupported distributed mode: {distributed}")
 
@@ -555,10 +751,10 @@ def _benchmark_framework_quantized_moe(
     else:
         raise ValueError(f"Unsupported framework quantized MoE case: {moe_type=} {model_name=}")
 
-    previous_backend = _moe_utils.MOE_RUNNER_BACKEND
-    server_args = _server_args_module._global_server_args
+    previous_backend = _get_moe_runner_backend()
+    server_args = _server_args_module.get_global_server_args()
     previous_precision = server_args.flashinfer_mxfp4_moe_precision
-    _moe_utils.MOE_RUNNER_BACKEND = MoeRunnerBackend(moe_backend)
+    _set_moe_runner_backend(MoeRunnerBackend(moe_backend))
     if moe_backend == "flashinfer_mxfp4":
         server_args.flashinfer_mxfp4_moe_precision = _mxfp4_activation_precision(moe_type)
 
@@ -747,6 +943,8 @@ def _benchmark_framework_quantized_moe(
                     )
                     for _ in range(5)
                 ]
+            elif distributed == "recorded":
+                logits = [recorded_logits(num_tokens, num_experts, topk, moe_ep_size).to(device=device) for _ in range(5)]
             else:
                 logits = [torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device) for _ in range(5)]
 
@@ -770,7 +968,7 @@ def _benchmark_framework_quantized_moe(
             parameter = None
             moe_layer = None
         _fmoe_kernels_mod._B_DESC_CACHE.clear()
-        _moe_utils.MOE_RUNNER_BACKEND = previous_backend
+        _set_moe_runner_backend(previous_backend)
         server_args.flashinfer_mxfp4_moe_precision = previous_precision
         gc.collect()
         torch.cuda.empty_cache()
@@ -892,6 +1090,8 @@ def build_rank0_workloads(
                 "rank0_num_tokens": int(rank0_token_mask.sum().item()),
                 "slots_per_rank": experts_per_rank,
             }
+        elif distributed == "recorded":
+            _, rank0_info = _recorded_rank0_info(num_tokens, num_experts, topk, moe_ep_size)
         else:
             raise ValueError(f"Unsupported distribution for rank0 workloads: {distributed}")
 
@@ -944,6 +1144,10 @@ def run_moe_torch(
     perf_filename,
     device="cuda:0",
 ):
+    os.environ.setdefault(
+        "COLLECTOR_CURRENT_OUTPUT_DIR",
+        os.path.dirname(os.path.abspath(str(perf_filename))) or os.getcwd(),
+    )
     torch.cuda.set_device(device)
     torch.set_default_device(device)
 
@@ -1108,7 +1312,7 @@ def run_moe_torch(
         )
     else:
         rank0_workloads: list[Rank0Workload] | None = None
-        if moe_ep_size > 1 and distributed in ("power_law", "balanced"):
+        if moe_ep_size > 1 and distributed in ("power_law", "balanced", "recorded"):
             rank0_workloads = build_rank0_workloads(
                 num_workloads=5,
                 num_tokens=num_tokens,

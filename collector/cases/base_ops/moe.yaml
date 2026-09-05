@@ -4,6 +4,10 @@
 schema_version: 1
 op: moe
 description: Base collector v2 cases for moe.
+framework_specific_op_cases:
+  sglang:
+    moe_token_distribution:
+      cases: all
 common_case_values:
   moe:
     token_counts:
@@ -161,6 +165,7 @@ common_case_values:
       # w4a16_mxfp4: 89 hardware fact.
       min_sm: 89
       allowed_model_paths:
+      - deepseek-ai/DeepSeek-V4-Flash
       - deepseek-ai/DeepSeek-V4-Pro
       - openai/gpt-oss-20b
       - openai/gpt-oss-120b
