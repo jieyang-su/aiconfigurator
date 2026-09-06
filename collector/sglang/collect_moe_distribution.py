@@ -423,7 +423,12 @@ def _diagnostics_path(perf_path: Path) -> Path | None:
 
 
 def _single_card_ep_sim_enabled() -> bool:
-    return _bool_env("COLLECTOR_MOE_DISTRIBUTION_SINGLE_CARD_EP_SIM", False)
+    # Recorded distribution collection is designed as a single-card
+    # materialization step: requested EP sizes are target metadata, while the
+    # collector constructs their rank-local replay without launching a
+    # multi-GPU DeepEP runtime. Real distributed probing remains an explicit
+    # opt-out for diagnostics only.
+    return _bool_env("COLLECTOR_MOE_DISTRIBUTION_SINGLE_CARD_EP_SIM", True)
 
 
 def _moe_distribution_perf_rows(
