@@ -25,7 +25,8 @@ import logging
 from typing import TYPE_CHECKING, ClassVar
 
 import aiconfigurator_core._aiconfigurator_core as _core
-from aiconfigurator_core.sdk.operations.base import OpShellKit
+from aiconfigurator_core.sdk import common, perf_interp
+from aiconfigurator_core.sdk.operations.base import Operation, OpShellKit
 
 if TYPE_CHECKING:
     from aiconfigurator_core.sdk.perf_database import PerfDatabase

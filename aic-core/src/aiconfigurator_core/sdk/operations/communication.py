@@ -34,7 +34,7 @@ import logging
 from typing import TYPE_CHECKING, ClassVar
 
 import aiconfigurator_core._aiconfigurator_core as _core
-from aiconfigurator_core.sdk.operations.base import OpShellKit, resolve_op_data_path
+from aiconfigurator_core.sdk.operations.base import Operation, OpShellKit, resolve_op_data_path
 
 if TYPE_CHECKING:
     from aiconfigurator_core.sdk.perf_database import PerfDatabase

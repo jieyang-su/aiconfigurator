@@ -42,10 +42,12 @@ from typing import TYPE_CHECKING, ClassVar
 
 import aiconfigurator_core
 import aiconfigurator_core._aiconfigurator_core as _core
+from aiconfigurator_core.sdk import common
 from aiconfigurator_core.sdk.operations import util_empirical
 from aiconfigurator_core.sdk.operations.base import (
     CommunicationDatabaseView,
     Operation,
+    OpShellKit,
     _read_filtered_rows,
     resolve_op_data_path,
 )
