@@ -67,6 +67,7 @@ except ModuleNotFoundError:
 setup_warning_filters()
 
 import argparse
+import atexit
 import cProfile
 import hashlib
 import importlib
@@ -1772,6 +1773,60 @@ def parallel_run(tasks, func, num_processes, module_name="unknown", resume_optio
     failed_tasks = manager.dict()
     attempted_tasks = manager.dict()
 
+    cleanup_finished = False
+
+    def cleanup_workers():
+        """Stop and reap all workers and IPC helpers exactly once.
+
+        This is also called from the parent signal handler/atexit hook.  A
+        collector may be interrupted while tqdm or a queue operation is
+        active, so cleanup cannot depend only on reaching the normal tail of
+        this function.
+        """
+        nonlocal cleanup_finished
+        if cleanup_finished:
+            return
+        cleanup_finished = True
+
+        for process in processes:
+            if process is not None and process.is_alive():
+                logger.warning(f"Stopping collector worker {process.pid}")
+                process.terminate()
+
+        for process in processes:
+            if process is None:
+                continue
+            process.join(timeout=10)
+            if process.is_alive():
+                logger.error(f"Collector worker {process.pid} did not exit after SIGTERM; killing")
+                process.kill()
+                process.join(timeout=10)
+
+        for ipc_queue in (queue, error_queue):
+            with contextlib.suppress(Exception):
+                ipc_queue.close()
+            with contextlib.suppress(Exception):
+                ipc_queue.join_thread()
+
+        with contextlib.suppress(Exception):
+            manager.shutdown()
+
+    previous_signal_handlers = {}
+
+    def parent_signal_handler(signum, frame):
+        cleanup_workers()
+        previous = previous_signal_handlers.get(signum, signal.SIG_DFL)
+        if callable(previous):
+            previous(signum, frame)
+        elif previous != signal.SIG_IGN:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+    for parent_signal in (signal.SIGINT, signal.SIGTERM):
+        previous_signal_handlers[parent_signal] = signal.getsignal(parent_signal)
+        signal.signal(parent_signal, parent_signal_handler)
+    atexit.register(cleanup_workers)
+
     def start_process(device_id):
         p = mp.Process(
             target=worker,
@@ -2060,17 +2115,15 @@ def parallel_run(tasks, func, num_processes, module_name="unknown", resume_optio
     sync_done_to_checkpoint()
     resume_tracker.flush(force=True)
 
-    # Wait for processes
-    for p in processes:
-        if p is None:
-            continue
-        p.join(timeout=42)
-        if p.is_alive():
-            logger.warning(f"Process {p.pid} did not terminate, forcing...")
-            p.terminate()
-
-    # Shutdown manager to clean up resources (semaphores, etc.)
-    manager.shutdown()
+    # Wait for processes and shut down the manager/queues.  The same helper
+    # is used by interruption paths so workers cannot be adopted by a
+    # sleep-only container PID 1.
+    cleanup_workers()
+    for parent_signal, previous in previous_signal_handlers.items():
+        with contextlib.suppress(Exception):
+            signal.signal(parent_signal, previous)
+    with contextlib.suppress(Exception):
+        atexit.unregister(cleanup_workers)
 
     # Surface systemic failure groups — a whole (model, dtype) family failing
     # is a fix-me signal, not something to tolerate.
@@ -2200,12 +2253,19 @@ def collect_ops(
                 "framework_version": runtime_version,
                 "sm_version": sm_version,
             }
+            collection_num_processes = collection.get("num_processes")
+            if collection_num_processes is None:
+                collection_num_processes = num_processes
+            logger.info(
+                f"Using {collection_num_processes} worker process(es) for "
+                f"{collection['name']}.{collection['type']}"
+            )
             errors = collect_module_safe(
                 collection["name"],
                 collection["type"],
                 get_func_with_limit,
                 run_func,
-                num_processes,
+                collection_num_processes,
                 resume_options=merged_resume,
             )
             all_errors.extend(errors)
