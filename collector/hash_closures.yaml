@@ -81,6 +81,9 @@ collector.sglang.collect_mla_module:
 collector.sglang.collect_moe:
   - collector/cases/base_ops/moe.yaml
   - __model_cases__
+collector.sglang.collect_moe_distribution:
+  - collector/cases/base_ops/moe.yaml
+  - __model_cases__
 collector.sglang.deepseekv4_sparse_modules:
   - __model_cases__
 collector.sglang.glm5_dsa_sparse_modules:

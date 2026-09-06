@@ -1184,11 +1184,24 @@ def get_moe_quantization_modes(
 def get_sglang_moe_backend(test_case: MoeCommonTestCase, moe_type: str, sm_version: int) -> str:
     """Resolve SGLang's target-version MoE backend from YAML metadata."""
 
+    return _resolve_sglang_moe_backend(
+        test_case.sglang_moe_backends,
+        moe_type,
+        sm_version,
+    )
+
+
+def _resolve_sglang_moe_backend(
+    model_backends: dict[str, object],
+    moe_type: str,
+    sm_version: int,
+) -> str:
+    """Resolve one backend from model-specific and base YAML mappings."""
+
     base_backends = _moe_backend_values("sglang").get("backends", {})
     if not isinstance(base_backends, dict):
         raise TypeError("common_case_values.moe_sglang.backends must be a mapping")
 
-    model_backends = test_case.sglang_moe_backends
     mode_backends = (
         model_backends.get(moe_type),
         base_backends.get(moe_type),
@@ -1223,6 +1236,30 @@ def get_sglang_moe_backend(test_case: MoeCommonTestCase, moe_type: str, sm_versi
             )
         return backend
     raise ValueError(f"No SGLang MoE backend for moe_type={moe_type!r}, sm_version={sm_version}")
+
+
+def get_sglang_moe_backend_for_model(
+    model_name: str,
+    moe_type: str,
+    sm_version: int,
+) -> str:
+    """Resolve a backend for a real checkpoint using the normal case rules.
+
+    A real routing probe has one active checkpoint/quantization mode, unlike
+    the synthetic collector which enumerates several modes. This adapter
+    reuses the same model-specific and base YAML backend maps without making
+    callers manufacture a complete ``MoeCommonTestCase``.
+    """
+    for model_case in _model_case_values("moe", apply_model_filter=False):
+        if _model_case_matches_path(model_case, model_name):
+            model_backends = model_case.get("sglang_moe_backends", {})
+            if not isinstance(model_backends, dict):
+                raise TypeError("model_case_values.moe.sglang_moe_backends must be a mapping")
+            return _resolve_sglang_moe_backend(model_backends, moe_type, sm_version)
+
+    # Unknown model aliases can still use the base hardware map. This keeps
+    # generic model support while preserving the same validation rules.
+    return _resolve_sglang_moe_backend({}, moe_type, sm_version)
 
 
 def _model_moe_backend_quantization(model_name: str, backend: str) -> dict[str, object]:

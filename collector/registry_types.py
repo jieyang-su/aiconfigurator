@@ -28,6 +28,7 @@ class PerfFile(str, Enum):
     GENERATION_ATTENTION = "generation_attention_perf.txt"
     ENCODER_ATTENTION = "encoder_attention_perf.txt"
     MOE = "moe_perf.txt"
+    MOE_TOKEN_DISTRIBUTION = "moe_token_distribution_perf.txt"
     CONTEXT_MLA = "context_mla_perf.txt"
     GENERATION_MLA = "generation_mla_perf.txt"
     MLA_BMM = "mla_bmm_perf.txt"
@@ -118,6 +119,9 @@ class OpEntry:
     #   unverified_sms=(120,)  — debugged elsewhere, not validated on these SMs
     unverified: bool = False
     unverified_sms: tuple[int, ...] = ()
+    # Some collectors must own one device because they write a shared replay
+    # bundle instead of independent per-case output.
+    num_processes: int | None = None
 
     def __post_init__(self) -> None:
         if not self.module and not self.versions:

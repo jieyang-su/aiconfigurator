@@ -126,6 +126,7 @@ families:
     op_files:
       - moe_perf
       - moe_expert_compute_perf
+      - moe_token_distribution_perf
       - dsv4_megamoe_module_perf
       - wideep_moe_perf
       - wideep_context_moe_perf

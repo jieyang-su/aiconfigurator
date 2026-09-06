@@ -17,6 +17,7 @@ only to assert that the loaded checkpoint agrees with the declaration.
 """
 
 import functools
+import csv
 import json
 import logging
 import os
@@ -72,6 +73,147 @@ MOE_EP_KERNEL_SOURCE = "deepep_moe"
 #: Written into the ``op_name`` prefix column of every row; the context /
 #: generation split lives in the ``inference_phase`` payload column.
 MOE_EP_OP_NAME = "moe_ep"
+
+
+def _recorded_distribution_path(output_path: str | None) -> str:
+    """Resolve the independent router-distribution sidecar for Recorded cases."""
+    for name in (
+        "COLLECTOR_WIDEEP_MOE_RECORDED_DISTRIBUTION_FILE",
+        "COLLECTOR_MOE_RECORDED_DISTRIBUTION_FILE",
+        "COLLECTOR_MOE_TOKEN_DISTRIBUTION_FILE",
+    ):
+        value = os.environ.get(name)
+        if value:
+            if not os.path.isfile(value):
+                raise FileNotFoundError(f"{name} points to missing file: {value}")
+            return value
+    if output_path:
+        candidate = os.path.join(output_path, "moe_token_distribution_perf.txt")
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "Recorded DeepEP requires moe_token_distribution_perf.txt; run "
+        "moe_token_distribution first or set COLLECTOR_MOE_RECORDED_DISTRIBUTION_FILE"
+    )
+
+
+@functools.cache
+def _recorded_rows(path: str, phase: str) -> tuple[dict[str, str], ...]:
+    with open(path, newline="", encoding="utf-8") as handle:
+        rows = tuple(
+            row for row in csv.DictReader(handle)
+            if row.get("phase", "context") == phase
+            and row.get("distribution", "").startswith("recorded")
+        )
+    return rows
+
+
+def _recorded_counts(output_path: str | None, *, phase: str, num_tokens: int,
+                     topk: int, total_experts: int, preferred_ep: int) -> list[int]:
+    path = _recorded_distribution_path(output_path)
+    candidates = []
+    for row in _recorded_rows(path, phase):
+        try:
+            if int(float(row.get("num_tokens", 0))) != int(num_tokens):
+                continue
+            if int(float(row.get("topk", topk))) != int(topk):
+                continue
+            if int(float(row.get("num_experts", total_experts))) != int(total_experts):
+                continue
+            counts = json.loads(row.get("expert_assignments_json") or "")
+            if len(counts) != total_experts:
+                continue
+            recorder_ep = int(float(row.get("recorder_ep_size", -1)))
+            layer = int(float(row.get("layer_id", -1)))
+            assignments = float(row.get("total_assignments", 0) or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if assignments > 0:
+            candidates.append((recorder_ep == preferred_ep, layer == 3, assignments, counts))
+    if not candidates:
+        raise ValueError(
+            f"No Recorded distribution for phase={phase}, tokens={num_tokens}, "
+            f"topk={topk}, experts={total_experts} in {path}"
+        )
+    counts = [max(0, int(round(float(value)))) for value in max(candidates, key=lambda item: item[:3])[3]]
+    if sum(counts) <= 0:
+        raise ValueError("Recorded distribution contains no assignments")
+    return counts
+
+
+def _recorded_distribution_has_case(*, output_path: str | None, phase: str,
+                                    num_tokens: int, topk: int,
+                                    total_experts: int,
+                                    preferred_recorder_ep_size: int | None) -> bool:
+    """Return whether the independent sidecar can serve one Recorded case."""
+    if output_path is None:
+        return False
+    try:
+        _recorded_counts(
+            output_path,
+            phase=phase,
+            num_tokens=num_tokens,
+            topk=topk,
+            total_experts=total_experts,
+            preferred_ep=preferred_recorder_ep_size or 1,
+        )
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _rescale_recorded_counts(counts: list[int], target: int) -> list[int]:
+    total = sum(counts)
+    if total == target:
+        return counts
+    if total <= 0:
+        raise ValueError("Cannot rescale an empty Recorded distribution")
+    scaled = [value * target / total for value in counts]
+    result = [int(value) for value in scaled]
+    for index in sorted(range(len(result)), key=lambda i: (scaled[i] - result[i], counts[i]), reverse=True)[: target - sum(result)]:
+        result[index] += 1
+    return result
+
+
+def _recorded_prefill_sample(*, output_path: str | None, global_tokens: int,
+                             topk: int, num_local_experts: int, total_experts: int,
+                             ep_size: int, device):
+    counts = _rescale_recorded_counts(
+        _recorded_counts(output_path, phase="context", num_tokens=global_tokens,
+                         topk=topk, total_experts=total_experts, preferred_ep=ep_size),
+        global_tokens * topk,
+    )
+    local_counts = [0] * num_local_experts
+    for expert, count in enumerate(counts):
+        local_counts[expert % num_local_experts] += count
+    probabilities = torch.tensor(local_counts, dtype=torch.float32, device=device)
+    if int(torch.count_nonzero(probabilities)) < topk:
+        raise ValueError("Recorded local distribution has fewer active experts than topk")
+    probabilities /= probabilities.sum()
+    seed = int(os.environ.get("COLLECTOR_WIDEEP_MOE_RECORDED_ROUTING_SEED", "20260615"))
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed + global_tokens + ep_size)
+    topk_ids = torch.stack([
+        torch.multinomial(probabilities, topk, replacement=False, generator=generator)
+        for _ in range(global_tokens)
+    ]).to(torch.int32)
+    topk_weights = torch.full((global_tokens, topk), 1.0 / topk, device=device)
+    recv = torch.bincount(topk_ids.reshape(-1), minlength=num_local_experts).tolist()
+    return topk_ids.contiguous(), topk_weights.contiguous(), recv
+
+
+def _recorded_decode_workload(*, output_path: str | None, global_tokens: int,
+                              topk: int, num_local_experts: int, total_experts: int,
+                              ep_size: int, device):
+    counts = _rescale_recorded_counts(
+        _recorded_counts(output_path, phase="generation", num_tokens=global_tokens,
+                         topk=topk, total_experts=total_experts, preferred_ep=ep_size),
+        global_tokens * topk,
+    )
+    local_counts = [0] * num_local_experts
+    for expert, count in enumerate(counts):
+        local_counts[expert % num_local_experts] += count
+    return torch.tensor(local_counts, dtype=torch.int32, device=device)
 
 
 class MoeEpDeclarationMismatchError(RuntimeError):
@@ -257,7 +399,7 @@ def _sorted_phase_cases(test_cases):
     )
 
 
-def get_moe_prefill_test_cases(rank, *, topk, num_experts):
+def get_moe_prefill_test_cases(rank, *, topk, num_experts, output_path=None):
     """Get test cases for MoE prefill phase including distribution and alpha.
 
     Returns a list of dicts with keys: 'num_tokens', 'distributed', 'power_law_alpha'.
@@ -299,6 +441,20 @@ def get_moe_prefill_test_cases(rank, *, topk, num_experts):
                     "power_law_alpha": alpha,
                 }
             )
+        # Recorded is data-driven: do not create a case unless the independent
+        # distribution collector has a matching global-token sample.
+        global_tokens = num_token * rank
+        if output_path is not None and _recorded_distribution_has_case(
+            output_path=output_path,
+            phase="context",
+            num_tokens=global_tokens,
+            topk=topk,
+            total_experts=num_experts,
+            preferred_recorder_ep_size=rank,
+        ):
+            test_cases.append(
+                {"num_tokens": num_token, "distributed": "recorded", "power_law_alpha": None}
+            )
 
     if dropped_small_workload:
         print(
@@ -321,7 +477,7 @@ def get_moe_prefill_test_cases(rank, *, topk, num_experts):
     return _sorted_phase_cases(test_cases)
 
 
-def get_moe_decode_test_cases():
+def get_moe_decode_test_cases(*, output_path=None, simulated_ep_size=1, topk=8, total_experts=256):
     """Get test cases for MoE decode phase including distribution and alpha.
 
     Returns a list of dicts with keys: 'num_tokens', 'distributed', 'power_law_alpha'.
@@ -348,6 +504,19 @@ def get_moe_decode_test_cases():
                     "distributed": "power_law",
                     "power_law_alpha": alpha,
                 }
+            )
+    for bs in batch_sizes:
+        global_tokens = bs * simulated_ep_size
+        if output_path is not None and _recorded_distribution_has_case(
+            output_path=output_path,
+            phase="generation",
+            num_tokens=global_tokens,
+            topk=topk,
+            total_experts=total_experts,
+            preferred_recorder_ep_size=simulated_ep_size,
+        ):
+            test_cases.append(
+                {"num_tokens": bs, "distributed": "recorded", "power_law_alpha": None}
             )
     return _sorted_phase_cases(test_cases)
 
@@ -531,6 +700,18 @@ def benchmark_moe_layer_prefill(
                     topk_weights_sample = torch.nan_to_num(topk_weights_sample, nan=0.0, posinf=0.0, neginf=0.0)
                     num_recv = num_recv_tensor.tolist()
                     power_law_samples.append((topk_idx_sample, topk_weights_sample, num_recv))
+
+            elif distributed == "recorded":
+                topk_idx_sample, topk_weights_sample, num_recv = _recorded_prefill_sample(
+                    output_path=output_path,
+                    global_tokens=num_token * simulated_ep_size,
+                    topk=topk,
+                    num_local_experts=num_local_experts,
+                    total_experts=model_total_experts,
+                    ep_size=simulated_ep_size,
+                    device=device,
+                )
+                power_law_samples = [(topk_idx_sample, topk_weights_sample, num_recv)]
 
             else:
                 raise ValueError(f"Unsupported distributed mode: {distributed}")
@@ -774,6 +955,17 @@ def benchmark_moe_layer_decode(
                     masked_m[: int(num_token * top_k)] = 1
                 else:
                     masked_m[:] = base_tokens_per_expert
+                masked_m_list = [masked_m]
+            elif distributed == "recorded":
+                masked_m = _recorded_decode_workload(
+                    output_path=output_path,
+                    global_tokens=num_token * simulated_ep_size,
+                    topk=top_k,
+                    num_local_experts=num_local_experts,
+                    total_experts=model_total_experts,
+                    ep_size=simulated_ep_size,
+                    device=device,
+                )
                 masked_m_list = [masked_m]
             else:
                 raise ValueError(f"Unsupported distributed mode: {distributed}")
@@ -1114,7 +1306,12 @@ def run_moe(
         f"(num_local_experts={num_local_experts}, total_experts={model_total_experts})"
     )
 
-    prefill_test_cases = get_moe_prefill_test_cases(simulated_ep_size, topk=model_topk, num_experts=model_total_experts)
+    prefill_test_cases = get_moe_prefill_test_cases(
+        simulated_ep_size,
+        topk=model_topk,
+        num_experts=model_total_experts,
+        output_path=output_path,
+    )
     rank_print(f"Testing {len(prefill_test_cases)} prefill configurations...")
 
     # Use deepep_mode="normal" for prefill
@@ -1143,7 +1340,12 @@ def run_moe(
         moe_dtype=moe_dtype,
     )
 
-    decode_test_cases = get_moe_decode_test_cases()
+    decode_test_cases = get_moe_decode_test_cases(
+        output_path=output_path,
+        simulated_ep_size=simulated_ep_size,
+        topk=model_topk,
+        total_experts=model_total_experts,
+    )
     rank_print(f"Testing {len(decode_test_cases)} decode configurations...")
     # Use deepep_mode="low_latency" for decode
     server_args.deepep_mode = "low_latency"

@@ -116,6 +116,10 @@ framework_specific_op_cases:
     mla_generation_module:
       cases: all
   sglang:
+    moe_token_distribution:
+      cases: all
+    moe_ep:
+      cases: all
     mla_context:
       cases: all
     mla_generation:

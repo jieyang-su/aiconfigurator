@@ -54,6 +54,14 @@ REGISTRY: list[OpEntry] = [
         perf_filename=PerfFile.MLA_BMM,
     ),
     OpEntry(
+        op="moe_token_distribution",
+        module="collector.sglang.collect_moe_distribution",
+        get_func="get_moe_distribution_test_cases",
+        run_func="run_moe_distribution",
+        perf_filename=PerfFile.MOE_TOKEN_DISTRIBUTION,
+        num_processes=1,
+    ),
+    OpEntry(
         op="moe",
         module="collector.sglang.collect_moe",
         get_func="get_moe_test_cases",
@@ -335,9 +343,10 @@ REGISTRY: list[OpEntry] = [
         get_func="get_kda_test_cases",
         run_func="run_kda_torch",
         perf_filename=PerfFile.KDA,
-        # Kimi-K3 KDA kernels exist only on the sglang kimi-k3 branch; debugged
-        # on Hopper (SM90), B200 (SM100) and B300 (SM103), then verified on
-        # L40S/SM89 and RTX Pro 6000/SM120 via full-grid probe runs
+        # Kimi-K3 KDA kernels are provided by the Kimi-K3-enabled SGLang
+        # 0.5.18 image; debugged on Hopper (SM90), B200 (SM100) and B300
+        # (SM103), then verified on L40S/SM89 and RTX Pro 6000/SM120 via
+        # full-grid probe runs
         # (2026-08-01, aic-auto-collector jobs 381312863/381312864: 1074 and
         # 1085 clean rows; SM89 needs the fused-decode SM90 gate in
         # collect_kda.py — the JIT kernel's mbarrier PTX rejects sm_89).

@@ -353,6 +353,17 @@ def _selected_base_ops(
                 )
             )
 
+    # Recorded MoE distribution is a generic companion to the shared MoE
+    # collector. The collector inspects config.json and returns no cases for
+    # models without expert metadata.
+    model_declares_moe = any(
+        "moe" in _section(data, "all_frameworks_op_cases")
+        or "moe" in _section(data, "framework_specific_op_cases").get(backend, {})
+        for data in model_data
+    )
+    if backend == "sglang" and ("moe" in selected or model_declares_moe):
+        selected.add("moe_token_distribution")
+
     unknown = selected - available_ops
     if unknown:
         raise ValueError(f"Unknown base_ops entries for backend {backend}: {sorted(unknown)}")

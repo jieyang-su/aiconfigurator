@@ -93,6 +93,21 @@ def _parse_bool_env(env_var: str, default: bool = False) -> bool:
     return value.lower() in ("true", "1", "yes")
 
 
+def resolve_subprocess_visible_device(logical_device_id: int) -> str:
+    """Map a worker-local GPU index through CUDA_VISIBLE_DEVICES."""
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible_devices:
+        return str(logical_device_id)
+
+    device_tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
+    if 0 <= logical_device_id < len(device_tokens):
+        return device_tokens[logical_device_id]
+    raise ValueError(
+        f"logical gpu_id={logical_device_id} is out of range for "
+        f"CUDA_VISIBLE_DEVICES={visible_devices!r}"
+    )
+
+
 def _ensure_nvml_initialized():
     """Initialize NVML once per process. Thread-safe."""
     global _NVML_INITIALIZED

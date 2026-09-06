@@ -169,6 +169,7 @@ def build_collections(
                 "perf_filename": entry.perf_filename,
                 "unverified": entry.unverified,
                 "unverified_sms": entry.unverified_sms,
+                "num_processes": entry.num_processes,
             }
         )
 
