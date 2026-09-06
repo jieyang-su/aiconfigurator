@@ -26,17 +26,19 @@ Manual CLI use::
 # Requires stock SGLang 0.5.14 with its matching ``sgl-kernel`` package.
 from __future__ import annotations
 
-__compat__ = "sglang==0.5.14"
+__compat__ = "sglang==0.5.18"
 
 import argparse
 import contextlib
 import copy
+import ctypes
 import gc
 import json
 import os
 import shutil
 import socket
 import subprocess
+import signal
 import sys
 import tempfile
 import traceback
@@ -194,7 +196,7 @@ def _dsv4_max_position_embeddings(model_path: str) -> int:
 
 
 def _attach_dsv4_context_memory_manifest(cases: list[list], attn_kind: str) -> list[list]:
-    """Bind context inner shapes whose mandatory BF16 input fits the device budget."""
+    """Bind context shapes that fit device and runtime admission limits."""
     if not cases:
         return []
 
@@ -207,10 +209,17 @@ def _attach_dsv4_context_memory_manifest(cases: list[list], attn_kind: str) -> l
     # Leave 20% for the loaded layer, KV pools, graph state, and other mandatory
     # tensors.  This is one device-capacity factor, not a model/SM shape limit.
     budget_bytes = total_memory * 4 // 5
+    try:
+        from collector.sglang.deepseekv4_sparse_modules import _sglang_chunked_prefill_size
+    except ModuleNotFoundError:
+        from deepseekv4_sparse_modules import _sglang_chunked_prefill_size
+    chunked_prefill_size = int(_sglang_chunked_prefill_size())
 
     filtered = []
     source_count = 0
     raw_count = 0
+    memory_retained_count = 0
+    chunk_dropped_count = 0
     retained_count = 0
     smoke = "--smoke" in sys.argv
     for case in cases:
@@ -246,19 +255,27 @@ def _attach_dsv4_context_memory_manifest(cases: list[list], attn_kind: str) -> l
                 seq_len for seq_len in raw_seq_lens if batch_size * seq_len * hidden_size * 2 <= budget_bytes
             )
             raw_count += len(raw_seq_lens)
+            memory_retained_count += len(retained_seq_lens)
+            before_chunk_count = len(retained_seq_lens)
+            retained_seq_lens = tuple(
+                seq_len for seq_len in retained_seq_lens if batch_size * int(seq_len) <= chunked_prefill_size
+            )
+            chunk_dropped_count += before_chunk_count - len(retained_seq_lens)
             retained_count += len(retained_seq_lens)
             if retained_seq_lens:
                 manifest.append((int(prefix_len), retained_seq_lens))
         if manifest:
             filtered.append([*case, tuple(manifest)])
 
-    dropped_count = raw_count - retained_count
     print(
         f"[dsv4-memory-filter] {attn_kind} context structurally_admitted={raw_count}/{source_count} "
         f"structural_dropped={source_count - raw_count}/{source_count} "
-        f"retained={retained_count}/{raw_count} memory_dropped={dropped_count}/{raw_count} "
+        f"memory_retained={memory_retained_count}/{raw_count} "
+        f"memory_dropped={raw_count - memory_retained_count}/{raw_count} "
+        f"chunk_dropped={chunk_dropped_count} retained={retained_count}/{raw_count} "
         f"outer_tasks={len(filtered)}/{len(cases)} "
         f"budget_bytes={budget_bytes} total_memory_bytes={total_memory} devices={device_count} "
+        f"chunked_prefill_size={chunked_prefill_size} "
         "formula=batch_size*sequence_length*hidden_size*2 (BF16 hidden-state lower bound, 80% budget)"
     )
     return filtered
@@ -645,6 +662,42 @@ def _effective_prefill_chunk_size(model_runner) -> int:
     return _runtime_chunk_size(model_runner)
 
 
+def _smallest_required_pool_cap(
+    shapes: Iterable[tuple[int, int, int]],
+    *,
+    is_prefill: bool,
+) -> int:
+    """Return a page-aligned KV cap sufficient for one collector worker.
+
+    A serving runner's default cap is unnecessarily large for this one-layer
+    benchmark and can OOM before the first shape, even with ``load_format``
+    set to ``dummy``.  This cap is derived only from requested KV spans and
+    allocator page/SWA rules; it is not truth-derived.
+    """
+    shapes = list(shapes)
+    if not shapes:
+        raise ValueError("cannot derive a KV pool cap without shapes")
+    full_required = max(
+        required_kv_alloc_tokens(
+            int(batch_size), int(seq_len), int(prefix_len), _DSV4_CUDA_PAGE_SIZE, is_prefill=is_prefill
+        )
+        for batch_size, seq_len, prefix_len in shapes
+    )
+    swa_required = max(
+        required_swa_kv_alloc_tokens(
+            int(batch_size),
+            int(seq_len),
+            int(prefix_len),
+            _DSV4_CUDA_PAGE_SIZE,
+            _DSV4_SWA_WINDOW_SIZE,
+            is_prefill=is_prefill,
+        )
+        for batch_size, seq_len, prefix_len in shapes
+    )
+    cap = max(full_required, swa_required * _DSV4_SWA_TO_FULL_SCALE)
+    return ((cap + _DSV4_CUDA_PAGE_SIZE - 1) // _DSV4_CUDA_PAGE_SIZE) * _DSV4_CUDA_PAGE_SIZE
+
+
 def _derive_csa_context_pool_cap(
     model_runner,
     shapes: Iterable[tuple[int, int, int]],
@@ -705,7 +758,18 @@ def _derive_csa_context_pool_cap(
     if not chunk_eligible_shapes:
         raise RuntimeError(f"DSV4 CSA context pool derivation has no shape within effective_chunk={effective_chunk}")
 
-    profiled_bytes = int(model_runner._profile_available_bytes(model_runner.pre_model_load_memory))
+    # SGLang 0.5.18 moved memory profiling from ModelRunner to its KV-cache
+    # configurator. Keep the same runtime-derived budget used by
+    # alloc_memory_pool(), while retaining compatibility with older images.
+    if hasattr(model_runner, "_profile_available_bytes"):
+        profiled_bytes = int(model_runner._profile_available_bytes(model_runner.pre_model_load_memory))
+    else:
+        model_runner.init_kv_cache_configurator()
+        profiled_bytes = int(
+            model_runner.kv_cache_configurator._profile_available_bytes(
+                model_runner.pre_model_load_memory
+            )
+        )
     profiled_config = configurator.calculate_pool_sizes(profiled_bytes, page_size)
     compress_ratio = ATTN_KIND_TO_COMPRESS_RATIO["csa"]
     if page_size % compress_ratio != 0:
@@ -824,6 +888,7 @@ def _load_model_runner(
     csa_context_shapes: Iterable[tuple[int, int, int]] | None = None,
 ):
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.entrypoints.engine import _set_envs_and_config
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
@@ -888,12 +953,11 @@ def _load_model_runner(
         # chunked_prefill_size also stay unset and are derived by
         # ServerArgs.__post_init__.
         max_total_tokens=max_total_tokens,
+        quantization="fp8" if gemm_type == "fp8_block" else None,
+        attention_backend="dsv4",
     )
     # gemm_type controls projection GEMM dispatch.  "fp8_block" → DeepGEMM
     # (matches production V4-Flash-FP8); anything else → cuBLASLt bf16.
-    server_args.quantization = "fp8" if gemm_type == "fp8_block" else None
-    server_args.attention_backend = "dsv4"
-
     print(
         f"[dsv4-collector] model_path {model_path} -> {local_model_path}; "
         f"attn_kind={attn_kind}, backend=dsv4, kv_cache_dtype={kv_cache_dtype}, "
@@ -914,12 +978,7 @@ def _load_model_runner(
             # Use sglang's own __post_init__-derived value, not a collector knob.
             mem_fraction_static=server_args.mem_fraction_static,
             gpu_id=gpu_id,
-            tp_rank=0,
-            tp_size=1,
-            pp_rank=0,
-            pp_size=1,
-            moe_ep_rank=0,
-            moe_ep_size=1,
+            ps=ParallelState.trivial(gpu_id=gpu_id),
             nccl_port=nccl_port,
             server_args=server_args,
         )
@@ -931,9 +990,18 @@ def _load_model_runner(
             model_runner,
             csa_context_shapes,
         )
-        model_runner.server_args.max_total_tokens = derived_requirements[0]
+        # ServerArgs is only the startup record in SGLang 0.5.18.  The pool
+        # configurator reads the published runtime schedule instead, so
+        # changing server_args here would be ineffective and would silently
+        # recreate the full serving-sized pool.
     # SGLang 0.5.14 separates model construction from serving-state setup.
-    model_runner.alloc_memory_pool()
+    pool_override = contextlib.nullcontext()
+    if derived_requirements is not None:
+        from sglang.srt.runtime_context import get_schedule
+
+        pool_override = get_schedule().override(max_total_tokens=derived_requirements[0])
+    with pool_override:
+        model_runner.alloc_memory_pool()
     if derived_requirements is not None:
         _, required_full_tokens, required_swa_tokens = derived_requirements
         actual_full_tokens = int(model_runner.full_max_total_num_tokens)
@@ -1036,7 +1104,10 @@ def _make_reqs(
         req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
         req.fill_len = full_len
         req.logprob_start_len = 0
-        req.set_extend_input_len(seq_len if prefix_len else full_len)
+        if hasattr(req, "set_extend_range"):
+            req.set_extend_range(prefix_len if prefix_len else 0, full_len)
+        else:
+            req.set_extend_input_len(seq_len if prefix_len else full_len)
         req.swa_evicted_seqlen = swa_evicted_seqlen
         if decode:
             req.cached_tokens = 0
@@ -1113,7 +1184,9 @@ def _build_forward_batch(
                 req.output_ids.append(0)
             batch.prepare_for_decode()
 
-    forward_batch = ForwardBatch.init_new(batch, model_runner)
+    forward_batch = ForwardBatch.init_new(
+        batch, model_runner, return_hidden_states_before_norm=False
+    )
     model_runner.attn_backend.init_forward_metadata(forward_batch)
     return forward_batch
 
@@ -1644,6 +1717,29 @@ def run_dsv4_mla_module(
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _set_parent_death_signal() -> None:
+    """Make an isolated benchmark exit when its collector worker dies."""
+    libc = ctypes.CDLL(None)
+    # Linux prctl(PR_SET_PDEATHSIG, SIGTERM), used only on CUDA collector
+    # hosts.  This prevents an orphan benchmark from retaining a CUDA context.
+    libc.prctl(1, int(signal.SIGTERM))
+
+
+def _terminate_subprocess_group(proc: subprocess.Popen) -> None:
+    """Terminate a benchmark and every process it may have spawned."""
+    if proc.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
 def _run_subprocess(
     *,
     mode: str,
@@ -1725,11 +1821,13 @@ def _run_subprocess(
                 stdout=logf,
                 stderr=subprocess.STDOUT,
                 cwd=os.path.dirname(os.path.abspath(__file__)),
+                start_new_session=True,
+                preexec_fn=_set_parent_death_signal,
             )
             try:
                 proc.wait(timeout=3600)  # up to 1 hour per (kind, tp, gemm, bs)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                _terminate_subprocess_group(proc)
                 proc.wait()
 
         try:
@@ -1823,9 +1921,21 @@ def _subprocess_entry(
             f"dsv4-flash mode={mode} bs={batch_size}: no valid prefix/sl values; ok=0 error=0 skip=0 total=0"
         )
 
-    # Let SGLang derive its full/SWA/DSV4 auxiliary pools, then use the live
-    # allocator capacities and page size to skip over-capacity cells.
+    # The serving default reserves a large pool before the sweep and can OOM
+    # on HCA even with load_format=dummy.  Bound each worker by its own cases;
+    # CSA context retains the workspace-aware derivation above.
+    worker_shapes = [
+        (batch_size, seq_len, prefix_len)
+        for prefix_len, seq_lens in seq_lens_by_prefix.items()
+        for seq_len in seq_lens
+    ]
     max_total_tokens = None
+    if not (mode == "context" and attn_kind == "csa"):
+        max_total_tokens = _smallest_required_pool_cap(worker_shapes, is_prefill=mode == "context")
+        print(
+            f"[dsv4-collector] case-local KV pool cap={max_total_tokens} "
+            f"for kind={attn_kind} mode={mode} bs={batch_size}"
+        )
 
     run_dsv4_mla_module(
         model_path=model_path,
