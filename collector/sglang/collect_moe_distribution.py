@@ -94,12 +94,15 @@ def _env_int_list(name: str, default: list[int]) -> list[int]:
 
 
 def _selected_model_path() -> str:
+    # Keep the logical model identity separate from the local runtime path.
+    # ``COLLECTOR_MODEL_PATH`` is populated by collector v2 with the requested
+    # model alias and must remain the key used for YAML/backend resolution.
+    if os.environ.get("COLLECTOR_MODEL_PATH"):
+        return os.environ["COLLECTOR_MODEL_PATH"]
     if os.environ.get("COLLECTOR_MOE_DISTRIBUTION_MODEL_PATH"):
         return os.environ["COLLECTOR_MOE_DISTRIBUTION_MODEL_PATH"]
     if os.environ.get("MOE_MODEL_PATH"):
         return os.environ["MOE_MODEL_PATH"]
-    if os.environ.get("COLLECTOR_MODEL_PATH"):
-        return os.environ["COLLECTOR_MODEL_PATH"]
     for candidate in (
         Path("/model/DeepSeek-V3.1"),
         Path("/model/DeepSeek-V3"),
@@ -185,13 +188,25 @@ def _recorded_moe_runner_backend(model_id: str, config: dict, sm_version: int) -
     expert_dtype = str(effective_config.get("expert_dtype", "")).lower()
     quant_config = effective_config.get("quantization_config") or {}
     quant_method = str(quant_config.get("quant_method", "")).lower()
+    # Compressed-tensors checkpoints commonly keep the actual weight format
+    # under config_groups rather than exposing expert_dtype.  Read the
+    # declared format so Recorded follows the same YAML-backed backend map as
+    # the ordinary MoE collector.
+    quant_formats = [str(quant_config.get("format", "")).lower()]
+    for group in (quant_config.get("config_groups") or {}).values():
+        if isinstance(group, dict):
+            quant_formats.append(str(group.get("format", "")).lower())
+            weights = group.get("weights") or {}
+            if isinstance(weights, dict):
+                quant_formats.append(str(weights.get("type", "")).lower())
+    quant_format = " ".join(quant_formats)
 
-    if expert_dtype in {"fp4", "mxfp4", "nvfp4"}:
+    if expert_dtype in {"fp4", "mxfp4", "nvfp4"} or "mxfp4" in quant_format:
         # A FP8 container with FP4 experts is the mixed DeepSeek-V4 artifact.
         # Hopper uses its W4A16 execution lane; Blackwell uses W4A8 where the
         # model case declares that path.
         moe_type = "w4a16_mxfp4" if sm_version == 90 else "w4a8_mxfp4_mxfp8"
-    elif quant_method == "fp8":
+    elif quant_method == "fp8" or "fp8" in quant_format:
         moe_type = "fp8_block"
     else:
         moe_type = "bfloat16"
