@@ -46,9 +46,10 @@ Output:
     draft-token count for verify rows.
 """
 
-# The kimi-k3 branch build (https://github.com/sgl-project/sglang/tree/kimi-k3)
-# reports 0.5.16; KDA kernels do not exist in stock sglang releases yet.
-__compat__ = "sglang==0.5.16"
+# The Kimi-K3-enabled SGLang 0.5.18 image contains the KDA model backend and
+# its prefill/decode kernels. Keep this collector in the same runtime group as
+# the other Kimi-K3 operators.
+__compat__ = "sglang==0.5.18"
 
 import gc
 import os
@@ -149,6 +150,11 @@ def _format_failures(failures: list[str], limit: int = 8) -> str:
     return shown + (f"; ... and {extra} more (see worker stdout)" if extra > 0 else "")
 
 
+def _kda_context_index_limit_exceeded(total_tokens: int, conv_channels: int) -> bool:
+    """Return whether SGLang's causal-conv Triton index arithmetic is unsafe."""
+    return total_tokens * conv_channels >= 2**31
+
+
 def run_kda_context_benchmark(
     d_model: int,
     d_conv: int,
@@ -181,6 +187,8 @@ def run_kda_context_benchmark(
     q_conv_weight, k_conv_weight, v_conv_weight = conv_weight.split([proj_size] * 3, dim=0)
     successful_points = 0
     failed_points = 0
+    skipped_points = 0
+    skipped_cells: list[str] = []
     failures: list[str] = []
 
     for batch_size in batch_size_list:
@@ -201,13 +209,15 @@ def run_kda_context_benchmark(
                 # [2**31, 3*2**31) crash with cudaErrorIllegalAddress on both
                 # Hopper SM90 (2026-07 campaign coverage boundary) and SM100
                 # (B200, 2026-07-28), while every cell under this bound passes.
-                if total_tokens * conv_channels >= 2**31:
-                    raise ValueError(
-                        "SGLang causal_conv1d Triton kernel int32 token-offset overflow: "
-                        f"total_tokens={total_tokens} * conv_channels={conv_channels} >= 2**31 "
-                        "(causal_conv1d_triton.py:373-379; per-block views stride "
-                        "across the whole 3-block buffer)"
+                if _kda_context_index_limit_exceeded(total_tokens, conv_channels):
+                    skipped_points += 1
+                    skipped_cells.append(
+                        "batch_size={} seq_len={} total_tokens={} conv_channels={} "
+                        "(causal_conv1d Triton int32 index limit)".format(
+                            batch_size, seq_len, total_tokens, conv_channels
+                        )
                     )
+                    continue
                 num_warmups = 3
                 num_runs = 10
                 cu_seqlens = torch.arange(0, total_tokens + 1, seq_len, dtype=torch.int32, device=device)
@@ -334,8 +344,14 @@ def run_kda_context_benchmark(
                 q = k = v = recurrent_state = seq_lens_cpu = state_indices = None
                 _cleanup("context")
 
-    summary = f"ok={successful_points} error={failed_points} skip=0"
+    summary = f"ok={successful_points} error={failed_points} skip={skipped_points}"
     print(f"KDA context summary: {summary}")
+    if skipped_cells:
+        print(f"KDA context skipped known unsupported cells: {len(skipped_cells)}")
+        for cell in skipped_cells[:8]:
+            print(f"  Skipped: {cell}")
+        if len(skipped_cells) > 8:
+            print(f"  ... and {len(skipped_cells) - 8} more")
     if failed_points or successful_points == 0:
         raise RuntimeError(
             f"SGLang KDA context collection failed strict completeness: {summary}; "

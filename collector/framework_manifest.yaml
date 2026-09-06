@@ -13,18 +13,18 @@ frameworks:
   sglang:
     source_repo: "https://github.com/sgl-project/sglang.git"
     default:
-      version: "0.5.14"
+      version: "0.5.18"
       images:
-        default: "lmsysorg/sglang:v0.5.14@sha256:5027e95bf6ec536856b1b52a91d1f35ff5c564ab83e8a94758a169ff09bb8df3"
-        cu130: "lmsysorg/sglang:v0.5.14-cu130@sha256:5027e95bf6ec536856b1b52a91d1f35ff5c564ab83e8a94758a169ff09bb8df3"
+        default: "10.110.181.132:5000/lmsysorg/sglang:v0.5.18@sha256:cb940197908678dacb041556b64798cc0493d547816a8e8a6731fa37dddfc4fb"
+        cu130: "10.110.181.132:5000/lmsysorg/sglang:v0.5.18@sha256:cb940197908678dacb041556b64798cc0493d547816a8e8a6731fa37dddfc4fb"
     families:
-      # Kimi-K3 KDA kernels exist only on the sglang kimi-k3 branch
-      # (https://github.com/sgl-project/sglang/tree/kimi-k3), whose build
-      # reports 0.5.16. Pin the branch image for the kda family only.
+      # The Kimi-K3-enabled 0.5.18 image contains the KDA model backend and
+      # prefill/decode kernels. Keep KDA in the default 0.5.18 runtime group.
       kda:
-        version: "0.5.16"
+        version: "0.5.18"
         images:
-          default: "lmsysorg/sglang@sha256:4b8a7542e00a4d82801d1276108438b024137c9a07f33215d03b04003e500f2b"
+          default: "10.110.181.132:5000/lmsysorg/sglang:v0.5.18@sha256:cb940197908678dacb041556b64798cc0493d547816a8e8a6731fa37dddfc4fb"
+          cu130: "10.110.181.132:5000/lmsysorg/sglang:v0.5.18@sha256:cb940197908678dacb041556b64798cc0493d547816a8e8a6731fa37dddfc4fb"
       # MiniMax-M3 (minimax_m3.py + minimax_sparse_ops) landed in the official
       # v0.5.16 release; the stock 0.5.14 default has no M3. Pin the official
       # tag for the msa family only (NOT the kimi-k3 branch build above, which

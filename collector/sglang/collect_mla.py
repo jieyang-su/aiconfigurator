@@ -9,15 +9,19 @@ this file owns SGLang MLA backend choice, paged KV-cache setup, DP-attention
 mocking, runtime dispatch, and perf logging.
 """
 
-__compat__ = "sglang==0.5.14"
+__compat__ = "sglang==0.5.18"
 
 import math
 import os
 import random
+from types import SimpleNamespace
 
 import pkg_resources
 import sglang.srt.layers.dp_attention
 import sglang.srt.server_args
+import sglang.srt.layers.attention.flashattention_backend as flashattention_backend
+import sglang.srt.layers.attention.trtllm_mla_backend as trtllm_mla_backend
+import sglang.srt.layers.attention.triton_backend as triton_backend
 import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
@@ -40,6 +44,44 @@ sglang.srt.layers.dp_attention._LOCAL_ATTN_DP_SIZE = 1
 sglang.srt.layers.dp_attention._LOCAL_ATTN_DP_RANK = 0
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
+
+_STANDALONE_SPEC = SimpleNamespace(
+    speculative_eagle_topk=0,
+    speculative_num_draft_tokens=None,
+    speculative_algorithm=None,
+    speculative_num_steps=0,
+)
+_STANDALONE_EXEC = SimpleNamespace(
+    deterministic=SimpleNamespace(enable_deterministic_inference=False),
+)
+_STANDALONE_MODEL = SimpleNamespace(is_embedding=False)
+_STANDALONE_SCHEDULE = SimpleNamespace(
+    chunked_prefill_size=-1,
+    disable_chunked_prefix_cache=False,
+)
+_STANDALONE_MEMORY = SimpleNamespace(disable_radix_cache=True)
+_STANDALONE_PARALLEL = SimpleNamespace(
+    attn_tp_size=1,
+    attn_tp_rank=0,
+    attn_cp_size=1,
+    attn_cp_rank=0,
+    attn_dp_size=1,
+    attn_dp_rank=0,
+    attn_dcp_size=1,
+    attn_dcp_rank=0,
+    enable_prefill_cp=False,
+    enable_dp_attention=False,
+)
+flashattention_backend.get_spec = lambda: _STANDALONE_SPEC
+flashattention_backend.get_exec = lambda: _STANDALONE_EXEC
+flashattention_backend.get_model = lambda: _STANDALONE_MODEL
+flashattention_backend.get_schedule = lambda: _STANDALONE_SCHEDULE
+flashattention_backend.get_memory = lambda: _STANDALONE_MEMORY
+flashattention_backend.get_parallel = lambda: _STANDALONE_PARALLEL
+triton_backend.get_spec = lambda: _STANDALONE_SPEC
+triton_backend.get_parallel = lambda: _STANDALONE_PARALLEL
+trtllm_mla_backend.get_spec = lambda: _STANDALONE_SPEC
+trtllm_mla_backend.get_schedule = lambda: _STANDALONE_SCHEDULE
 
 # Default DeepSeek MLA dims (non-wide): latent=512, rope=64 (query=576, value=512).
 KV_LORA_RANK = 512
@@ -161,6 +203,7 @@ class MockModelRunner:
         self.gpu_id = device.index if device.index is not None else torch.cuda.current_device()
         self.tp_size = 1
         self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_dtype_str = "fp8" if kv_cache_dtype == torch.float8_e4m3fn else "bfloat16"
         self.dtype = torch.bfloat16
         self.page_size = page_size
         self.req_to_token_pool = None
@@ -172,10 +215,12 @@ class MockModelRunner:
         self.hybrid_gdn_config = None
         self.kimi_linear_config = None
         self.linear_attn_model_spec = None
+        self.is_draft_worker = False
         self.model_config = MockModelConfig(num_attention_heads=num_attention_heads, scaling=scaling)
         # Keep attributes for compatibility across sglang versions (older code ignores them)
         self.is_hybrid_swa = self.model_config.is_hybrid_swa
         self.attn_cp_size = 1  # Context parallelism size; required by FlashAttentionBackend in sglang >=0.5.10
+        self.ps = SimpleNamespace(attn_cp_size=1, tp_size=1)
         self.server_args = MockServerArgs(kv_cache_dtype, page_size)
         self.use_mla_backend = True
 

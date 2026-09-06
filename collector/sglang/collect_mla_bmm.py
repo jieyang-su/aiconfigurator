@@ -8,12 +8,12 @@ generation pre/post processing. It consumes YAML-backed synthetic tensor
 shapes, selects SGLang kernel helpers, and logs the resulting MLA BMM perf rows.
 """
 
-__compat__ = "sglang==0.5.14"
+__compat__ = "sglang==0.5.18"
 
 import pkg_resources
 import torch
-from sgl_kernel import bmm_fp8
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.gemm import bmm_fp8
+from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
 )
 

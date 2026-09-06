@@ -22,7 +22,7 @@ Usage:
         python collect_mla_module.py --mode generation --attn-type mla
 """
 
-__compat__ = "sglang==0.5.14"
+__compat__ = "sglang==0.5.18"
 
 import argparse
 import gc
@@ -141,6 +141,17 @@ def _parse_int_list(value: str | None) -> list[int] | None:
     if not value:
         return None
     return [int(item) for item in value.split(",") if item]
+
+
+def _dsa_max_total_tokens_override() -> int | None:
+    """Read an optional pre-init DSA KV-pool budget."""
+    value = os.environ.get("AIC_DSA_MAX_TOTAL_TOKENS")
+    if not value:
+        return None
+    budget = int(value)
+    if budget <= 0:
+        raise ValueError("AIC_DSA_MAX_TOTAL_TOKENS must be positive")
+    return budget
 
 
 def _filter_cases_from_env(test_cases, *, is_prefill: bool, attn_type: str):
@@ -540,6 +551,24 @@ def _dsa_context_prefix_shape_is_valid(
     if not (prefix_len >= 0 and dsa_indexer_prefill_shape_is_supported(batch_size, seq_len)):
         return False
     return not (max_position_embeddings is not None and prefix_len + seq_len > max_position_embeddings)
+
+
+def _set_req_extend_range(req, start: int, end: int) -> None:
+    """Set the request extension range across SGLang request API versions.
+
+    SGLang 0.5.18 replaced ``set_extend_input_len`` with an absolute
+    ``extend_range``.  The collector uses the same semantics in both cases:
+    only ``[start, end)`` is newly evaluated; ``[0, start)`` is the cached
+    prefix.
+    """
+    if hasattr(req, "set_extend_range"):
+        req.set_extend_range(start, end)
+    elif hasattr(req, "set_extend_input_len"):
+        req.set_extend_input_len(end - start)
+    else:
+        from sglang.srt.managers.schedule_batch import Range
+
+        req.extend_range = Range(start, end)
 
 
 def _model_dsa_operator_gemm_type(model_id: str) -> str:
@@ -1065,6 +1094,7 @@ def load_model_runner(
     from sglang.srt.layers.moe import initialize_moe_config
     from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
     from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.utils import suppress_other_loggers
@@ -1091,6 +1121,20 @@ def load_model_runner(
     local_model_path = _resolve_local_model_path(model_path)
     load_quantization = {"fp8_block": "fp8", "nvfp4": "modelopt_fp4", None: None}[native_quant]
 
+    resolved_dsa_backend = None
+    if attention_backend == "dsa" and sglang_kv_dtype == "fp8_e4m3":
+        resolved_dsa_backend = dsa_prefill_backend
+        if resolved_dsa_backend is None:
+            resolved_dsa_backend = "trtllm" if get_sm_version() >= 100 else "flashmla_kv"
+
+    override_args = None
+    if num_layers > 0 and load_format == "dummy":
+        override_args = {
+            "num_hidden_layers": num_layers,
+            "num_attention_heads": head_num,
+            "num_key_value_heads": head_num,
+        }
+
     server_args = ServerArgs(
         model_path=local_model_path,
         dtype="auto",
@@ -1103,39 +1147,28 @@ def load_model_runner(
         kv_cache_dtype=sglang_kv_dtype,
         max_total_tokens=max_total_tokens,
         quantization=load_quantization,
+        attention_backend=attention_backend,
+        disable_flashinfer_autotune=True,
+        dsa_prefill_backend=resolved_dsa_backend,
+        dsa_decode_backend=resolved_dsa_backend,
+        json_model_override_args=json.dumps(override_args or {}),
     )
-
-    server_args.attention_backend = attention_backend
     # Do NOT warm up gemm at sglang ModelRunner init (that is the separate
     # front-of-timeline gemm autotune phase, done over the FULL model). The DSA
     # module gemm tuning is instead absorbed into the dsa-module warmup below
     # (run_mla_module, under `with autotune(True)`), so it is part of the module
     # init we actually measure -- not a global init phase.
-    server_args.disable_flashinfer_autotune = True
     # Match SGLang 0.5.14's configured FP8-KV dispatch. Hopper uses
     # flashmla_kv; the exact image has a runnable TRTLLM-GEN path on SM100.
     # SGLang's major-based selector also names TRT-LLM on SM103, but the
     # bundled capability test rejects that target. Registry maturity markers
     # park SM103/SM120 before this worker is queued. BF16 KV stays on the
     # runtime default because flashmla_kv rejects BF16.
-    if attention_backend == "dsa" and sglang_kv_dtype == "fp8_e4m3":
-        if dsa_prefill_backend is None:
-            dsa_prefill_backend = "trtllm" if get_sm_version() >= 100 else "flashmla_kv"
-        server_args.dsa_prefill_backend = dsa_prefill_backend
-        server_args.dsa_decode_backend = dsa_prefill_backend
     print(
         f"Using attention backend: {attention_backend}, kv_cache_dtype: {sglang_kv_dtype}, "
         f"gpu_id: {gpu_id}, chunked_prefill_size={server_args.chunked_prefill_size}, "
         f"max_prefill_tokens={server_args.max_prefill_tokens}, max_total_tokens={max_total_tokens}"
     )
-
-    if num_layers > 0 and load_format == "dummy":
-        override_args = {
-            "num_hidden_layers": num_layers,
-            "num_attention_heads": head_num,
-            "num_key_value_heads": head_num,
-        }
-        server_args.json_model_override_args = json.dumps(override_args)
 
     _set_envs_and_config(server_args)
     initialize_moe_config(server_args)
@@ -1166,12 +1199,7 @@ def load_model_runner(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
         gpu_id=gpu_id,
-        tp_rank=gpu_id,
-        tp_size=server_args.tp_size,
-        pp_rank=0,
-        pp_size=1,
-        moe_ep_rank=0,
-        moe_ep_size=1,
+        ps=ParallelState.trivial(gpu_id=gpu_id),
         nccl_port=nccl_port,
         server_args=server_args,
     )
@@ -1380,7 +1408,7 @@ def _run_prefill(
             req.prefix_indices = prefix_indices[i]
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
             req.fill_len = full_length
-            req.set_extend_input_len(seq_length if prefix_len else full_length)
+            _set_req_extend_range(req, prefix_len if prefix_len else 0, full_length)
             req.logprob_start_len = 0
             reqs.append(req)
 
@@ -1403,7 +1431,9 @@ def _run_prefill(
         )
         with _temporarily_chunked_alloc_extend(model_runner, batch_size * seq_length):
             batch.prepare_for_extend()
-        forward_batch = ForwardBatch.init_new(batch, model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch, model_runner, return_hidden_states_before_norm=False
+        )
         model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         hidden_states = torch.randn(
@@ -2070,7 +2100,7 @@ def _run_decode(
             req.prefix_indices = torch.empty((0,), dtype=torch.int64)
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
             req.fill_len = len(req.origin_input_ids)
-            req.set_extend_input_len(req.fill_len)
+            _set_req_extend_range(req, 0, req.fill_len)
             req.logprob_start_len = 0
             req.cached_tokens = 0
             req.already_computed = 0
@@ -2098,7 +2128,9 @@ def _run_decode(
         for req in batch.reqs:
             req.output_ids.append(0)
         batch.prepare_for_decode()
-        forward_batch_decode = ForwardBatch.init_new(batch, model_runner)
+        forward_batch_decode = ForwardBatch.init_new(
+            batch, model_runner, return_hidden_states_before_norm=False
+        )
         model_runner.attn_backend.init_forward_metadata(forward_batch_decode)
 
         decode_hidden = torch.randn(
@@ -2480,6 +2512,26 @@ def run_mla_module(
             print(
                 f"[DSA] pre-init dropped {_dropped_chunk} cases with bs*seq > "
                 f"chunked_prefill_size={_chunk_cap} (oversized one-shot forward crashes FlashMLA)"
+            )
+
+        # The DSA KV pool is allocated before the first case runs. A Cartesian
+        # product of large prefixes and large batches can therefore exhaust the
+        # GPU even when each retained point is individually valid. Apply an
+        # explicit budget before ModelRunner construction and keep the smaller
+        # batch/large-prefix points plus larger-batch/small-prefix points.
+        dsa_budget = _dsa_max_total_tokens_override()
+        if dsa_budget is not None:
+            before = len(cases)
+            cases = [
+                (bs, seq_len, ip, prefix_len)
+                for (bs, seq_len, ip, prefix_len) in cases
+                if required_kv_alloc_tokens(
+                    bs, seq_len, prefix_len, SGLANG_DSA_PAGE_SIZE, is_prefill=True
+                ) <= dsa_budget
+            ]
+            print(
+                f"[DSA] Applied AIC_DSA_MAX_TOTAL_TOKENS={dsa_budget}; "
+                f"dropped {before - len(cases)} context cases beyond the pre-init budget"
             )
 
     if not cases:

@@ -9,7 +9,7 @@ shape intent should live in YAML; this file owns SGLang backend construction,
 KV-cache setup, backend dispatch, and perf logging for the SGLang runtime.
 """
 
-__compat__ = "sglang==0.5.14"
+__compat__ = "sglang==0.5.18"
 
 import math
 import os
@@ -19,6 +19,7 @@ from typing import NamedTuple
 import pkg_resources
 import torch
 from sglang.srt.configs.model_config import AttentionArch
+import sglang.srt.layers.attention.flashattention_backend as flashattention_backend
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
@@ -34,6 +35,44 @@ from collector.case_generator import (
 from collector.helper import benchmark_with_power, get_sm_version, log_perf
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
+
+# Standalone collectors do not publish SGLang's scheduler config tree.  The
+# 0.5.18 attention backend nevertheless reads the speculative-decoding
+# namespace during initialization, so provide the production-equivalent
+# disabled configuration for this non-speculative microbenchmark.
+_STANDALONE_SPEC = SimpleNamespace(
+    speculative_eagle_topk=0,
+    speculative_num_draft_tokens=None,
+    speculative_algorithm=None,
+    speculative_num_steps=0,
+)
+_STANDALONE_EXEC = SimpleNamespace(
+    deterministic=SimpleNamespace(enable_deterministic_inference=False),
+)
+_STANDALONE_MODEL = SimpleNamespace(is_embedding=False)
+_STANDALONE_SCHEDULE = SimpleNamespace(
+    chunked_prefill_size=-1,
+    disable_chunked_prefix_cache=False,
+)
+_STANDALONE_MEMORY = SimpleNamespace(disable_radix_cache=True)
+_STANDALONE_PARALLEL = SimpleNamespace(
+    attn_tp_size=1,
+    attn_tp_rank=0,
+    attn_cp_size=1,
+    attn_cp_rank=0,
+    attn_dp_size=1,
+    attn_dp_rank=0,
+    attn_dcp_size=1,
+    attn_dcp_rank=0,
+    enable_prefill_cp=False,
+    enable_dp_attention=False,
+)
+flashattention_backend.get_spec = lambda: _STANDALONE_SPEC
+flashattention_backend.get_exec = lambda: _STANDALONE_EXEC
+flashattention_backend.get_model = lambda: _STANDALONE_MODEL
+flashattention_backend.get_schedule = lambda: _STANDALONE_SCHEDULE
+flashattention_backend.get_memory = lambda: _STANDALONE_MEMORY
+flashattention_backend.get_parallel = lambda: _STANDALONE_PARALLEL
 
 
 class Timing(NamedTuple):
@@ -144,6 +183,7 @@ class MockModelRunner:
         self.attn_backend = None
         self.server_args = MockServerArgs(page_size=page_size)
         self.attn_cp_size = 1  # Context parallelism size; required by FlashAttentionBackend in sglang >=0.5.10
+        self.ps = SimpleNamespace(attn_cp_size=1, tp_size=1)
         self.is_draft_worker = False
         self.model_is_mrope = False
         self.sliding_window_size = attention_chunk_size
@@ -162,6 +202,9 @@ class MockModelRunner:
             attention_chunk_size,
         )
         self.kv_cache_dtype = kv_cache_dtype  # Default
+        # SGLang 0.5.18's attention backends consume both the dtype object and
+        # its resolved string form during backend construction.
+        self.kv_cache_dtype_str = kv_cache_dtype
         self.page_size = page_size
         self.tp_size = 1
         self.is_hybrid = False
@@ -201,7 +244,7 @@ def get_context_attention_test_cases():
     test_cases = []
 
     # FP8 KV-cache cases follow the FP8 hardware floor (SM89+, Ada — see
-    # cases/capabilities.yaml dtype_min_sm.fp8). SGLang 0.5.14 puts no SM
+    # cases/capabilities.yaml dtype_min_sm.fp8). SGLang 0.5.18 puts no SM
     # gate on --kv-cache-dtype fp8_e4m3 (server_args.py:596-600) and the
     # flashinfer backend passes kv_cache_dtype straight into its plan calls
     # (flashinfer_backend.py:1151, 1377-1397); any backend-level rejection
@@ -241,6 +284,18 @@ def get_context_attention_test_cases():
                         use_fp8_kv_cache = bool(precision_case["fp8_kv_cache"])
                         use_fp8_context_fmha = bool(precision_case["fp8_context_fmha"])
                         if skip_fp8 and use_fp8_kv_cache:
+                            continue
+                        # On FA3 and TRTLLM-MHA, an FP8 KV cache causes the
+                        # backend to quantize Q internally.  Therefore the
+                        # only valid FP8-KV prefill case is the explicitly
+                        # labeled FP8 context-FMHA case; do not generate the
+                        # impossible BF16-compute/FP8-KV combination.
+                        if (
+                            use_fp8_kv_cache
+                            and not use_fp8_context_fmha
+                            and head_config.kernel_source in {"fa3", "trtllm_mha"}
+                            and head_dim <= 256
+                        ):
                             continue
                         test_cases.append(
                             [
@@ -441,6 +496,7 @@ def run_attention_torch(
         attention_chunk_size=attention_chunk_size,
     )
     model_runner.kv_cache_dtype = kvtype
+    model_runner.kv_cache_dtype_str = "fp8" if use_fp8_kv_cache else "bfloat16"
 
     total_len = input_len if is_context_phase else input_len + 1
     # TRTLLM MHA sizes its page table from context_len.
@@ -623,7 +679,7 @@ def run_attention_torch(
         attn_backend.init_forward_metadata(forward_batch)
 
         # Label prefill rows by the compute dtype the backend actually uses in
-        # SGLang 0.5.14 — the input dtype is an API contract, not the compute
+        # SGLang 0.5.18 — the input dtype is an API contract, not the compute
         # dtype:
         #   - fa3 (SM90): whenever the KV cache is FP8 and head_dim <= 256 it
         #     casts Q to the KV dtype itself (flashattention_backend.py:857-872),
@@ -641,7 +697,7 @@ def run_attention_torch(
         if is_context_phase:
             if use_fp8_context_fmha:
                 if attn_backend_name == "flashinfer":
-                    raise ValueError("SGLang 0.5.14 flashinfer has no FP8 prefill compute path")
+                    raise ValueError("SGLang 0.5.18 flashinfer has no FP8 prefill compute path")
                 if attn_backend_name != "trtllm_mha":
                     q = q.to(kvtype)
                     k = k.to(kvtype)
@@ -650,7 +706,7 @@ def run_attention_torch(
                 attn_backend_name == "trtllm_mha" or (attn_backend_name == "fa3" and head_dim <= 256)
             ):
                 raise ValueError(
-                    f"SGLang 0.5.14 {attn_backend_name} quantizes Q to FP8 internally when the KV cache "
+                    f"SGLang 0.5.18 {attn_backend_name} quantizes Q to FP8 internally when the KV cache "
                     "is FP8, so a BF16-compute prefill on an FP8 KV cache does not exist; this "
                     "combination is the fp8_context_fmha case"
                 )

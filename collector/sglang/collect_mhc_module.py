@@ -8,7 +8,7 @@
 # capable image or put a matching SGLang source tree on PYTHONPATH.
 from __future__ import annotations
 
-__compat__ = "sglang==0.5.14"
+__compat__ = "sglang==0.5.18"
 
 import argparse
 import copy
@@ -173,6 +173,7 @@ def _load_one_layer_runner(
     mem_fraction_static: float,
 ):
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.entrypoints.engine import _set_envs_and_config
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
@@ -198,8 +199,8 @@ def _load_one_layer_runner(
         max_total_tokens=4096,
         max_running_requests=16,
         max_prefill_tokens=4096,
+        attention_backend="dsv4",
     )
-    server_args.attention_backend = "dsv4"
 
     print(f"[mhc-collector] model_path {model_path} -> {local_model_path}")
 
@@ -209,12 +210,7 @@ def _load_one_layer_runner(
         model_config=model_config,
         mem_fraction_static=mem_fraction_static,
         gpu_id=gpu_id,
-        tp_rank=0,
-        tp_size=1,
-        pp_rank=0,
-        pp_size=1,
-        moe_ep_rank=0,
-        moe_ep_size=1,
+        ps=ParallelState.trivial(gpu_id=gpu_id),
         nccl_port=29500 + random.randint(0, 10000),
         server_args=server_args,
     )

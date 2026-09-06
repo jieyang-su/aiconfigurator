@@ -9,7 +9,9 @@ available. The module owns SGLang-specific kernel selection, quantization
 helpers, SM filters, and perf logging.
 """
 
-__compat__ = "sglang==0.5.14"
+# The collector follows the current SGLang 0.5.18 quantization helpers.  Keep
+# the gate explicit so a future API change fails during module loading.
+__compat__ = "sglang==0.5.18"
 
 import os
 import random
@@ -40,8 +42,10 @@ from sglang.srt.layers.deep_gemm_wrapper import (
     DEEPGEMM_SCALE_UE8M0,
     gemm_nt_f8f8bf16,
 )
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
-from sglang.srt.layers.quantization.fp8_utils import requant_weight_ue8m0
+from sglang.srt.layers.quantization.fp8_utils import (
+    requant_weight_ue8m0,
+    sglang_per_token_group_quant_fp8,
+)
 
 from collector.helper import benchmark_with_power, get_sm_version, log_perf
 

@@ -33,7 +33,7 @@ CSA(=4) / HCA(=128).
 # Requires stock SGLang 0.5.14 with its matching ``sgl-kernel`` package.
 from __future__ import annotations
 
-__compat__ = "sglang==0.5.14"
+__compat__ = "sglang==0.5.18"
 
 import functools
 import json
@@ -1131,11 +1131,31 @@ def _bench_topk_512(
     uses planned v2. Both execute inside production CUDA graphs, so capture is
     mandatory here too.
     """
-    from sglang.jit_kernel.dsv4.topk import (
-        plan_topk_v2,
-        topk_transform_512,
-        topk_transform_512_v2,
-    )
+    # The DSV4 top-k kernels moved out of ``sglang.jit_kernel`` in 0.5.18.
+    # Keep the old path for older compatible images, but resolve the complete
+    # API from one module so v1/v2 functions cannot be mixed accidentally.
+    import importlib
+
+    topk_api = None
+    for module_name in (
+        "sglang.jit_kernel.dsv4.topk",
+        "sglang.kernels.ops.attention.dsv4.topk",
+        "sglang.srt.layers.attention.dsv4.indexer",
+    ):
+        try:
+            candidate = importlib.import_module(module_name)
+        except (ImportError, ModuleNotFoundError):
+            continue
+        if all(hasattr(candidate, name) for name in ("plan_topk_v2", "topk_transform_512", "topk_transform_512_v2")):
+            topk_api = candidate
+            break
+    if topk_api is None:
+        raise ModuleNotFoundError(
+            "No compatible DSV4 top-k API found in SGLang 0.5.18 or legacy paths"
+        )
+    plan_topk_v2 = topk_api.plan_topk_v2
+    topk_transform_512 = topk_api.topk_transform_512
+    topk_transform_512_v2 = topk_api.topk_transform_512_v2
 
     if variant not in ("v1", "v2"):
         raise ValueError(f"unknown topk variant: {variant}")

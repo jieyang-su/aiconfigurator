@@ -36,7 +36,7 @@ model_case_values:
       sglang_moe_num_expert_group: 1
       sglang_moe_topk_group: 1
       sglang_moe_backends:
-        bfloat16: {100: flashinfer_trtllm, 103: flashinfer_trtllm}
+        bfloat16: {90: triton, 100: flashinfer_trtllm, 103: flashinfer_trtllm}
       framework_quantization:
         sglang:
           allowed_modes: [bfloat16]
@@ -54,7 +54,7 @@ model_case_values:
       sglang_moe_num_expert_group: 1
       sglang_moe_topk_group: 1
       sglang_moe_backends:
-        fp8_block: {100: flashinfer_trtllm, 103: flashinfer_trtllm}
+        fp8_block: {90: triton, 100: flashinfer_trtllm, 103: flashinfer_trtllm}
       framework_quantization:
         sglang:
           allowed_modes: [fp8_block]
@@ -90,7 +90,7 @@ model_case_values:
       sglang_moe_num_expert_group: 1
       sglang_moe_topk_group: 1
       sglang_moe_backends:
-        bfloat16: {100: flashinfer_trtllm, 103: flashinfer_trtllm}
+        bfloat16: {90: triton, 100: flashinfer_trtllm, 103: flashinfer_trtllm}
       framework_quantization:
         sglang:
           allowed_modes: [bfloat16]
@@ -108,7 +108,7 @@ model_case_values:
       sglang_moe_num_expert_group: 1
       sglang_moe_topk_group: 1
       sglang_moe_backends:
-        fp8_block: {100: flashinfer_trtllm, 103: flashinfer_trtllm}
+        fp8_block: {90: triton, 100: flashinfer_trtllm, 103: flashinfer_trtllm}
       framework_quantization:
         sglang:
           allowed_modes: [fp8_block]
@@ -146,7 +146,7 @@ model_case_values:
       sglang_moe_num_expert_group: 1
       sglang_moe_topk_group: 1
       sglang_moe_backends:
-        bfloat16: {100: flashinfer_trtllm, 103: flashinfer_trtllm}
+        bfloat16: {90: triton, 100: flashinfer_trtllm, 103: flashinfer_trtllm}
       framework_quantization:
         sglang:
           allowed_modes: [bfloat16]
@@ -166,7 +166,7 @@ model_case_values:
       sglang_moe_num_expert_group: 1
       sglang_moe_topk_group: 1
       sglang_moe_backends:
-        fp8_block: {100: flashinfer_trtllm, 103: flashinfer_trtllm}
+        fp8_block: {90: triton, 100: flashinfer_trtllm, 103: flashinfer_trtllm}
       framework_quantization:
         sglang:
           allowed_modes: [fp8_block]

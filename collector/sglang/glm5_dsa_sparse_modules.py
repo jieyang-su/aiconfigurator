@@ -27,7 +27,7 @@ CSV schema matches the aic module CSVs (``isl``=M, ``step``=past_kv).
 
 from __future__ import annotations
 
-__compat__ = "sglang==0.5.14"
+__compat__ = "sglang==0.5.18"
 
 import os
 import sys
@@ -78,8 +78,17 @@ def _selected_glm5_models():
     # prefer the longest-context GLM representative so one full/raw sparse sweep
     # covers the shorter GLM-5 range as well.
     paths = {s.model_path for s in get_mla_module_model_specs(attention_type="dsa")}
+    # A targeted collector run may expose only the requested alias (for
+    # example GLM-5.2), so do not require the historical GLM-5 path to be
+    # present. Sparse kernel geometry is selected from the resolved model
+    # config and is valid for every registered GLM DSA checkpoint.
+    targeted_glm = sorted(path for path in paths if "GLM-5" in path)
     if get_sm_version() not in {100, 103, 120}:
+        if targeted_glm:
+            return [targeted_glm[0]]
         return ["zai-org/GLM-5"] if "zai-org/GLM-5" in paths else []
+    if targeted_glm and not any("NVFP4" in path for path in targeted_glm):
+        return [targeted_glm[0]]
     if "nvidia/GLM-5.2-NVFP4" in paths:
         return ["nvidia/GLM-5.2-NVFP4"]
     if "nvidia/GLM-5-NVFP4" in paths:
