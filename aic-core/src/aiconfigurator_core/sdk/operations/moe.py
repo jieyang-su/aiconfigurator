@@ -64,6 +64,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _analytical_communication_result(sol_latency_ms: float) -> PerformanceResult:
+    """Apply the unified table-free communication proxy to an SOL result."""
+    from aiconfigurator_core.sdk.kernelsim.analytical import communication_latency_ms
+
+    return PerformanceResult(communication_latency_ms(sol_latency_ms), energy=0.0, source="analytical")
+
+
 def _cache_key(database: PerfDatabase) -> tuple:
     """Shared cache key — same shape as every other migrated op family."""
     return (
@@ -1074,6 +1081,8 @@ class MoEDispatch(Operation):
         elif database_mode == common.DatabaseMode.EMPIRICAL:
             return PerformanceResult(get_empirical(num_tokens, topk, num_experts), energy=0.0, source="empirical")
         elif database_mode == common.DatabaseMode.ANALYTICAL:
+            if database._analytical_config.communication_mode == "analytical":
+                return _analytical_communication_result(get_sol(num_tokens, topk, num_experts)[0])
             if database._analytical_config.communication_mode == "silicon":
                 return cls._query_wideep_deepep_ll_table(
                     database,
@@ -1169,6 +1178,8 @@ class MoEDispatch(Operation):
                 get_empirical(num_tokens, num_experts, topk, hidden_size), energy=0.0, source="empirical"
             )
         elif database_mode == common.DatabaseMode.ANALYTICAL:
+            if database._analytical_config.communication_mode == "analytical":
+                return _analytical_communication_result(get_sol(num_tokens, num_experts, topk, hidden_size)[0])
             if database._analytical_config.communication_mode == "silicon":
                 return cls._query_wideep_deepep_normal_table(
                     database,
@@ -2422,6 +2433,21 @@ class TrtLLMWideEPMoEDispatch(Operation):
                 kernel_source,
             )
             return PerformanceResult(emp_latency, energy=0.0, source="empirical")
+        elif (
+            database_mode == common.DatabaseMode.ANALYTICAL
+            and database._analytical_config.communication_mode == "analytical"
+        ):
+            return _analytical_communication_result(
+                get_sol(
+                    num_tokens,
+                    hidden_size,
+                    topk,
+                    num_experts,
+                    moe_ep_size,
+                    quant_mode,
+                    node_num,
+                )[0]
+            )
 
         # SILICON or HYBRID mode - use database
         def get_silicon():

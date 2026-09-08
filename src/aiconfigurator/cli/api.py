@@ -212,7 +212,8 @@ def cli_default(
         database_mode: Database mode for performance estimation
             ('SILICON', 'HYBRID', 'EMPIRICAL', 'SOL'). Default is 'SILICON'.
         analytical_communication_mode: Communication source when
-            ``database_mode='ANALYTICAL'``: empirical formula or silicon table.
+            ``database_mode='ANALYTICAL'``: calibrated analytical proxy,
+            legacy empirical formula, or silicon table.
         isl: Input sequence length. Default is 4000.
         osl: Output sequence length. Default is 1000.
         enable_encoder_dp: Model the vision encoder data-parallel (default True;

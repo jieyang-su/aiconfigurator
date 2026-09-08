@@ -9,5 +9,8 @@ not validated across GPUs, SGLang versions, backends, dtypes, or MSA variants.
 The three parameter levels are engineering envelopes, not confidence
 intervals. TopK/page-table transform is intentionally represented by a small
 launch-aware ElementWise approximation in the MSA analytical path; it is not a
-dedicated calibrated model. The selected-block GQA attention currently uses
-the FA model as a provisional proxy.
+dedicated calibrated model. The selected-block GQA attention uses the exact
+causal selected-pair count with FA's generic launch/efficiency profiles. Its
+HBM term conservatively gathers each selected KV block per query and KV head;
+sparse task waves, cache reuse, indirect-address overhead and split-K merge are
+not calibrated.

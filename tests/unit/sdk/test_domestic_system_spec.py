@@ -52,16 +52,25 @@ def test_proxy_sm_does_not_claim_nvidia_architecture() -> None:
 
 
 @pytest.mark.parametrize(
-    ("system_name", "fp8", "fp4"),
+    ("system_name", "fp8", "fp4", "capacity", "intra_node_bw"),
     [
-        ("_dom_br100_64", False, False),
-        ("_dom_br100_128", False, False),
-        ("_dom_ascend_910c", False, False),
-        ("_dom_klx_m300_512", True, False),
-        ("_dom_ascend_950dt", True, True),
+        ("_dom_br100_64", False, False, 64, 400_000_000_000),
+        ("_dom_br100_128", False, False, 128, 400_000_000_000),
+        ("_dom_ascend_910c", False, False, 384, 392_000_000_000),
+        ("_dom_klx_p800_256", False, False, 256, 200_000_000_000),
+        ("_dom_zte_128", True, False, 128, 400_000_000_000),
+        ("_dom_klx_m300_512", True, False, 256, 600_000_000_000),
+        ("_dom_ascend_950dt", True, True, 96, 840_000_000_000),
+        ("_dom_ascend_950dt_1024", True, True, 1024, 840_000_000_000),
     ],
 )
-def test_packaged_domestic_specs_declare_explicit_capabilities(system_name: str, fp8: bool, fp4: bool) -> None:
+def test_packaged_domestic_specs_declare_explicit_capabilities(
+    system_name: str,
+    fp8: bool,
+    fp4: bool,
+    capacity: int,
+    intra_node_bw: int,
+) -> None:
     spec = load_system_spec(system_name)
 
     assert spec["gpu"]["architecture_family"] == "domestic"
@@ -72,12 +81,41 @@ def test_packaged_domestic_specs_declare_explicit_capabilities(system_name: str,
     }
     assert spec["node"]["topology_scope"] == "single_supernode"
     assert spec["node"]["inter_node_bw"] == 0
-    assert spec["node"]["num_gpus_per_node"] > 0
+    assert spec["node"]["num_gpus_per_node"] == capacity
+    assert spec["node"]["intra_node_bw"] == intra_node_bw
     assert not is_hopper_spec(spec)
     assert not is_blackwell_spec(spec)
     assert supports_fp8_mma(spec) is fp8
     assert supports_fp4_mma(spec) is fp4
     assert not supports_mnnvl(spec)
+
+
+def test_domestic_supernode_variants_share_chip_parameters() -> None:
+    ascend_96 = load_system_spec("_dom_ascend_950dt")
+    ascend_1024 = load_system_spec("_dom_ascend_950dt_1024")
+
+    assert ascend_96["gpu"] == ascend_1024["gpu"]
+
+
+def test_zte_128_uses_documented_peaks_and_h100_microarchitecture_proxy() -> None:
+    spec = load_system_spec("_dom_zte_128")
+
+    assert spec["gpu"]["bfloat16_tc_flops"] == 500_000_000_000_000
+    assert spec["gpu"]["fp8_tc_flops"] == 1_000_000_000_000_000
+    assert spec["gpu"]["mem_bw"] == 3_200_000_000_000
+    assert spec["gpu"]["mem_capacity"] == 128 * 1024**3
+    assert spec["gpu"]["sm_version"] == 90
+    assert spec["gpu"]["sm_count"] == 132
+
+
+def test_klx_p800_uses_documented_peaks_and_a100_microarchitecture_proxy() -> None:
+    spec = load_system_spec("_dom_klx_p800_256")
+
+    assert spec["gpu"]["bfloat16_tc_flops"] == 345_000_000_000_000
+    assert spec["gpu"]["mem_bw"] == 2_400_000_000_000
+    assert spec["gpu"]["mem_capacity"] == 96 * 1024**3
+    assert spec["gpu"]["sm_version"] == 80
+    assert spec["gpu"]["sm_count"] == 108
 
 
 def test_single_supernode_rejects_oversized_groups() -> None:

@@ -213,6 +213,25 @@ class TestCLIArgumentParsing:
 
         assert args.engine_step_backend == "rust"
 
+    def test_analytical_communication_proxy_flag(self, cli_parser):
+        args = cli_parser.parse_args(
+            [
+                "default",
+                "--model-path",
+                "Qwen/Qwen3-32B",
+                "--total-gpus",
+                "8",
+                "--system",
+                "h200_sxm",
+                "--database-mode",
+                "ANALYTICAL",
+                "--analytical-communication-mode",
+                "analytical",
+            ]
+        )
+
+        assert args.analytical_communication_mode == "analytical"
+
     def test_save_directory_argument(self, cli_parser):
         """Test that save directory can be specified."""
         args = cli_parser.parse_args(

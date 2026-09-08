@@ -289,8 +289,12 @@ def _add_analytical_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--analytical-communication-mode",
-        choices=["empirical", "silicon"],
+        choices=["analytical", "empirical", "silicon"],
         default="empirical",
+        help=(
+            "Communication path inside ANALYTICAL mode: analytical uses the Hopper-calibrated "
+            "7us + SOL/0.75 proxy; empirical preserves the legacy SOL/0.8 formula; silicon uses tables."
+        ),
     )
     parser.add_argument(
         "--communication-placement",

@@ -13,16 +13,20 @@ import warnings as python_warnings
 from dataclasses import dataclass
 
 EMPIRICAL_MODEL_VERSION = "2026-07-29.aic-gemm-empirical-v3"
-W8A16_TRANSFER_MODEL_VERSION = "2026-08-13.w8a16-int8wo-bf16-transfer-v1"
+W8A16_TRANSFER_MODEL_VERSION = "2026-08-24.w8a16-int8wo-bf16-fused-transition-proxy-v4"
 W8A16_TRANSFER_LIMITATION = (
-    "W8A16 dense GEMM uses an uncalibrated BF16 parameter transfer: activations, "
-    "outputs, FLOPs, launch cost, and compute efficiency remain BF16, while only "
-    "INT8 weight values and per-output-channel FP32 scale traffic are substituted. "
-    "Fused dequantization cost, backend-specific packing/tiling, small-M behavior, "
-    "and non-NVIDIA hardware are not calibrated. The current SGLang GEMM collector "
-    "also does not fully connect its declared int8_wo case. Treat this estimate as "
-    "low confidence. This is an ANALYTICAL transfer proxy, not a Silicon calibration "
-    "row, and must not be reported as measured W8A16 performance."
+    "W8A16 dense GEMM uses an uncalibrated BF16-compute compatibility proxy. It "
+    "retains BF16 activations, outputs, and peak FLOPs while accounting for INT8 "
+    "weight and scale traffic in the fused GEMM body. Its launch and utilization "
+    "and a fitted-style launch/body transition term are conservatively degraded from "
+    "the BF16 model, but it does not model a "
+    "separate quantization kernel or materialized BF16 weight traffic: SGLang "
+    "performs dequantization inside the kernel. Fused dequantization, packing/tiling, "
+    "small-M behavior, backend differences, scale granularity, and non-NVIDIA "
+    "hardware are not calibrated. The current SGLang GEMM collector also does not "
+    "fully connect its declared int8_wo case. Treat this estimate as low confidence. "
+    "This is an ANALYTICAL transfer proxy, not a Silicon calibration row, and must "
+    "not be reported as measured W8A16 performance."
 )
 
 
@@ -46,6 +50,16 @@ class Bf16Sum3PParameters:
     t_launch_us: float = 2.0
     eta_mem: float = 0.77
     eta_compute: float = 0.90
+
+
+@dataclass(frozen=True)
+class W8A16GatedTransferParameters:
+    """Engineering parameters for the fused, uncalibrated W8A16 proxy."""
+
+    t_launch_us: float = 5.0
+    eta_mem: float = 0.70
+    eta_compute: float = 0.80
+    rho_transition: float = 1.5
 
 
 @dataclass(frozen=True)
@@ -100,6 +114,23 @@ BF16_SUM_3P_LOW = Bf16Sum3PParameters(
     t_launch_us=1.5,
     eta_mem=0.96,
     eta_compute=1.0,
+)
+
+# No pure-W8A16 collector data are available. "precise" therefore deliberately
+# aliases the standard engineering parameters instead of implying a fitted model.
+W8A16_GATED_TRANSFER_PRECISE = W8A16GatedTransferParameters()
+W8A16_GATED_TRANSFER_STANDARD = W8A16GatedTransferParameters()
+W8A16_GATED_TRANSFER_HIGH = W8A16GatedTransferParameters(
+    t_launch_us=6.5,
+    eta_mem=0.58,
+    eta_compute=0.65,
+    rho_transition=1.9,
+)
+W8A16_GATED_TRANSFER_LOW = W8A16GatedTransferParameters(
+    t_launch_us=4.0,
+    eta_mem=0.88,
+    eta_compute=0.95,
+    rho_transition=1.1,
 )
 
 DEEPGEMM_MAX_8P_PRECISE = DeepGemmMax8PParameters(
@@ -161,12 +192,19 @@ SGLANG_FP8_MAX_5P_LOW = SglangFp8Max5PParameters(
 BF16_SUM_3P = BF16_SUM_3P_STANDARD
 DEEPGEMM_MAX_8P = DEEPGEMM_MAX_8P_STANDARD
 SGLANG_FP8_MAX_5P = SGLANG_FP8_MAX_5P_STANDARD
+W8A16_GATED_TRANSFER = W8A16_GATED_TRANSFER_STANDARD
 
 _BF16_PARAMETER_LEVELS = {
     "precise": BF16_SUM_3P_PRECISE,
     "standard": BF16_SUM_3P_STANDARD,
     "high": BF16_SUM_3P_HIGH,
     "low": BF16_SUM_3P_LOW,
+}
+_W8A16_PARAMETER_LEVELS = {
+    "precise": W8A16_GATED_TRANSFER_PRECISE,
+    "standard": W8A16_GATED_TRANSFER_STANDARD,
+    "high": W8A16_GATED_TRANSFER_HIGH,
+    "low": W8A16_GATED_TRANSFER_LOW,
 }
 _DEEPGEMM_PARAMETER_LEVELS = {
     "precise": DEEPGEMM_MAX_8P_PRECISE,
@@ -191,6 +229,10 @@ def _parameter_level(value: str) -> str:
 
 def get_bf16_parameters(level: str = "standard") -> Bf16Sum3PParameters:
     return _BF16_PARAMETER_LEVELS[_parameter_level(level)]
+
+
+def get_w8a16_parameters(level: str = "standard") -> W8A16GatedTransferParameters:
+    return _W8A16_PARAMETER_LEVELS[_parameter_level(level)]
 
 
 def get_deepgemm_parameters(level: str = "standard") -> DeepGemmMax8PParameters:
@@ -289,23 +331,20 @@ def estimate_w8a16_gemm(
     k: int,
     peak_bf16_flops: float,
     mem_bandwidth_bytes_s: float,
-    params: Bf16Sum3PParameters | None = None,
+    params: W8A16GatedTransferParameters | None = None,
     *,
     parameter_level: str = "standard",
 ) -> LatencyBreakdown:
-    """Estimate an INT8-weight/BF16-activation GEMM by BF16 transfer.
-
-    The proxy assumes one FP32 scale per output channel and fused weight
-    dequantization, so no materialized BF16 weight tensor is charged.
-    """
+    """Estimate a fused INT8-weight/BF16-activation GEMM compatibility proxy."""
     _warn_w8a16_transfer_once()
-    params = _resolve_parameters(parameter_level, params, get_bf16_parameters)
+    params = _resolve_parameters(parameter_level, params, get_w8a16_parameters)
     m, n, k = _positive_shape(m, n, k)
     peak = _positive_rate("peak_bf16_flops", peak_bf16_flops)
     bandwidth = _positive_rate("mem_bandwidth_bytes_s", mem_bandwidth_bytes_s)
     launch_us = _nonnegative("params.t_launch_us", params.t_launch_us)
     eta_mem = _positive_rate("params.eta_mem", params.eta_mem)
     eta_compute = _positive_rate("params.eta_compute", params.eta_compute)
+    rho = _nonnegative("params.rho_transition", params.rho_transition)
 
     flops = 2.0 * m * n * k
     scale_bytes = 4.0 * n
@@ -313,19 +352,21 @@ def estimate_w8a16_gemm(
     memory_s = gemm_bytes / bandwidth / eta_mem
     compute_s = flops / peak / eta_compute
     body_s = memory_s + compute_s
+    launch_s = launch_us * 1e-6
+    transition_s = rho * launch_s * body_s / (body_s + launch_s)
     return LatencyBreakdown(
-        model="w8a16_int8wo_bf16_transfer_sum_3p",
-        latency_us=launch_us + _us(body_s),
+        model="w8a16_int8wo_bf16_fused_transition_proxy_v4",
+        latency_us=_us(launch_s + body_s + transition_s),
         launch_us=launch_us,
         body_us=_us(body_s),
-        transition_us=0.0,
+        transition_us=_us(transition_s),
         quant_us=0.0,
         gemm_memory_us=_us(memory_s),
         compute_us=_us(compute_s),
         roofline_branch="sum",
         flops=flops,
         gemm_bytes=gemm_bytes,
-        quant_bytes=scale_bytes,
+        quant_bytes=0.0,
     )
 
 
@@ -472,12 +513,18 @@ __all__ = [
     "SGLANG_FP8_MAX_5P_LOW",
     "SGLANG_FP8_MAX_5P_PRECISE",
     "SGLANG_FP8_MAX_5P_STANDARD",
+    "W8A16_GATED_TRANSFER",
+    "W8A16_GATED_TRANSFER_HIGH",
+    "W8A16_GATED_TRANSFER_LOW",
+    "W8A16_GATED_TRANSFER_PRECISE",
+    "W8A16_GATED_TRANSFER_STANDARD",
     "W8A16_TRANSFER_LIMITATION",
     "W8A16_TRANSFER_MODEL_VERSION",
     "Bf16Sum3PParameters",
     "DeepGemmMax8PParameters",
     "LatencyBreakdown",
     "SglangFp8Max5PParameters",
+    "W8A16GatedTransferParameters",
     "W8A16TransferModelWarning",
     "bf16_gemm_latency_us",
     "deepgemm_fp8_latency_us",
@@ -488,6 +535,7 @@ __all__ = [
     "get_bf16_parameters",
     "get_deepgemm_parameters",
     "get_sglang_fp8_parameters",
+    "get_w8a16_parameters",
     "sglang_fp8_latency_us",
     "w8a16_gemm_latency_us",
 ]

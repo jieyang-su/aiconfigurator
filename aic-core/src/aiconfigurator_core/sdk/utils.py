@@ -957,6 +957,9 @@ def _normalize_quant_algo(value: object) -> str | None:
     aliases = {
         "fp8": "fp8",
         "fp8_block": "fp8_block",
+        # MiniMax-M3-MXFP8 stores block-scaled MXFP8 weights.  KernelSim has
+        # no distinct MXFP8 recipe, so use the existing FP8-block proxy.
+        "mxfp8": "fp8_block",
         "nvfp4": "nvfp4",
         "mxfp4": "mxfp4",
         "w4a16_mxfp4": "mxfp4",

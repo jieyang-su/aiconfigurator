@@ -41,6 +41,19 @@ class MsaAnalyticalApproximationWarning(UserWarning):
     """Warning for deliberately approximate non-index MSA granular recipes."""
 
 
+def _msa_selected_pairs(*, batch: int, query_length: int, prefix: int, topk: int, is_context: bool) -> int:
+    """Exact causal selected-token pairs before block-kernel padding."""
+    if not is_context:
+        return batch * min(query_length, topk)
+    full_context = prefix + query_length
+    if full_context <= topk:
+        return batch * (full_context * (full_context + 1) - prefix * (prefix + 1)) // 2
+    if prefix >= topk:
+        return batch * query_length * topk
+    ramp = batch * (topk * (topk + 1) - prefix * (prefix + 1)) // 2
+    return ramp + batch * (full_context - topk) * topk
+
+
 def _msa_attention_sol(
     database: PerfDatabase,
     *,
@@ -85,19 +98,14 @@ def _msa_attention_sol(
     )
 
     # ── sparse attention: top-k saturated causal (query, kv) pair count ──
-    if is_context:
-        if full_s <= index_topk:
-            pairs = b * (full_s * (full_s + 1) - prefix * (prefix + 1)) // 2
-        elif prefix >= index_topk:
-            pairs = tokens * index_topk
-        else:
-            ramp = b * (index_topk * (index_topk + 1) - prefix * (prefix + 1)) // 2
-            sat = b * (full_s - index_topk) * index_topk
-            pairs = ramp + sat
-        score_len = full_s
-    else:
-        pairs = tokens * min(kv_len, index_topk)
-        score_len = kv_len
+    pairs = _msa_selected_pairs(
+        batch=b,
+        query_length=s if is_context else kv_len,
+        prefix=prefix,
+        topk=index_topk,
+        is_context=is_context,
+    )
+    score_len = full_s if is_context else kv_len
     effective_kv = min(kv_len, index_topk) if not is_context else min(full_s, index_topk)
     attention_ops = 2 * num_heads * (qk_head_dim + v_head_dim) * pairs  # QK^T + AV
 
@@ -259,9 +267,9 @@ class _BaseMSAModule(Operation):
     def _analytical(self, database, *, b: int, s: int, prefix: int, is_context: bool) -> float:
         """Granular no-table MSA recipe used only by ANALYTICAL mode."""
         from aiconfigurator_core.sdk.kernelsim.analytical import (
-            attention_latency_ms,
             gemm_latency_ms,
             msa_index_latency_ms,
+            msa_sparse_attention_latency_ms,
             msa_topk_elementwise_latency_ms,
         )
 
@@ -280,21 +288,26 @@ class _BaseMSAModule(Operation):
         )
         latency = gemm_latency_ms(tokens, fused_n, self._hidden_size, self._gemm_quant_mode, gpu, config)
 
-        selected_tokens = min(full_context, self._index_topk)
         dtype = "fp8" if self._fmha_quant_mode in (common.FMHAQuantMode.fp8, common.FMHAQuantMode.fp8_block) else "bf16"
-        latency += attention_latency_ms(
-            system=database.system,
+        selected_pairs = _msa_selected_pairs(
+            batch=b,
+            query_length=query_length if is_context else full_context,
+            prefix=prefix,
+            topk=self._index_topk,
+            is_context=is_context,
+        )
+        latency += msa_sparse_attention_latency_ms(
             gpu=gpu,
             batch=b,
             query_length=query_length,
-            # FA schema requires kv >= fresh query length. For prefill the
-            # selected-block adapter therefore retains the causal query span;
-            # the sparse reduction is represented by the capped KV axis.
-            kv_length=max(query_length, selected_tokens),
+            selected_pairs=selected_pairs,
             query_heads=self._num_heads,
             kv_heads=self._num_kv_heads,
             head_dim=self._head_dim,
-            dtype=dtype,
+            value_head_dim=self._v_head_dim,
+            compute_dtype=dtype,
+            kv_cache_bytes_per_element=self._kvcache_quant_mode.value.memory,
+            block_size=self._block_size,
             config=config,
         )
         latency += gemm_latency_ms(
@@ -331,8 +344,9 @@ class _BaseMSAModule(Operation):
         warnings.warn(
             "MiniMax MSA ANALYTICAL uses a provisional single-H100 BF16 Triton index fit, "
             "a launch-aware ElementWise approximation for block TopK/page transform, and "
-            "the dense FA model as a selected-block GQA proxy. Cross-GPU/backend/dtype "
-            "transfer and random block-gather effects are not calibrated.",
+            "an exact-pair GQA roofline with conservative HBM block gathers for the main "
+            "attention. Cross-GPU/backend/dtype transfer, sparse task waves and split-K "
+            "merge effects are not calibrated.",
             MsaAnalyticalApproximationWarning,
             stacklevel=3,
         )

@@ -16,6 +16,7 @@ from aiconfigurator.sdk import common, config
 from aiconfigurator.sdk.backends.base_backend import BaseBackend
 from aiconfigurator.sdk.models import Gemma4MixModel, HybridMoEModel
 from aiconfigurator.sdk.utils import (
+    _normalize_quant_algo,
     _parse_hf_config_json,
     enumerate_parallel_config,
     enumerate_ttft_tpot_constraints,
@@ -23,6 +24,10 @@ from aiconfigurator.sdk.utils import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_mxfp8_quant_algo_uses_fp8_block_proxy():
+    assert _normalize_quant_algo("mxfp8") == "fp8_block"
 
 
 class TestParseHFConfig:

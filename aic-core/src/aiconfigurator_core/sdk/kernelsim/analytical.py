@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from aiconfigurator_core.sdk import common
 from aiconfigurator_core.sdk.kernelsim.bmm.model import estimate_mla_bmm
+from aiconfigurator_core.sdk.kernelsim.communication import estimate_communication
 from aiconfigurator_core.sdk.kernelsim.dsa import (
     IndexMqaShape,
     IndexTopKShape,
@@ -80,8 +81,8 @@ class AnalyticalConfig:
             raise ValueError("attention algorithm must be fa2 or fa3")
         if self.sparse_attention_head_quantum not in {None, 64, 128}:
             raise ValueError("sparse attention head quantum must be omitted, 64, or 128")
-        if communication_mode not in {"empirical", "silicon"}:
-            raise ValueError("analytical communication mode must be empirical or silicon")
+        if communication_mode not in {"empirical", "silicon", "analytical"}:
+            raise ValueError("analytical communication mode must be empirical, silicon, or analytical")
         if communication_placement not in _COMMUNICATION_PLACEMENTS:
             raise ValueError("communication placement must be independent or tp_first")
         for name, dtype in communication_dtypes.items():
@@ -116,6 +117,11 @@ class AnalyticalConfig:
         prefix = "wideep" if wideep else "moe"
         phase = "dispatch" if dispatch else "combine"
         return common.CommQuantMode[getattr(self, f"{prefix}_{phase}_dtype")]
+
+
+def communication_latency_ms(sol_latency_ms: float) -> float:
+    """Return the unified startup-plus-efficiency communication estimate."""
+    return estimate_communication(sol_latency_ms).latency_ms
 
 
 def warn_backend_compatibility(backend: str) -> None:
@@ -450,6 +456,84 @@ def msa_topk_elementwise_latency_ms(
     floor_us = 1.5
     memory_us = bytes_moved / float(gpu["mem_bw"]) * 1e6 / 0.35
     return (floor_us + memory_us) * {"low": 0.85, "standard": 1.0, "high": 1.25}[config.level] / 1000.0
+
+
+def msa_sparse_attention_latency_ms(
+    *,
+    gpu: dict,
+    batch: int,
+    query_length: int,
+    selected_pairs: int,
+    query_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    value_head_dim: int,
+    compute_dtype: str,
+    kv_cache_bytes_per_element: float,
+    block_size: int,
+    config: AnalyticalConfig,
+) -> float:
+    """Selected-block GQA roofline for MiniMax MSA.
+
+    MSA supplies one TopK block list per KV head and query.  A dense causal FA
+    shape cannot represent that contract when the fresh query span is longer
+    than the selected KV span.  This adapter therefore carries the exact
+    selected pair count while reusing FA's launch and efficiency scenarios.
+
+    KV traffic assumes every selected block is gathered from HBM for each
+    query/KV-head pair.  This is deliberately conservative for random pages;
+    cache reuse, sparse-kernel task waves and split-K merge remain uncalibrated.
+    """
+    positive_ints = {
+        "batch": batch,
+        "query_length": query_length,
+        "selected_pairs": selected_pairs,
+        "query_heads": query_heads,
+        "kv_heads": kv_heads,
+        "head_dim": head_dim,
+        "value_head_dim": value_head_dim,
+        "block_size": block_size,
+    }
+    for name, value in positive_ints.items():
+        if isinstance(value, bool) or int(value) != value or int(value) <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if query_heads % kv_heads:
+        raise ValueError("query_heads must be divisible by kv_heads")
+    if kv_cache_bytes_per_element <= 0:
+        raise ValueError("kv_cache_bytes_per_element must be positive")
+
+    dtype = compute_dtype.strip().lower()
+    if dtype in {"bf16", "bfloat16", "fp16", "float16"}:
+        peak_key = "bfloat16_tc_flops"
+        compute_bytes = 2
+    elif dtype in {"fp8", "float8"}:
+        peak_key = "fp8_tc_flops"
+        compute_bytes = 1
+    else:
+        raise ValueError("MSA sparse attention compute_dtype must be BF16/FP16 or FP8")
+    if peak_key not in gpu:
+        raise ValueError(f"MSA sparse attention analytical model requires gpu.{peak_key}")
+
+    profile = get_reference_profile(config.level)
+    tokens = batch * query_length
+    matrix_flops = 2.0 * selected_pairs * query_heads * (head_dim + value_head_dim)
+    # Online softmax is vector work; 40 FLOP-equivalents includes exp plus
+    # max/sum/state updates and follows the generic FA convention.
+    vector_flops = float(selected_pairs * query_heads * 40)
+
+    selected_block_refs = (selected_pairs + block_size - 1) // block_size
+    q_bytes = tokens * query_heads * head_dim * compute_bytes
+    output_bytes = tokens * query_heads * value_head_dim * 2
+    gathered_kv_bytes = (
+        selected_pairs * kv_heads * (head_dim + value_head_dim) * float(kv_cache_bytes_per_element)
+    )
+    block_index_bytes = selected_block_refs * kv_heads * 4
+    hbm_bytes = q_bytes + output_bytes + gathered_kv_bytes + block_index_bytes
+
+    matrix_ms = matrix_flops / (float(gpu[peak_key]) * profile.compute_efficiency) * 1000
+    vector_ms = vector_flops / (float(gpu["vector_peak_flops"]) * profile.compute_efficiency) * 1000
+    memory_ms = hbm_bytes / (float(gpu["mem_bw"]) * profile.hbm_efficiency) * 1000
+    return profile.fixed_overhead_us / 1000 + max(matrix_ms + vector_ms, memory_ms)
 
 
 def dsa_sparse_attention_latency_ms(

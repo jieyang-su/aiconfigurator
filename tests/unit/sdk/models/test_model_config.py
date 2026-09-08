@@ -51,6 +51,7 @@ class TestSupportedModels:
             "sgl-project/DeepSeek-V4-Pro-FP8",
             "zai-org/GLM-5-FP8",
             "nvidia/GLM-5-NVFP4",
+            "MiniMaxAI/MiniMax-M3-MXFP8",
             "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16",
             "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8",
             "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
@@ -139,6 +140,16 @@ class TestMOEParallelismResolution:
         assert ctx["context_moe"]._scale_factor == 57
         assert ctx["context_dense_attention"]._scale_factor == 3
         assert ctx["context_dense_gate_up_gemm"]._n == 2 * 12288
+
+    def test_minimax_m3_mxfp8_uses_fp8_block_proxy_and_preserves_bf16_router(self):
+        """MXFP8 uses the existing FP8-block recipe; routing remains high precision."""
+        model_config = config.ModelConfig(tp_size=1, attention_dp_size=1, moe_tp_size=1, moe_ep_size=1)
+        model = get_model("MiniMaxAI/MiniMax-M3-MXFP8", model_config, backend_name="trtllm")
+        context_ops = {op._name: op for op in model.context_ops}
+
+        assert model_config.gemm_quant_mode == common.GEMMQuantMode.fp8_block
+        assert model_config.moe_quant_mode == common.MoEQuantMode.fp8_block
+        assert context_ops["context_router_gemm"]._quant_mode == common.GEMMQuantMode.bfloat16
 
     def test_nemotron_h_mtp_scales_generation_only(self):
         """Nemotron-3 ships num_nextn_predict_layers=1; MTP must build (no assert) and

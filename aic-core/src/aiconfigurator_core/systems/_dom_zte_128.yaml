@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 AIC contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Domestic GPU estimate-only system profile for the 128-GPU ZTE OEX SuperPoD.
+# The accelerator is not KLX-M300. Peak compute, memory, and topology values
+# come from the 2026-08-17 source description. Unpublished microarchitectural
+# fields use H100 proxies for KernelSim only, not ISA/backend compatibility.
+
+data_dir: data/_dom_zte_128
+gpu:
+  mem_bw: 3200000000000 # 3.2TB/s
+  mem_bw_empirical_scaling_factor: 0.8 # provisional generic correction
+  mem_empirical_constant_latency: 0.000003 # 3us provisional estimate
+  mem_capacity: 137438953472 # 128GiB
+  bfloat16_tc_flops: 500000000000000 # 500TFLOPS BF16
+  fp8_tc_flops: 1000000000000000 # 1000TFLOPS FP8
+  power: 700 # H100 proxy; target board power not provided
+  sm_version: 90 # H100 proxy, not a ZTE accelerator ISA claim
+  architecture_family: domestic
+  capability_overrides:
+    fp8_mma: true
+    fp4_mma: false
+    mnnvl: false
+  sm_count: 132 # H100 proxy for analytical KernelSim
+  clock_hz: 1830000000 # H100 proxy
+  shared_memory_per_sm_bytes: 262144 # H100 proxy
+  l2_capacity_bytes: 52428800 # H100 proxy
+  l2_bandwidth_bytes_s: 9369600000000 # H100 proxy
+  vector_peak_flops: 123724800000000 # H100 proxy
+
+node:
+  topology_scope: single_supernode
+  num_gpus_per_node: 128 # ZTE OEX SuperPoD size
+  inter_node_bw: 0 # cross-supernode link not modeled
+  intra_node_bw: 400000000000 # 400GB/s per GPU within the supernode
+  pcie_bw: 64000000000 # H100 proxy; host link not provided
+  p2p_latency: 0.00001 # provisional H100 proxy
+
+misc:
+  nccl_mem:
+    1: 0
+    2: 358612992
+    4: 411041792
+    8: 411041792
+  other_mem: 3758096384
+  nccl_version: '2.27.3' # placeholder; no domestic collective backend data yet

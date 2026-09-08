@@ -1,5 +1,6 @@
 import pytest
 
+from aiconfigurator_core.sdk.kernelsim.analytical import AnalyticalConfig, msa_sparse_attention_latency_ms
 from aiconfigurator_core.sdk.kernelsim.msa import (
     MsaIndexModelWarning,
     MsaIndexShape,
@@ -40,3 +41,27 @@ def test_profiles_are_monotonic_and_scope_is_reported():
 def test_decode_rejects_multi_query_recipe():
     with pytest.raises(ValueError, match="query_length=1"):
         MsaIndexShape("decode", 1, 2, 4096, 4)
+
+
+def test_selected_attention_scales_with_real_sparse_pairs():
+    gpu = {
+        "bfloat16_tc_flops": 0.989e15,
+        "vector_peak_flops": 6.0e13,
+        "mem_bw": 3.35e12,
+    }
+    kwargs = dict(
+        gpu=gpu,
+        batch=1,
+        query_length=13_108,
+        query_heads=64,
+        kv_heads=4,
+        head_dim=128,
+        value_head_dim=128,
+        compute_dtype="bf16",
+        kv_cache_bytes_per_element=1,
+        block_size=128,
+        config=AnalyticalConfig(),
+    )
+    sparse = msa_sparse_attention_latency_ms(selected_pairs=13_108 * 2_048, **kwargs)
+    accidental_dense = msa_sparse_attention_latency_ms(selected_pairs=13_108 * 13_108, **kwargs)
+    assert 0 < sparse < accidental_dense

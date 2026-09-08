@@ -123,3 +123,40 @@ def test_msa_analytical_uses_granular_no_table_recipe(mutable_comprehensive_perf
         assert result.source == "analytical"
     finally:
         comprehensive_perf_db.set_default_database_mode(common.DatabaseMode.SILICON)
+
+
+def test_msa_analytical_long_prefix_uses_selected_pairs(mutable_comprehensive_perf_db, monkeypatch):
+    """A long fresh span must not inflate sparse KV work to dense Q x Q."""
+    from aiconfigurator_core.sdk.kernelsim import analytical
+    from aiconfigurator_core.sdk.operations.msa import MsaAnalyticalApproximationWarning
+
+    database = mutable_comprehensive_perf_db
+    database.system_spec["gpu"].update(
+        {
+            "sm_count": 132,
+            "clock_hz": 1.8e9,
+            "shared_memory_per_sm_bytes": 228 * 1024,
+            "l2_capacity_bytes": 50 * 1024 * 1024,
+            "l2_bandwidth_bytes_s": 1e15,
+            "vector_peak_flops": 1e13,
+        }
+    )
+    captured = {}
+
+    def selected_attention(**kwargs):
+        captured.update(kwargs)
+        return 0.001
+
+    monkeypatch.setattr(analytical, "msa_sparse_attention_latency_ms", selected_attention)
+    database.set_default_database_mode(common.DatabaseMode.ANALYTICAL)
+    try:
+        with pytest.warns(MsaAnalyticalApproximationWarning):
+            _ctx_msa().query(database, batch_size=1, s=13_108, prefix=117_964)
+    finally:
+        database.set_default_database_mode(common.DatabaseMode.SILICON)
+
+    assert captured["query_length"] == 13_108
+    assert captured["selected_pairs"] == 13_108 * 2_048
+    assert captured["selected_pairs"] < 13_108 * 13_108
+    assert captured["kv_heads"] == 1
+    assert captured["block_size"] == 128

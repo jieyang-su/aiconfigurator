@@ -26,6 +26,7 @@ def analytical_db():
 
 def test_config_validation_and_normalization():
     assert AnalyticalConfig().level == "standard"
+    assert AnalyticalConfig(communication_mode="analytical").communication_mode == "analytical"
     assert AnalyticalConfig().sparse_attention_head_quantum is None
     assert AnalyticalConfig(fp8_gemm_recipe="deepgemm_hopper").fp8_gemm_recipe == "deepgemm-hopper"
     assert AnalyticalConfig(sparse_attention_head_quantum=64).sparse_attention_executed_heads(16) == 64
@@ -204,6 +205,114 @@ def test_table_free_communication_and_dtype_scaling():
     )
     assert wideep.source == "empirical"
     assert float(wideep) > 0
+
+
+def test_calibrated_analytical_communication_path():
+    database = get_database_view(
+        "h100_sxm",
+        "sglang",
+        "estimate",
+        allow_missing_data=True,
+        database_mode="ANALYTICAL",
+        analytical_config={"communication_mode": "analytical"},
+    )
+    assert database is not None
+
+    queries = (
+        lambda mode=None: database.query_nccl(
+            common.CommQuantMode.half,
+            8,
+            "all_reduce",
+            1_000_000,
+            database_mode=mode,
+        ),
+        lambda mode=None: database.query_custom_allreduce(
+            common.CommQuantMode.half,
+            8,
+            1_000_000,
+            database_mode=mode,
+        ),
+        lambda mode=None: database.query_p2p(2_000_000, database_mode=mode),
+    )
+    for query in queries:
+        sol = query(common.DatabaseMode.SOL)
+        analytical = query()
+        assert analytical.source == "analytical"
+        assert float(analytical) == pytest.approx(0.007 + float(sol) / 0.75)
+
+    wideep_kwargs = dict(
+        node_num=1,
+        num_tokens=64,
+        num_experts=256,
+        topk=8,
+        hidden_size=7168,
+        sms=20,
+        dispatch_dtype=common.CommQuantMode.fp8,
+        combine_dtype=common.CommQuantMode.half,
+    )
+    wideep_sol = database.query_wideep_deepep_normal(
+        **wideep_kwargs,
+        database_mode=common.DatabaseMode.SOL,
+    )
+    wideep = database.query_wideep_deepep_normal(**wideep_kwargs)
+    assert wideep.source == "analytical"
+    assert float(wideep) == pytest.approx(0.007 + float(wideep_sol) / 0.75)
+
+    noop = database.query_nccl(common.CommQuantMode.half, 1, "all_reduce", 1_000_000)
+    assert noop.source == "analytical"
+    assert float(noop) == 0.0
+
+
+def test_trtllm_alltoall_uses_calibrated_analytical_communication():
+    database = get_database_view(
+        "b200_sxm",
+        "trtllm",
+        "1.3.0rc10",
+        allow_missing_data=True,
+        database_mode="ANALYTICAL",
+        analytical_config={"communication_mode": "analytical"},
+    )
+    assert database is not None
+    kwargs = dict(
+        op_name="alltoall_dispatch",
+        num_tokens=64,
+        hidden_size=7168,
+        topk=8,
+        num_experts=256,
+        moe_ep_size=8,
+        quant_mode=common.MoEQuantMode.nvfp4,
+        node_num=1,
+        moe_backend="CUTLASS",
+    )
+
+    sol = database.query_trtllm_alltoall(**kwargs, database_mode=common.DatabaseMode.SOL)
+    analytical = database.query_trtllm_alltoall(**kwargs)
+
+    assert analytical.source == "analytical"
+    assert float(analytical) == pytest.approx(0.007 + float(sol) / 0.75)
+
+
+def test_legacy_analytical_communication_formula_is_unchanged():
+    database = get_database_view(
+        "h100_sxm",
+        "sglang",
+        "estimate",
+        allow_missing_data=True,
+        database_mode="ANALYTICAL",
+        analytical_config={"communication_mode": "empirical"},
+    )
+    assert database is not None
+
+    sol = database.query_nccl(
+        common.CommQuantMode.half,
+        8,
+        "all_reduce",
+        1_000_000,
+        database_mode=common.DatabaseMode.SOL,
+    )
+    empirical = database.query_nccl(common.CommQuantMode.half, 8, "all_reduce", 1_000_000)
+    assert empirical.source == "empirical"
+    assert float(empirical) == pytest.approx(float(sol) / 0.8)
 
 
 def test_non_sglang_warns_but_remains_usable(caplog):

@@ -1198,6 +1198,18 @@ def test_database_mode_is_forwarded_to_view_loader(monkeypatch):
     assert calls[-1][1]["database_mode"] == "SILICON"
     assert calls[-1][1]["allow_missing_data"] is False
 
+    t3 = Task(
+        serving_mode="agg",
+        model_path="deepseek-ai/DeepSeek-V3",
+        system_name="h200_sxm",
+        backend_name="trtllm",
+        database_mode="ANALYTICAL",
+        analytical_communication_mode="analytical",
+    )
+    assert t3._load_database("h200_sxm", "trtllm", "1.3.0rc10") is database
+    assert calls[-1][1]["analytical_config"]["communication_mode"] == "analytical"
+    assert calls[-1][1]["allow_missing_data"] is True
+
 
 def test_no_orphan_fields():
     """Every tunable Task field must be consumed in task_v2/sweep -- guards against the

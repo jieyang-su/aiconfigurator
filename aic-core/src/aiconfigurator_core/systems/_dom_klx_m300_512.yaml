@@ -30,9 +30,11 @@ gpu:
 
 node:
   topology_scope: single_supernode
-  num_gpus_per_node: 256 # KLX-M300 supernode size
+  # Historical system ID retains the "512" suffix for compatibility, while
+  # the source-of-truth topology is the 256-GPU KLX-M300 supernode.
+  num_gpus_per_node: 256
   inter_node_bw: 0 # cross-supernode link not modeled
-  intra_node_bw: 400000000000 # 400GB/s per GPU within the supernode
+  intra_node_bw: 600000000000 # 600GB/s per GPU; updated 2026-08-17
   pcie_bw: 64000000000 # H200 proxy; KLX host link not provided
   p2p_latency: 0.00001 # provisional H200 proxy
 

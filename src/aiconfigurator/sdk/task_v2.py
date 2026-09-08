@@ -486,6 +486,8 @@ class Task:
     analytical_fp8_gemm_recipe: str = "sglang"
     analytical_attention_algorithm: str = "fa2"
     analytical_sparse_attention_head_quantum: int | None = None
+    # analytical = Hopper-calibrated startup + SOL/eta proxy; empirical and
+    # silicon preserve the existing formula and measured-table paths.
     analytical_communication_mode: str = "empirical"
     analytical_moe_dispatch_dtype: str = "half"
     analytical_moe_combine_dtype: str = "half"

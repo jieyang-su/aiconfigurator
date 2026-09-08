@@ -165,7 +165,7 @@ impl MoeTable {
     ) -> Result<f64, AicError> {
         let loaded = self.load()?;
         let grids = &loaded.default;
-        let quant_name = quant.name();
+        let mut quant_name = quant.name();
 
         let shape = MoeShapeKey {
             topk,
@@ -179,13 +179,30 @@ impl MoeTable {
             grids
                 .index
                 .resolve_uniform(quant_name, workload_distribution, &shape);
-        let by_tokens = by_tokens.ok_or_else(|| {
-            let key = MoeKey::from_shape(quant_name, dist, shape);
-            AicError::PerfDatabase(format!(
-                "MoE data missing for {key:?} at {}",
-                self.data_root.display()
-            ))
-        })?;
+
+        // Fallback: nvfp4 -> w4a16_mxfp4 if nvfp4 data is missing
+        let by_tokens = if by_tokens.is_none() && quant_name == "nvfp4" {
+            quant_name = "w4a16_mxfp4";
+            let (fallback_dist, fallback_tokens) =
+                grids
+                    .index
+                    .resolve_uniform(quant_name, workload_distribution, &shape);
+            fallback_tokens.ok_or_else(|| {
+                let key = MoeKey::from_shape(quant_name, fallback_dist, shape);
+                AicError::PerfDatabase(format!(
+                    "MoE data missing for nvfp4 and fallback {key:?} at {}",
+                    self.data_root.display()
+                ))
+            })?
+        } else {
+            by_tokens.ok_or_else(|| {
+                let key = MoeKey::from_shape(quant_name, dist, shape);
+                AicError::PerfDatabase(format!(
+                    "MoE data missing for {key:?} at {}",
+                    self.data_root.display()
+                ))
+            })?
+        };
         if by_tokens.is_empty() {
             let key = MoeKey::from_shape(quant_name, dist, shape);
             return Err(AicError::PerfDatabase(format!(
@@ -237,7 +254,7 @@ impl MoeTable {
         if grids.index.is_empty() {
             return Ok(None);
         }
-        let quant_name = quant.name();
+        let mut quant_name = quant.name();
         let shape = MoeShapeKey {
             topk,
             num_experts,
@@ -250,6 +267,19 @@ impl MoeTable {
             grids
                 .index
                 .resolve_uniform(quant_name, workload_distribution, &shape);
+
+        // Fallback: nvfp4 -> w4a16_mxfp4 if nvfp4 data is missing
+        let (dist, by_tokens) = if by_tokens.is_none() && quant_name == "nvfp4" {
+            quant_name = "w4a16_mxfp4";
+            let (fallback_dist, fallback_tokens) =
+                grids
+                    .index
+                    .resolve_uniform(quant_name, workload_distribution, &shape);
+            (fallback_dist, fallback_tokens)
+        } else {
+            (dist, by_tokens)
+        };
+
         let Some(by_tokens) = by_tokens else {
             return Ok(None);
         };

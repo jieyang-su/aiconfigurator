@@ -87,6 +87,13 @@ def _silicon_collective_topology_scale(
     return requested_ring_fraction / anchor_ring_fraction * anchor_bw / target_bw
 
 
+def _analytical_communication_result(sol_latency_ms: float) -> PerformanceResult:
+    """Apply the table-free calibrated communication proxy to an SOL result."""
+    from aiconfigurator_core.sdk.kernelsim.analytical import communication_latency_ms
+
+    return PerformanceResult(communication_latency_ms(sol_latency_ms), energy=0.0, source="analytical")
+
+
 class CustomAllReduce(Operation):
     """
     Custom AllReduce operation with power tracking.
@@ -219,16 +226,14 @@ class CustomAllReduce(Operation):
 
         if database_mode is None:
             database_mode = database._default_database_mode
-        analytical_formula = (
-            database_mode == common.DatabaseMode.ANALYTICAL
-            and database._analytical_config.communication_mode == "empirical"
-        )
         if database_mode == common.DatabaseMode.ANALYTICAL:
-            database_mode = (
-                common.DatabaseMode.EMPIRICAL
-                if database._analytical_config.communication_mode == "empirical"
-                else common.DatabaseMode.SILICON
-            )
+            communication_mode = database._analytical_config.communication_mode
+            if communication_mode == "analytical":
+                return _analytical_communication_result(get_sol(quant_mode, tp_size, size)[0])
+            analytical_formula = communication_mode == "empirical"
+            database_mode = common.DatabaseMode.EMPIRICAL if analytical_formula else common.DatabaseMode.SILICON
+        else:
+            analytical_formula = False
         if database_mode == common.DatabaseMode.SOL:
             sol_latency = get_sol(quant_mode, tp_size, size)[0]
             return PerformanceResult(sol_latency, energy=0.0, source="sol")
@@ -533,16 +538,14 @@ class NCCL(Operation):
 
         if database_mode is None:
             database_mode = database._default_database_mode
-        analytical_formula = (
-            database_mode == common.DatabaseMode.ANALYTICAL
-            and database._analytical_config.communication_mode == "empirical"
-        )
         if database_mode == common.DatabaseMode.ANALYTICAL:
-            database_mode = (
-                common.DatabaseMode.EMPIRICAL
-                if database._analytical_config.communication_mode == "empirical"
-                else common.DatabaseMode.SILICON
-            )
+            communication_mode = database._analytical_config.communication_mode
+            if communication_mode == "analytical":
+                return _analytical_communication_result(get_sol(dtype, num_gpus, operation, message_size)[0])
+            analytical_formula = communication_mode == "empirical"
+            database_mode = common.DatabaseMode.EMPIRICAL if analytical_formula else common.DatabaseMode.SILICON
+        else:
+            analytical_formula = False
         if database_mode == common.DatabaseMode.SOL:
             return PerformanceResult(get_sol(dtype, num_gpus, operation, message_size)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
@@ -706,16 +709,14 @@ class P2P(Operation):
 
         if database_mode is None:
             database_mode = database._default_database_mode
-        analytical_formula = (
-            database_mode == common.DatabaseMode.ANALYTICAL
-            and database._analytical_config.communication_mode == "empirical"
-        )
         if database_mode == common.DatabaseMode.ANALYTICAL:
-            database_mode = (
-                common.DatabaseMode.EMPIRICAL
-                if database._analytical_config.communication_mode == "empirical"
-                else common.DatabaseMode.SILICON
-            )
+            communication_mode = database._analytical_config.communication_mode
+            if communication_mode == "analytical":
+                return _analytical_communication_result(get_sol(message_bytes)[0])
+            analytical_formula = communication_mode == "empirical"
+            database_mode = common.DatabaseMode.EMPIRICAL if analytical_formula else common.DatabaseMode.SILICON
+        else:
+            analytical_formula = False
         if database_mode == common.DatabaseMode.SOL:
             return PerformanceResult(get_sol(message_bytes)[0], energy=0.0, source="sol")
         elif database_mode == common.DatabaseMode.SOL_FULL:
