@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+provenance: collected
+runtime:
+  framework: sglang
+  version: 0.5.18
+  image: 10.110.181.132:5000/lmsysorg/sglang:v0.5.18
+  image_digest: sha256:cb940197908678dacb041556b64798cc0493d547816a8e8a6731fa37dddfc4fb
+tables:
+  # GEMM is a model-independent common grid; one copy is retained because
+  # the Kimi and V4 collections have identical keys and no model column.
+  gemm_perf:
+    rows: 101010
+    status: complete

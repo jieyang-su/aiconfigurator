@@ -6,7 +6,7 @@
 # with this repository's H20 collector assumptions (96 GiB class memory and
 # ~4023 GB/s HBM bandwidth). Microarchitecture-only KernelSim fields are marked
 # as derived proxies and must not be interpreted as NVIDIA-published limits.
-data_dir: data/h20_sxm # Analytical-only initially; no packaged Silicon tables
+data_dir: data/h20_sxm # Includes packaged H20 SGLang 0.5.18 silicon tables for selected operators
 gpu:
   architecture_family: nvidia
   mem_bw: 4000000000000 # 4.0 TB/s HBM3; measured code paths use ~4023 GB/s
@@ -46,4 +46,4 @@ misc:
     4: 411041792
     8: 411041792
   other_mem: 3758096384
-  nccl_version: '2.27.3'
+  nccl_version: '2.28.9'

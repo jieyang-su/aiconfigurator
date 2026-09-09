@@ -1,0 +1,23 @@
+schema_version: 1
+provenance: migrated_recorded_dsv3
+runtime:
+  framework: sglang
+  version: 0.5.9-dsv3
+tables:
+  moe_perf:
+    status: complete
+    rows: 12930
+  moe_expert_compute_perf:
+    status: complete
+    rows: 423
+  moe_token_distribution_perf:
+    status: complete
+    rows: 528
+source_directory: legacy systems/data/<system>/sglang/0.5.9-dsv3
+source_files:
+- moe_perf.txt
+- wideep_context_moe_perf.txt
+- wideep_generation_moe_perf.txt
+- moe_token_distribution_perf.txt
+truth_used_as_input: false
+recorded_distribution_is_independent_sidecar: true
