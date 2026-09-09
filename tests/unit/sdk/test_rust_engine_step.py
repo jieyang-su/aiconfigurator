@@ -42,55 +42,10 @@ def test_engine_step_backend_defaults_to_rust(monkeypatch) -> None:
         rust_engine_step.should_use_rust_engine_step(RuntimeConfig(engine_step_backend="auto"), database)
 
 
-def _model_with_communication_placement(placement: str) -> SimpleNamespace:
-    return SimpleNamespace(config=ModelConfig(communication_placement=placement))
-
-
-def test_independent_placement_preserves_default_and_explicit_rust_routing(monkeypatch, tmp_path: Path) -> None:
+def test_python_backend_value_is_removed(monkeypatch) -> None:
+    """The retired Python performance executor is rejected explicitly."""
     monkeypatch.delenv("AICONFIGURATOR_ENGINE_STEP_BACKEND", raising=False)
-    monkeypatch.setattr(rust_engine_step, "_POWER_DATA_CACHE", {})
-    database = _power_probe_database(tmp_path, with_power=False)
-    model = _model_with_communication_placement("independent")
-
-    assert rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
-    assert rust_engine_step.should_use_rust_engine_step(
-        RuntimeConfig(engine_step_backend="rust"), database, model
-    )
-
-
-def test_tp_first_placement_delegates_default_and_explicit_rust_to_python(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("AICONFIGURATOR_ENGINE_STEP_BACKEND", raising=False)
-    monkeypatch.setattr(rust_engine_step, "_POWER_DATA_CACHE", {})
-    database = _power_probe_database(tmp_path, with_power=False)
-    model = _model_with_communication_placement("tp_first")
-
-    assert not rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
-    assert not rust_engine_step.should_use_rust_engine_step(
-        RuntimeConfig(engine_step_backend="rust"), database, model
-    )
-
-
-def test_tp_first_python_fallback_warning_is_emitted_once(monkeypatch, tmp_path: Path, caplog) -> None:
-    monkeypatch.delenv("AICONFIGURATOR_ENGINE_STEP_BACKEND", raising=False)
-    monkeypatch.setattr(rust_engine_step, "_POWER_DATA_CACHE", {})
-    rust_engine_step._warn_python_placement_fallback_once.cache_clear()
-    database = _power_probe_database(tmp_path, with_power=False)
-    model = _model_with_communication_placement("tp_first")
-
-    with caplog.at_level("WARNING", logger=rust_engine_step.__name__):
-        assert not rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
-        assert not rust_engine_step.should_use_rust_engine_step(RuntimeConfig(), database, model)
-
-    messages = [record.message for record in caplog.records if "communication placement tp_first" in record.message]
-    assert len(messages) == 1
-
-
-def _power_probe_database(tmp_path: Path, *, with_power: bool):
-    """A real ``PerfDatabase`` instance (loader bypassed) whose data tree the
-    power probe can scan. Default routing requires the real type: synthetic
-    database doubles delegate to the Python step."""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    database = _real_database()
 
     with pytest.raises(ValueError, match=r"unknown engine_step_backend 'python'"):
         rust_engine_step.should_use_rust_engine_step(RuntimeConfig(engine_step_backend="python"), database)
@@ -101,9 +56,7 @@ def _power_probe_database(tmp_path: Path, *, with_power: bool):
 
 
 def _real_database():
-    """A real ``PerfDatabase`` instance (loader bypassed): default routing
-    requires the real type — synthetic database doubles delegate to the
-    Python step."""
+    """A real ``PerfDatabase`` instance with a reloadable database identity."""
     from aiconfigurator_core.sdk.perf_database import PerfDatabase
 
     database = PerfDatabase.__new__(PerfDatabase)
@@ -1456,7 +1409,7 @@ def test_shipped_gb200_ep32_node8_reports_executed_fallback_to_api_and_cli(cli_p
                 "--backend",
                 "sglang",
                 "--backend-version",
-                "0.5.16",
+                "0.5.14",
                 "--estimate-mode",
                 "static",
                 "--database-mode",
@@ -1516,7 +1469,7 @@ def test_shipped_gb200_ep32_node8_reports_executed_fallback_to_api_and_cli(cli_p
             num_gpus_per_node=4,
         )
         model = get_model("deepseek-ai/DeepSeek-R1", config, "sglang")
-        database = get_database("gb200", "sglang", "0.5.16")
+        database = get_database("gb200", "sglang", "0.5.14")
         handle = rust_engine_step._cached_engine_handle(model, database)
 
         def _fallback_payloads(entries):
@@ -1603,9 +1556,9 @@ def test_every_selectable_database_mode_routes_to_rust():
     assert should_use_rust_engine_step(rc, _DB(_Mode.SILICON))
     assert should_use_rust_engine_step(rc, _DB(_Mode.HYBRID))
     assert should_use_rust_engine_step(rc, _DB(_Mode.EMPIRICAL))
-    assert not should_use_rust_engine_step(rc, _DB(_Mode.SOL))
-    assert not should_use_rust_engine_step(rc, _DB(_Mode.SOL_FULL))
-    assert not should_use_rust_engine_step(rc, _DB(_Mode.ANALYTICAL))
+    assert should_use_rust_engine_step(rc, _DB(_Mode.SOL))
+    assert should_use_rust_engine_step(rc, _DB(_Mode.SOL_FULL))
+    assert should_use_rust_engine_step(rc, _DB(_Mode.ANALYTICAL))
     assert should_use_rust_engine_step(rc)  # no database context -> unchanged
 
 

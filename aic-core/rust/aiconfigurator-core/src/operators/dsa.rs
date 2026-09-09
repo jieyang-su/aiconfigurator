@@ -174,6 +174,23 @@ impl DsaModuleOp {
         isl: u32,
         prefix: u32,
     ) -> Result<PerformanceResult, AicError> {
+        if db.database_mode == DatabaseMode::Analytical {
+            // CP-specific sparse helper tables are measured data. Analytical
+            // mode keeps the same DSA shape model but deliberately omits that
+            // table-backed CP delta instead of loading it as a side effect.
+            let w = self.full_frac;
+            let full = query_context_table(db, self, batch_size, isl, prefix, "trtllm", false)?;
+            if w >= 1.0 {
+                return Ok(full.clamp_non_negative().scaled(self.scale_factor));
+            }
+            let skip = query_context_table(db, self, batch_size, isl, prefix, "trtllm", true)?;
+            return Ok(PerformanceResult::new(
+                w * full.latency_ms + (1.0 - w) * skip.latency_ms,
+                Source::Analytical,
+            )
+            .clamp_non_negative()
+            .scaled(self.scale_factor));
+        }
         // CP composes latency-only sparse MQA/top-k deltas with the base DSA
         // and all-gather results. Those collected deltas do not provide a
         // defensible math-vs-memory split, so reject decomposition requests
@@ -499,6 +516,29 @@ fn query_context_table(
             .map(|v| PerformanceResult::with_energy(v.latency, v.energy, Source::Silicon))
     };
     match db.database_mode {
+        DatabaseMode::Analytical => {
+            let spec = &db.system_spec;
+            let dims = dsa_dims(&op.architecture);
+            let flops = dsa_context_sol_flops(spec, op.gemm_quant_mode, op.fmha_quant_mode)?;
+            Ok(PerformanceResult::new(
+                dsa_context_sol(
+                    spec,
+                    dims,
+                    op.index_topk as i64,
+                    op.kv_cache_dtype,
+                    op.fmha_quant_mode,
+                    op.gemm_quant_mode,
+                    i64::from(b),
+                    i64::from(isl),
+                    i64::from(prefix),
+                    i64::from(op.num_heads),
+                    skip_indexer,
+                    flops,
+                )
+                .time_ms(),
+                Source::Analytical,
+            ))
+        }
         // Python `_query_context_dsa_module_table`: `get_sol(b, s, prefix,
         // num_heads, kvcache_quant_mode, fmha_quant_mode)[0]`, closing over
         // skip_indexer / gemm quant / the op's index_topk.
@@ -563,6 +603,25 @@ fn query_generation_table(
             .map(|v| PerformanceResult::with_energy(v.latency, v.energy, Source::Silicon))
     };
     match db.database_mode {
+        DatabaseMode::Analytical => {
+            let spec = &db.system_spec;
+            let dims = dsa_dims(&op.architecture);
+            let flops = dsa_generation_sol_flops(spec, op.gemm_quant_mode)?;
+            Ok(PerformanceResult::new(
+                dsa_generation_sol(
+                    spec,
+                    dims,
+                    op.kv_cache_dtype,
+                    op.gemm_quant_mode,
+                    i64::from(b),
+                    i64::from(s),
+                    i64::from(op.num_heads),
+                    flops,
+                )
+                .time_ms(),
+                Source::Analytical,
+            ))
+        }
         // Python `_query_generation_dsa_module_table`: `get_sol(b, s,
         // num_heads, kv_cache_dtype)[0]` — the attention group is hardcoded
         // bfloat16 inside; skip_indexer never enters the decode SOL.

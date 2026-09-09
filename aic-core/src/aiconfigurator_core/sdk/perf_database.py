@@ -17,11 +17,10 @@ from typing import ClassVar, Optional
 
 import yaml
 
-from aiconfigurator_core.sdk import common, perf_interp
-from aiconfigurator_core.sdk.common import PerfDataFilename, parse_support_matrix_version
-from aiconfigurator_core.sdk.errors import InterpolationDataNotAvailableError, PerfDataNotAvailableError
-from aiconfigurator_core.sdk.performance_result import PerformanceResult
-from aiconfigurator_core.sdk.system_spec import SystemSpec, is_blackwell_spec, is_hopper_spec
+from aiconfigurator_core.sdk import common
+from aiconfigurator_core.sdk.common import PerfDataFilename
+from aiconfigurator_core.sdk.errors import PerfDataNotAvailableError
+from aiconfigurator_core.sdk.system_spec import SystemSpec
 
 databases_cache = defaultdict(lambda: defaultdict(lambda: defaultdict()))
 logger = logging.getLogger(__name__)
@@ -337,34 +336,25 @@ def load_system_spec(
     return _load_system_spec_from_paths(tuple(resolved_paths), system_name)
 
 
-def is_blackwell_system(system_name: str | dict | None) -> bool:
+def is_blackwell_system(system_name: str | None) -> bool:
     """True for Blackwell-class systems (SM >= 100, e.g. b200_sxm / gb200 / b300 / gb300)."""
     if not system_name:
         return False
-    spec = system_name if isinstance(system_name, dict) else load_system_spec(system_name)
-    return is_blackwell_spec(spec)
+    spec = load_system_spec(system_name)
+    return int(spec.get("gpu", {}).get("sm_version", -1)) >= 100
 
 
-def is_hopper_system(system_name: str | dict | None) -> bool:
+def is_hopper_system(system_name: str | None) -> bool:
     """True for Hopper-class systems (SM 90, e.g. h100 / h200 / gh200)."""
     if not system_name:
         return False
-    spec = system_name if isinstance(system_name, dict) else load_system_spec(system_name)
-    return is_hopper_spec(spec)
-
-
-def is_sm100_system(system_name: str | dict | None) -> bool:
-    """True only for real NVIDIA SM100 systems, never for a proxy SM value."""
-    if not system_name:
-        return False
-    from aiconfigurator_core.sdk.system_spec import is_sm100_spec
-
-    spec = system_name if isinstance(system_name, dict) else load_system_spec(system_name)
-    return is_sm100_spec(spec)
+    spec = load_system_spec(system_name)
+    return int(spec.get("gpu", {}).get("sm_version", -1)) == 90
 
 
 @functools.cache
 def _warn_domestic_analytical_once(system: str) -> None:
+    """Warn that domestic analytical results use proxy hardware parameters."""
     logger.warning(
         "ANALYTICAL evaluation for domestic system %s uses proxy NVIDIA microarchitecture "
         "parameters only for KernelSim scheduling. Results are estimate-only, communication "
@@ -1554,6 +1544,7 @@ def get_database_view(
     transfer_policy=None,
     shared_layer: bool | None = None,
     strict_provenance: bool | None = None,
+    allow_unlisted_version: bool = False,
     analytical_config=None,
 ) -> PerfDatabase | None:
     """Return an isolated, lightweight query view over a cached database.
@@ -1571,24 +1562,13 @@ def get_database_view(
     its docstring); ``None`` resolves from the ``AIC_STRICT_PROVENANCE`` env var.
     """
     mode = _normalize_database_mode(database_mode)
-    resolved_shared_layer = shared_layer
-    if mode == common.DatabaseMode.ANALYTICAL and shared_layer is None:
-        communication_mode = (
-            analytical_config.get("communication_mode")
-            if isinstance(analytical_config, dict)
-            else getattr(analytical_config, "communication_mode", None)
-        )
-        if str(communication_mode or "").lower() == "silicon":
-            # Analytical compute remains formula-based, but communication=silicon
-            # must inherit the measured collective tables from older versions.
-            resolved_shared_layer = True
     database_kwargs = {
         "system": system,
         "backend": backend,
         "version": version,
         "allow_missing_data": allow_missing_data,
         "database_mode": mode.name,
-        "shared_layer": resolved_shared_layer,
+        "shared_layer": shared_layer,
         "strict_provenance": strict_provenance,
         "allow_unlisted_version": allow_unlisted_version,
     }
@@ -1601,7 +1581,7 @@ def get_database_view(
         database,
         mode,
         transfer_policy,
-        shared_layer=resolved_shared_layer,
+        shared_layer=shared_layer,
         analytical_config=analytical_config,
     )
 
@@ -2866,256 +2846,6 @@ class PerfDatabase:
 
     def moe_expert_compute_coverage(
         self,
-        b: int,
-        s: int,
-        n: int,
-        head_size: int,
-        fmha_quant_mode: common.FMHAQuantMode,
-        database_mode: Optional[common.DatabaseMode] = None,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query non-causal encoder attention latency. Delegates to
-        ``EncoderAttention._query_encoder_attention_table``."""
-        from aiconfigurator_core.sdk.operations.attention import EncoderAttention
-
-        return EncoderAttention._query_encoder_attention_table(
-            self,
-            b,
-            s,
-            n,
-            head_size,
-            fmha_quant_mode,
-            database_mode,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_generation_attention(
-        self,
-        b: int,
-        s: int,
-        n: int,
-        n_kv: int,
-        kvcache_quant_mode: common.KVCacheQuantMode,
-        database_mode: Optional[common.DatabaseMode] = None,
-        window_size: int = 0,
-        head_size: int = 128,
-        fmha_quant_mode: common.FMHAQuantMode | None = None,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query generation attention latency. Delegates to
-        ``GenerationAttention._query_generation_attention_table``."""
-        from aiconfigurator_core.sdk.operations.attention import GenerationAttention
-
-        return GenerationAttention._query_generation_attention_table(
-            self,
-            b,
-            s,
-            n,
-            n_kv,
-            kvcache_quant_mode,
-            database_mode,
-            window_size,
-            head_size,
-            fmha_quant_mode,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_context_mla(
-        self,
-        b: int,
-        s: int,
-        prefix: int,
-        num_heads: int,
-        kvcache_quant_mode: common.KVCacheQuantMode,
-        fmha_quant_mode: common.FMHAQuantMode,
-        database_mode: common.DatabaseMode | None = None,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query context MLA latency. Delegates to ``ContextMLA._query_context_mla_table``."""
-        from aiconfigurator_core.sdk.operations.mla import ContextMLA
-
-        return ContextMLA._query_context_mla_table(
-            self,
-            b,
-            s,
-            prefix,
-            num_heads,
-            kvcache_quant_mode,
-            fmha_quant_mode,
-            database_mode,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_generation_mla(
-        self,
-        b: int,
-        s: int,
-        num_heads: int,
-        kvcache_quant_mode: common.KVCacheQuantMode,
-        database_mode: common.DatabaseMode | None = None,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query generation MLA latency. Delegates to ``GenerationMLA._query_generation_mla_table``."""
-        from aiconfigurator_core.sdk.operations.mla import GenerationMLA
-
-        return GenerationMLA._query_generation_mla_table(
-            self,
-            b,
-            s,
-            num_heads,
-            kvcache_quant_mode,
-            database_mode,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_context_mla_module(
-        self,
-        b: int,
-        s: int,
-        prefix: int,
-        num_heads: int,
-        kvcache_quant_mode: common.KVCacheQuantMode,
-        fmha_quant_mode: common.FMHAQuantMode,
-        gemm_quant_mode: common.GEMMQuantMode = common.GEMMQuantMode.bfloat16,
-        *,
-        native_num_heads: int | None = None,
-        database_mode: common.DatabaseMode | None = None,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query context MLA module latency. Delegates to ``MLAModule._query_context_mla_module_table``."""
-        from aiconfigurator_core.sdk.operations.mla import MLAModule
-
-        return MLAModule._query_context_mla_module_table(
-            self,
-            b,
-            s,
-            prefix,
-            num_heads,
-            kvcache_quant_mode,
-            fmha_quant_mode,
-            gemm_quant_mode,
-            native_num_heads=native_num_heads,
-            database_mode=database_mode,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_generation_mla_module(
-        self,
-        b: int,
-        s: int,
-        num_heads: int,
-        kv_cache_dtype: common.KVCacheQuantMode,
-        gemm_quant_mode: common.GEMMQuantMode = common.GEMMQuantMode.bfloat16,
-        *,
-        native_num_heads: int | None = None,
-        database_mode: common.DatabaseMode | None = None,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query generation MLA module latency. Delegates to ``MLAModule._query_generation_mla_module_table``."""
-        from aiconfigurator_core.sdk.operations.mla import MLAModule
-
-        return MLAModule._query_generation_mla_module_table(
-            self,
-            b,
-            s,
-            num_heads,
-            kv_cache_dtype,
-            gemm_quant_mode,
-            native_num_heads=native_num_heads,
-            database_mode=database_mode,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_wideep_generation_mla(
-        self,
-        b: int,
-        s: int,
-        tp_size: int,
-        kvcache_quant_mode: common.KVCacheQuantMode,
-        fmha_quant_mode: common.FMHAQuantMode,
-        attention_backend: str | None = None,
-        database_mode: common.DatabaseMode | None = None,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query WideEP generation MLA latency.
-
-        Delegates to ``WideEPGenerationMLA._query_wideep_generation_mla_table``.
-        """
-        from aiconfigurator_core.sdk.operations.mla import WideEPGenerationMLA
-
-        return WideEPGenerationMLA._query_wideep_generation_mla_table(
-            self,
-            b,
-            s,
-            tp_size,
-            kvcache_quant_mode,
-            fmha_quant_mode,
-            attention_backend,
-            database_mode,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_wideep_context_mla(
-        self,
-        b: int,
-        s: int,
-        prefix: int,
-        tp_size: int,
-        kvcache_quant_mode: common.KVCacheQuantMode,
-        fmha_quant_mode: common.FMHAQuantMode,
-        attention_backend: str | None = None,
-        database_mode: common.DatabaseMode | None = None,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query WideEP context MLA latency. Delegates to ``WideEPContextMLA._query_wideep_context_mla_table``."""
-        from aiconfigurator_core.sdk.operations.mla import WideEPContextMLA
-
-        return WideEPContextMLA._query_wideep_context_mla_table(
-            self,
-            b,
-            s,
-            prefix,
-            tp_size,
-            kvcache_quant_mode,
-            fmha_quant_mode,
-            attention_backend,
-            database_mode,
-        )
-
-    # to simplify, we no longer support allreduce_strategy
-    @functools.lru_cache(maxsize=32768)
-    def query_custom_allreduce(
-        self,
-        quant_mode: common.CommQuantMode,
-        tp_size: int,
-        size: int,
-        database_mode: common.DatabaseMode | None = None,
-        parallel_layout=None,
-        communication_group: str | None = None,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query custom AllReduce latency. Delegates to
-        ``CustomAllReduce._query_custom_allreduce_table``."""
-        from aiconfigurator_core.sdk.operations.communication import CustomAllReduce
-
-        return CustomAllReduce._query_custom_allreduce_table(
-            self, quant_mode, tp_size, size, database_mode, parallel_layout, communication_group
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_nccl(
-        self,
-        dtype: common.CommQuantMode,
-        num_gpus: int,
-        operation: str,
-        message_size: int,  # element number
-        database_mode: common.DatabaseMode | None = None,
-        parallel_layout=None,
-        communication_group: str | None = None,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query NCCL collective communication latency. Delegates to
-        ``NCCL._query_nccl_table``."""
-        from aiconfigurator_core.sdk.operations.communication import NCCL
-
-        return NCCL._query_nccl_table(
-            self, dtype, num_gpus, operation, message_size, database_mode, parallel_layout, communication_group
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_moe(
-        self,
-        num_tokens: int,
         hidden_size: int,
         inter_size: int,
         topk: int,
@@ -3172,274 +2902,12 @@ class PerfDatabase:
         if not table:
             return set()
 
-    @functools.lru_cache(maxsize=32768)
-    def query_mla_bmm(
-        self,
-        num_tokens: int,
-        num_heads: int,
-        quant_mode: common.GEMMQuantMode,
-        if_pre: bool = True,
-        database_mode: common.DatabaseMode | None = None,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query MLA BMM latency. Delegates to ``MLABmm._query_mla_bmm_table``."""
-        from aiconfigurator_core.sdk.operations.mla import MLABmm
-
-        return MLABmm._query_mla_bmm_table(
-            self,
-            num_tokens,
-            num_heads,
-            quant_mode,
-            if_pre,
-            database_mode,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_mem_op(
-        self, mem_bytes: int, database_mode: common.DatabaseMode | None = None
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query memory-operation latency analytically (no CSV data).
-
-        Returns:
-            PerformanceResult acting as float (latency in ms); energy via ``.energy``.
-            For SOL_FULL, returns a ``(sol_time, 0, sol_time)`` tuple.
-        """
-        gpu_spec = self.system_spec["gpu"]
-
-        def get_sol() -> tuple[float, float, float]:
-            sol_time = mem_bytes / gpu_spec["mem_bw"] * 1000
-            return sol_time, 0, sol_time
-
-        def get_empirical() -> float:
-            return (
-                mem_bytes / (gpu_spec["mem_bw"] * gpu_spec["mem_bw_empirical_scaling_factor"])
-                + gpu_spec["mem_empirical_constant_latency"]
-            ) * 1000
-
-        if database_mode is None:
-            database_mode = self._default_database_mode
-        if database_mode == common.DatabaseMode.SOL:
-            return PerformanceResult(get_sol()[0], energy=0.0, source="sol")
-        if database_mode == common.DatabaseMode.SOL_FULL:
-            return get_sol()
-        # EMPIRICAL / SILICON / HYBRID share the same empirical formula. There is
-        # no silicon table for raw memory ops, so always tag as ``empirical``.
-        return PerformanceResult(get_empirical(), energy=0.0, source="empirical")
-
-    def query_mamba2(
-        self,
-        phase: str,
-        kernel_source: str,
-        batch_size: int,
-        seq_len: int | None,
-        d_model: int,
-        d_state: int,
-        d_conv: int,
-        nheads: int,
-        head_dim: int,
-        n_groups: int,
-        chunk_size: int,
-    ) -> PerformanceResult:
-        """Query Mamba2 kernel latency. Delegates to ``Mamba2Kernel._query_mamba2_table``."""
-        from aiconfigurator_core.sdk.operations.mamba import Mamba2Kernel
-
-        return Mamba2Kernel._query_mamba2_table(
-            self,
-            phase,
-            kernel_source,
-            batch_size,
-            seq_len,
-            d_model,
-            d_state,
-            d_conv,
-            nheads,
-            head_dim,
-            n_groups,
-            chunk_size,
-        )
-
-    def query_gdn(
-        self,
-        phase: str,
-        kernel_source: str,
-        batch_size: int,
-        seq_len: int | None,
-        d_model: int,
-        num_k_heads: int,
-        head_k_dim: int,
-        num_v_heads: int,
-        head_v_dim: int,
-        d_conv: int,
-    ) -> PerformanceResult:
-        """Query GDN kernel latency. Delegates to ``GDNKernel._query_gdn_table``."""
-        from aiconfigurator_core.sdk.operations.mamba import GDNKernel
-
-        return GDNKernel._query_gdn_table(
-            self,
-            phase,
-            kernel_source,
-            batch_size,
-            seq_len,
-            d_model,
-            num_k_heads,
-            head_k_dim,
-            num_v_heads,
-            head_v_dim,
-            d_conv,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_p2p(
-        self,
-        message_bytes: int,
-        database_mode: common.DatabaseMode | None = None,
-        parallel_layout=None,
-        communication_group: str | None = "pp",
-        group_size: int = 2,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Query P2P latency. Delegates to ``P2P._query_p2p_table``."""
-        from aiconfigurator_core.sdk.operations.communication import P2P
-
-        return P2P._query_p2p_table(
-            self, message_bytes, database_mode, parallel_layout, communication_group, group_size
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_wideep_deepep_ll(
-        self,
-        node_num: int,
-        num_tokens: int,
-        num_experts: int,
-        topk: int,
-        hidden_size: int,
-        dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
-        combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
-        database_mode: common.DatabaseMode | None = None,
-        parallel_layout=None,
-        communication_group: str | None = "moe_tp_ep",
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Delegates to ``MoEDispatch``; see
-        ``operations.moe.MoEDispatch._query_wideep_deepep_ll_table``."""
-        from aiconfigurator_core.sdk.operations.moe import MoEDispatch
-
-        return MoEDispatch._query_wideep_deepep_ll_table(
-            self,
-            node_num=node_num,
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            topk=topk,
-            hidden_size=hidden_size,
-            dispatch_dtype=dispatch_dtype,
-            combine_dtype=combine_dtype,
-            database_mode=database_mode,
-            parallel_layout=parallel_layout,
-            communication_group=communication_group,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_wideep_deepep_normal(
-        self,
-        node_num: int,
-        num_tokens: int,
-        num_experts: int,
-        topk: int,
-        hidden_size: int,
-        sms: int,
-        dispatch_dtype: common.CommQuantMode = common.CommQuantMode.half,
-        combine_dtype: common.CommQuantMode = common.CommQuantMode.half,
-        database_mode: common.DatabaseMode | None = None,
-        parallel_layout=None,
-        communication_group: str | None = "moe_tp_ep",
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Delegates to ``MoEDispatch``; see
-        ``operations.moe.MoEDispatch._query_wideep_deepep_normal_table``."""
-        from aiconfigurator_core.sdk.operations.moe import MoEDispatch
-
-        return MoEDispatch._query_wideep_deepep_normal_table(
-            self,
-            node_num=node_num,
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            topk=topk,
-            hidden_size=hidden_size,
-            sms=sms,
-            dispatch_dtype=dispatch_dtype,
-            combine_dtype=combine_dtype,
-            database_mode=database_mode,
-            parallel_layout=parallel_layout,
-            communication_group=communication_group,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_wideep_moe_compute(
-        self,
-        num_tokens: int,
-        hidden_size: int,
-        inter_size: int,
-        topk: int,
-        num_experts: int,
-        num_slots: int,
-        moe_tp_size: int,
-        moe_ep_size: int,
-        quant_mode: common.MoEQuantMode,
-        workload_distribution: str,
-        database_mode: common.DatabaseMode | None = None,
-        is_gated: bool = True,
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Delegates to ``TrtLLMWideEPMoE``; see
-        ``operations.moe.TrtLLMWideEPMoE._query_compute_table``."""
-        from aiconfigurator_core.sdk.operations.moe import TrtLLMWideEPMoE
-
-        return TrtLLMWideEPMoE._query_compute_table(
-            self,
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            inter_size=inter_size,
-            topk=topk,
-            num_experts=num_experts,
-            num_slots=num_slots,
-            moe_tp_size=moe_tp_size,
-            moe_ep_size=moe_ep_size,
-            quant_mode=quant_mode,
-            workload_distribution=workload_distribution,
-            database_mode=database_mode,
-            is_gated=is_gated,
-        )
-
-    @functools.lru_cache(maxsize=32768)
-    def query_trtllm_alltoall(
-        self,
-        op_name: str,
-        num_tokens: int,
-        hidden_size: int,
-        topk: int,
-        num_experts: int,
-        moe_ep_size: int,
-        quant_mode: common.MoEQuantMode,
-        node_num: int | None = None,
-        database_mode: common.DatabaseMode | None = None,
-        moe_backend: str | None = None,
-        parallel_layout=None,
-        communication_group: str | None = "moe_tp_ep",
-    ) -> PerformanceResult | tuple[float, float, float]:
-        """Delegates to ``TrtLLMWideEPMoEDispatch``; see
-        ``operations.moe.TrtLLMWideEPMoEDispatch._query_alltoall_table``."""
-        from aiconfigurator_core.sdk.operations.moe import TrtLLMWideEPMoEDispatch
-
-        return TrtLLMWideEPMoEDispatch._query_alltoall_table(
-            self,
-            op_name=op_name,
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            topk=topk,
-            num_experts=num_experts,
-            moe_ep_size=moe_ep_size,
-            quant_mode=quant_mode,
-            node_num=node_num,
-            database_mode=database_mode,
-            moe_backend=moe_backend,
-            parallel_layout=parallel_layout,
-            communication_group=communication_group,
-        )
+        covered: set[int] = set()
+        for by_topk in (table.get(quant_mode) or {}).values():  # ANY distribution
+            by_hidden = ((by_topk.get(topk) or {}).get(num_experts) or {}).get(hidden_size) or {}
+            by_ep = (by_hidden.get(inter_size) or {}).get(1) or {}  # moe_tp == 1
+            covered.update(ep_size for ep_size, tokens in by_ep.items() if tokens)
+        return covered
 
     # ═══════════════════════════════════════════════════════════════════
     # DSA (DeepSeek Sparse Attention) Queries

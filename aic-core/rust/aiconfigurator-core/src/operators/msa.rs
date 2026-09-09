@@ -22,6 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::analytical;
 use crate::common::enums::{
     DatabaseMode, FmhaQuantMode, GemmQuantMode, KvCacheQuantMode, TransferKind,
 };
@@ -76,8 +77,16 @@ impl MsaModuleOp {
         s: u32,
         prefix: u32,
     ) -> Result<PerformanceResult, AicError> {
+        if db.database_mode == DatabaseMode::Analytical {
+            return Ok(PerformanceResult::new(
+                self.analytical_ms(db, batch_size, s, prefix, true)?,
+                Source::Analytical,
+            )
+            .scaled(self.scale_factor));
+        }
         let sol = self.sol_ms(db, batch_size, s, prefix, true)?;
         match db.database_mode {
+            DatabaseMode::Analytical => unreachable!("analytical MSA returned before mode dispatch"),
             DatabaseMode::Sol | DatabaseMode::SolFull => {
                 Ok(PerformanceResult::new(sol * self.scale_factor, Source::Sol))
             }
@@ -148,8 +157,16 @@ impl MsaModuleOp {
         batch_size: u32,
         s: u32,
     ) -> Result<PerformanceResult, AicError> {
+        if db.database_mode == DatabaseMode::Analytical {
+            return Ok(PerformanceResult::new(
+                self.analytical_ms(db, batch_size, s, 0, false)?,
+                Source::Analytical,
+            )
+            .scaled(self.scale_factor));
+        }
         let sol = self.sol_ms(db, batch_size, s, 0, false)?;
         match db.database_mode {
+            DatabaseMode::Analytical => unreachable!("analytical MSA returned before mode dispatch"),
             DatabaseMode::Sol | DatabaseMode::SolFull => {
                 Ok(PerformanceResult::new(sol * self.scale_factor, Source::Sol))
             }
@@ -169,6 +186,106 @@ impl MsaModuleOp {
                 Err(err) => Err(err),
             },
         }
+    }
+
+    /// Table-free MSA recipe matching Python `_BaseMSAModule._analytical`.
+    /// The fused Q/K/V/index projection is one GEMM, followed by selected-token
+    /// GQA attention, the output projection, and (only after the top-k boundary)
+    /// the block index and elementwise selection kernels.
+    fn analytical_ms(
+        &self,
+        db: &PerfDatabase,
+        batch_size: u32,
+        s: u32,
+        prefix: u32,
+        is_context: bool,
+    ) -> Result<f64, AicError> {
+        let gpu = &db.system_spec.gpu;
+        let config = &db.analytical_config;
+        let tokens = if is_context {
+            batch_size.saturating_mul(s)
+        } else {
+            batch_size
+        };
+        let full_context = if is_context {
+            prefix.saturating_add(s)
+        } else {
+            s
+        };
+        let query_length = if is_context { s } else { 1 };
+        let fused_n = self
+            .num_heads
+            .saturating_mul(self.head_dim)
+            .saturating_add(2 * self.num_kv_heads.saturating_mul(self.head_dim))
+            .saturating_add(self.index_n_heads.saturating_mul(self.index_head_dim))
+            .saturating_add(self.index_head_dim);
+        let mut latency = analytical::gemm_latency_ms(
+            &db.system_spec,
+            config,
+            self.gemm_quant_mode.mapping(),
+            tokens,
+            fused_n,
+            self.hidden_size,
+        )?;
+
+        let selected_tokens = full_context.min(self.index_topk);
+        let dtype = match self.fmha_quant_mode {
+            FmhaQuantMode::Fp8 | FmhaQuantMode::Fp8Block => "fp8",
+            _ => "bf16",
+        };
+        latency += analytical::attention_model_latency_ms(
+            &db.system_spec,
+            config,
+            batch_size,
+            query_length,
+            query_length.max(selected_tokens),
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.v_head_dim,
+            self.head_dim,
+            dtype,
+            false,
+            None,
+            false,
+        )?;
+        latency += analytical::gemm_latency_ms(
+            &db.system_spec,
+            config,
+            self.gemm_quant_mode.mapping(),
+            tokens,
+            self.hidden_size,
+            self.num_heads.saturating_mul(self.v_head_dim),
+        )?;
+
+        if full_context > self.index_topk {
+            let sm_count = gpu
+                .analytical
+                .sm_count
+                .ok_or_else(|| AicError::MissingSystemFlops("MSA analytical mode requires gpu.sm_count".into()))?;
+            latency += analytical::msa_index_latency_ms(
+                if is_context { "prefill" } else { "decode" },
+                batch_size,
+                query_length,
+                full_context,
+                self.index_n_heads,
+                self.index_head_dim,
+                sm_count,
+                gpu.mem_bw,
+                &config.level,
+            )?;
+            let rows = batch_size
+                .saturating_mul(self.index_n_heads)
+                .saturating_mul(if is_context { query_length.div_ceil(128) } else { 1 });
+            latency += msa_topk_elementwise_latency_ms(
+                gpu.mem_bw,
+                rows,
+                full_context.div_ceil(self.block_size),
+                self.index_topk.div_ceil(self.block_size),
+                &config.level,
+            )?;
+        }
+        Ok(latency)
     }
 
     /// The legacy cross-op fallback for decode, gated by XOP.
@@ -400,6 +517,36 @@ impl MsaModuleOp {
             index_topk as u32,
         )
     }
+}
+
+fn msa_topk_elementwise_latency_ms(
+    mem_bw: f64,
+    rows: u32,
+    candidate_blocks: u32,
+    topk_blocks: u32,
+    level: &str,
+) -> Result<f64, AicError> {
+    if rows == 0 || candidate_blocks == 0 || topk_blocks == 0 {
+        return Err(AicError::InvalidEngineConfig(
+            "MSA TopK shape values must be positive".into(),
+        ));
+    }
+    let bytes = f64::from(rows)
+        * (f64::from(candidate_blocks) * 4.0
+            + f64::from(candidate_blocks.min(topk_blocks)) * 4.0);
+    let scale = match level {
+        "low" => 0.85,
+        "high" => 1.25,
+        _ => 1.0,
+    };
+    let bandwidth = if mem_bw.is_finite() && mem_bw > 0.0 {
+        mem_bw
+    } else {
+        return Err(AicError::InvalidEngineConfig(
+            "analytical hardware field mem_bw must be positive".into(),
+        ));
+    };
+    Ok((1.5e-6 + bytes / bandwidth / 0.35) * scale * 1000.0)
 }
 
 /// Pre-resolved TC-FLOPS for the three MSA op groups (GEMM projections /

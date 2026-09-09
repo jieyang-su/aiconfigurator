@@ -60,6 +60,28 @@ pub struct GpuSpec {
     /// CUDA SM architecture version (e.g. 100 for Blackwell SM_100).
     #[serde(default)]
     pub sm_version: Option<u32>,
+    /// Fine-grained hardware fields used by the Analytical KernelSim models.
+    /// They are flattened because the YAML schema stores these fields beside
+    /// the coarse GPU properties. Keeping them in a nested Rust type avoids
+    /// spreading optional analytical fields through every GPU consumer.
+    #[serde(flatten)]
+    pub analytical: AnalyticalGpuSpec,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AnalyticalGpuSpec {
+    #[serde(default)]
+    pub sm_count: Option<u32>,
+    #[serde(default)]
+    pub clock_hz: Option<f64>,
+    #[serde(default)]
+    pub shared_memory_per_sm_bytes: Option<u64>,
+    #[serde(default)]
+    pub l2_capacity_bytes: Option<u64>,
+    #[serde(default)]
+    pub l2_bandwidth_bytes_s: Option<f64>,
+    #[serde(default)]
+    pub vector_peak_flops: Option<f64>,
 }
 
 /// Strict tensor-core FLOPS resolver. Mirrors Python
@@ -120,6 +142,9 @@ pub struct NodeSpec {
 /// Miscellaneous, mostly empirical, configuration.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct MiscSpec {
+    /// Equivalent vector cost used by the analytical attention model.
+    #[serde(default = "default_exp_flop_equivalent")]
+    pub exp_flop_equivalent: f64,
     /// NCCL memory overhead by per-rank count.
     #[serde(default)]
     pub nccl_mem: BTreeMap<u32, u64>,
@@ -139,6 +164,10 @@ pub struct MiscSpec {
     /// Python `sdk/operations/communication.py:301-303`.
     #[serde(default)]
     pub oneccl_version: Option<String>,
+}
+
+fn default_exp_flop_equivalent() -> f64 {
+    35.0
 }
 
 fn default_mem_bw_scaling() -> f64 {
@@ -231,6 +260,7 @@ mod tests {
                 fp4_tc_flops: None,
                 power: None,
                 sm_version: None,
+                analytical: AnalyticalGpuSpec::default(),
             },
             node: NodeSpec {
                 num_gpus_per_node: 8,
@@ -269,6 +299,7 @@ mod tests {
                 fp4_tc_flops: None,
                 power: None,
                 sm_version: None,
+                analytical: AnalyticalGpuSpec::default(),
             },
             node: NodeSpec {
                 num_gpus_per_node: 8,

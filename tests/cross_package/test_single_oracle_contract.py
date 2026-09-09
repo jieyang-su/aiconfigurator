@@ -172,6 +172,9 @@ OPERATIONS_DEF_INVENTORY = {
             "_normalize_projection_quant_modes",
         }
     ),
+    # Granular DSA names are Rust-backed constructor shells.  They intentionally
+    # define no Python functions, so their per-op values remain in Rust.
+    "dsa_granular.py": frozenset(),
     "dsv4.py": frozenset(
         {
             "ContextDeepSeekV4AttentionModule._cache_key",

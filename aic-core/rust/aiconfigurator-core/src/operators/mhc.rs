@@ -149,6 +149,10 @@ impl MhcModuleOp {
                 .map(|v| PerformanceResult::with_energy(v.latency, v.energy, Source::Silicon))
         };
         let result = match db.database_mode {
+            DatabaseMode::Analytical => PerformanceResult::new(
+                self.sol_ms(db, &self.op, i64::from(num_tokens), tc_flops),
+                Source::Analytical,
+            ),
             // Python `_query_mhc_table`: `get_sol()[0]` at the pre-bound
             // `(nt=num_tokens, op_name=self.op)` — for op == "both" the SOL
             // is the single fused `pre_ops + post_ops` roofline, NOT the

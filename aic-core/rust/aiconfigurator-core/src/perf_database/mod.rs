@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::common::enums::{DatabaseMode, TransferPolicy};
+use crate::common::analytical::AnalyticalConfig;
 use crate::common::error::AicError;
 use crate::common::system_spec::SystemSpec;
 use crate::config::{PerfDbSources, PerfSource};
@@ -280,6 +281,9 @@ pub struct PerfDatabase {
     pub database_mode: DatabaseMode,
     /// Enabled empirical transfer kinds (Python's `database.transfer_policy`).
     pub transfer_policy: TransferPolicy,
+    /// Table-free analytical policy. Kept per database view so compiled
+    /// engines can carry level/recipe choices without consulting Python.
+    pub analytical_config: AnalyticalConfig,
     /// Memo of built util-calibration grids, keyed by op/slice identity
     /// (see `operators::util_empirical`). Tables are immutable after load and
     /// grid keys name their slice, so the memo is shared across mode views
@@ -655,6 +659,7 @@ impl PerfDatabase {
             tables,
             database_mode: DatabaseMode::default(),
             transfer_policy: TransferPolicy::ALL,
+            analytical_config: AnalyticalConfig::default(),
             util_grids: Arc::new(UtilGridCache::new()),
             delta_lookups: Arc::new(DeltaLookupCache::new()),
             provenance: Arc::new(AtomicU8::new(ProvenanceTier::Silicon as u8)),
@@ -706,6 +711,12 @@ impl PerfDatabase {
         self
     }
 
+    /// Attach the table-free analytical policy decoded from the engine spec.
+    pub fn with_analytical_config(mut self, config: AnalyticalConfig) -> Self {
+        self.analytical_config = config;
+        self
+    }
+
     /// Test-only mutable access to the shared tables (panics if the view has
     /// been cloned — synthetic-table injection must happen before any
     /// `silicon_view`). Production code never mutates loaded tables.
@@ -727,6 +738,7 @@ impl PerfDatabase {
             tables: Arc::clone(&self.tables),
             database_mode: DatabaseMode::Silicon,
             transfer_policy: self.transfer_policy,
+            analytical_config: self.analytical_config.clone(),
             util_grids: Arc::clone(&self.util_grids),
             delta_lookups: Arc::clone(&self.delta_lookups),
             provenance: Arc::clone(&self.provenance),
@@ -745,6 +757,7 @@ impl PerfDatabase {
             tables: Arc::clone(&self.tables),
             database_mode: DatabaseMode::SolFull,
             transfer_policy: self.transfer_policy,
+            analytical_config: self.analytical_config.clone(),
             util_grids: Arc::clone(&self.util_grids),
             delta_lookups: Arc::clone(&self.delta_lookups),
             provenance: Arc::clone(&self.provenance),
@@ -856,6 +869,7 @@ pub(crate) mod energy_test_fixtures {
                 fp4_tc_flops: Some(9e15),
                 power: None,
                 sm_version: Some(100),
+                analytical: Default::default(),
             },
             node: NodeSpec {
                 num_gpus_per_node: 8,

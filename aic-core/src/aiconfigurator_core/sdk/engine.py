@@ -309,7 +309,7 @@ def _engine_config_dict(
         # directory, so the Rust reload skips its missing-directory gate for
         # exactly this identity.
         "tolerate_dirless_version": bool(getattr(database, "dirless_next_load", False)),
-        "extra": {},
+        "extra": _analytical_extra(database),
     }
     # SpeculativeConfig (flattened, Option<>): emit nextn at the top level
     # when MTP is active. When inactive, omit it so the
@@ -321,6 +321,24 @@ def _engine_config_dict(
 
 def _opt_int(value: Any) -> int | None:
     return None if value is None else int(value)
+
+
+def _analytical_extra(database: Any) -> dict[str, str]:
+    """Serialize the Python analytical policy for the Rust engine wire."""
+    analytical = getattr(database, "_analytical_config", None)
+    sparse_quantum = getattr(analytical, "sparse_attention_head_quantum", None)
+    return {
+        "analytical_level": str(getattr(analytical, "level", "standard")),
+        "analytical_fp8_gemm_recipe": str(getattr(analytical, "fp8_gemm_recipe", "sglang")),
+        "analytical_attention_algorithm": str(getattr(analytical, "attention_algorithm", "fa2")),
+        "analytical_sparse_attention_head_quantum": "none" if sparse_quantum is None else str(sparse_quantum),
+        "analytical_communication_mode": str(getattr(analytical, "communication_mode", "empirical")),
+        "analytical_moe_dispatch_dtype": str(getattr(analytical, "moe_dispatch_dtype", "half")),
+        "analytical_moe_combine_dtype": str(getattr(analytical, "moe_combine_dtype", "half")),
+        "analytical_wideep_dispatch_dtype": str(getattr(analytical, "wideep_dispatch_dtype", "half")),
+        "analytical_wideep_combine_dtype": str(getattr(analytical, "wideep_combine_dtype", "half")),
+        "analytical_communication_placement": str(getattr(analytical, "communication_placement", "independent")),
+    }
 
 
 def _database_mode_name(database: Any) -> str:
@@ -568,7 +586,7 @@ def build_database_probe_spec_json(
         # get_database returned as valid must stay valid through the probe
         # handle (table views, ad-hoc op-list evaluation).
         "tolerate_dirless_version": bool(getattr(database, "dirless_next_load", False)),
-        "extra": {},
+        "extra": _analytical_extra(database),
     }
     spec = {
         "schema_version": ENGINE_SPEC_SCHEMA_VERSION,

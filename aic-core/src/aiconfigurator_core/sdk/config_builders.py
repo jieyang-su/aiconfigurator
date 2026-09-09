@@ -35,6 +35,7 @@ def build_model_config(
     moe_quant_mode: str | None = None,
     comm_quant_mode: str | None = None,
     forward_model: str | None = None,
+    attention_backend: str | None = None,
     enable_encoder_dp: bool = True,
     communication_placement: str = "independent",
 ) -> ModelConfig:
@@ -51,6 +52,7 @@ def build_model_config(
         moe_quant_mode=MoEQuantMode[moe_quant_mode] if moe_quant_mode else None,
         comm_quant_mode=CommQuantMode[comm_quant_mode] if comm_quant_mode else None,
         forward_model=forward_model or "op_level",
+        attention_backend=attention_backend,
         enable_encoder_dp=enable_encoder_dp,
         communication_placement=communication_placement,
     )

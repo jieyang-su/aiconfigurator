@@ -25,7 +25,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::enums::DatabaseMode;
+use crate::common::analytical;
+use crate::common::enums::{CommQuantMode, DatabaseMode};
 use crate::common::error::AicError;
 use crate::operators::base::{MoeCommFallback, PerformanceResult, Source};
 use crate::perf_database::PerfDatabase;
@@ -169,6 +170,30 @@ impl MoeAllToAllOp {
         // moe_comm.py:600 — validation precedes the mode gate (:610), so an
         // invalid backend/phase is a ValueError even under SOL/EMPIRICAL.
         validate_a2a_request(&self.comm_backend, &self.phase)?;
+        if db.database_mode == DatabaseMode::Analytical {
+            let quant = match self.comm_dtype.as_str() {
+                "int8" => CommQuantMode::Int8,
+                "fp8" | "fp8_block" => CommQuantMode::Fp8,
+                _ => CommQuantMode::Half,
+            };
+            let operation = if self.phase == "combine" {
+                "all_gather"
+            } else {
+                "all_to_all"
+            };
+            return Ok(PerformanceResult::new(
+                analytical::collective_latency_ms(
+                    &db.system_spec,
+                    &db.analytical_config,
+                    quant,
+                    self.moe_ep_size,
+                    f64::from(tokens) * f64::from(self.hidden_size),
+                    operation,
+                )?,
+                Source::Analytical,
+            )
+            .scaled(self.scale_factor));
+        }
         match db.database_mode {
             DatabaseMode::Silicon | DatabaseMode::Hybrid => {}
             mode => {

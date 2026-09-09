@@ -490,123 +490,11 @@ class BaseBackend:
             stride,
             latency_correction_scale,
         )
-        isl_eff = isl + img_ctx_tokens
-
-        context_latency_dict, context_energy_wms_dict, context_source_dict = {}, {}, {}
-        generation_latency_dict, generation_energy_wms_dict, generation_source_dict = {}, {}, {}
-
-        if should_use_rust_engine_step(runtime_config, database, model):
-            try:
-                rust_runtime_config = runtime_config
-                if img_ctx_tokens:
-                    rust_runtime_config = copy.copy(runtime_config)
-                    rust_runtime_config.isl = isl_eff
-                (
-                    context_latency_dict,
-                    generation_latency_dict,
-                    context_source_dict,
-                    generation_source_dict,
-                ) = estimate_static_latency_breakdown_with_rust(
-                    model,
-                    database,
-                    rust_runtime_config,
-                    mode,
-                    stride,
-                    latency_correction_scale,
-                )
-                if include_energy:
-                    # Rust engine tracks only latency; run the Python phase runners
-                    # for energy so power_w is populated when power overlay parquets
-                    # are present.  Sum each phase's energy into a single value stored
-                    # under the matching Rust synthetic key so that
-                    # has_sufficient_power_data() can pair energy with latency by name.
-                    ctx_energy_total = 0.0
-                    gen_energy_total = 0.0
-                    if mode in ("static_ctx", "static"):
-                        _, ctx_e, _ = self._run_context_phase(
-                            model, database, runtime_config, batch_size, isl_eff, prefix
-                        )
-                        ctx_energy_total = sum(ctx_e.values()) * latency_correction_scale
-                    if mode in ("static_gen", "static"):
-                        _, gen_e, _ = self._run_generation_phase(
-                            model, database, runtime_config, batch_size, beam_width, isl_eff, osl, stride
-                        )
-                        gen_energy_total = sum(gen_e.values()) * latency_correction_scale
-                    context_energy_wms_dict = dict.fromkeys(context_latency_dict, ctx_energy_total)
-                    generation_energy_wms_dict = dict.fromkeys(generation_latency_dict, gen_energy_total)
-                else:
-                    context_energy_wms_dict = dict.fromkeys(context_latency_dict, 0.0)
-                    generation_energy_wms_dict = dict.fromkeys(generation_latency_dict, 0.0)
-                return (
-                    context_latency_dict,
-                    context_energy_wms_dict,
-                    generation_latency_dict,
-                    generation_energy_wms_dict,
-                    context_source_dict,
-                    generation_source_dict,
-                )
-            except RustEngineUnsupportedError as exc:
-                # Op graph not expressible as a compiled EngineSpec: fall back
-                # to the Python step (parity by delegation — Python computes
-                # what Rust cannot yet express). Perf-data misses are NOT
-                # caught here; they must stay error-symmetric.
-                logger.warning(
-                    "engine-step backend 'rust' cannot compile this model; using the python step: %s",
-                    exc,
-                )
-
-        if mode == "static_ctx":
-            context_latency_dict, context_energy_wms_dict, context_source_dict = self._run_context_phase(
-                model,
-                database,
-                runtime_config,
-                batch_size,
-                isl_eff,
-                prefix,
-                include_energy=include_energy,
-            )
-        elif mode == "static_gen":
-            generation_latency_dict, generation_energy_wms_dict, generation_source_dict = self._run_generation_phase(
-                model,
-                database,
-                runtime_config,
-                batch_size,
-                beam_width,
-                isl_eff,
-                osl,
-                stride,
-                include_energy=include_energy,
-            )
-        else:
-            context_latency_dict, context_energy_wms_dict, context_source_dict = self._run_context_phase(
-                model,
-                database,
-                runtime_config,
-                batch_size,
-                isl_eff,
-                prefix,
-                include_energy=include_energy,
-            )
-            generation_latency_dict, generation_energy_wms_dict, generation_source_dict = self._run_generation_phase(
-                model,
-                database,
-                runtime_config,
-                batch_size,
-                beam_width,
-                isl_eff,
-                osl,
-                stride,
-                include_energy=include_energy,
-            )
-
-        if latency_correction_scale != 1.0:
-            logger.debug(f"latency_correction_scale: {latency_correction_scale} is applied")
-            for op in context_latency_dict:
-                context_latency_dict[op] *= latency_correction_scale
-                context_energy_wms_dict[op] *= latency_correction_scale
-            for op in generation_latency_dict:
-                generation_latency_dict[op] *= latency_correction_scale
-                generation_energy_wms_dict[op] *= latency_correction_scale
+        if not include_energy:
+            # Rust currently reports zero energy; preserve the key shape for
+            # latency-only callers and for power coverage accounting.
+            context_energy_wms_dict = dict.fromkeys(context_latency_dict, 0.0)
+            generation_energy_wms_dict = dict.fromkeys(generation_latency_dict, 0.0)
 
         return (
             context_latency_dict,
@@ -1190,45 +1078,8 @@ class BaseBackend:
         isl += self._visual_context_tokens(model, runtime_config)
 
         decode_query_tokens = step.num_decode_requests * (model._nextn + 1)
-        if should_use_rust_engine_step(runtime_config, database, model):
-            try:
-                components = estimate_mixed_step_breakdown_with_rust(
-                    model,
-                    database,
-                    ctx_tokens=step.context_tokens,
-                    gen_tokens=step.num_decode_requests,
-                    isl=isl,
-                    osl=osl,
-                    prefix=prefix,
-                    seq_imbalance_correction_scale=runtime_config.seq_imbalance_correction_scale,
-                    gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
-                )
-            except RustEngineUnsupportedError as exc:
-                logger.warning(
-                    "engine-step backend 'rust' cannot compile this model; using the python step: %s",
-                    exc,
-                )
-            else:
-                latency_ms = components["total"]
-                return StepEstimate(
-                    latency_ms=latency_ms,
-                    energy_wms=0.0,
-                    component_latency_ms={key: value for key, value in components.items() if key != "total"},
-                    per_op_latency_ms={"rust_engine_step_mixed": latency_ms},
-                    per_op_source={"rust_engine_step_mixed": "rust"},
-                    context_tokens=step.context_tokens,
-                    num_decode_requests=step.num_decode_requests,
-                    num_decode_query_tokens=decode_query_tokens,
-                )
-
-        ctx_scale = runtime_config.seq_imbalance_correction_scale
-        gen_scale = runtime_config.gen_seq_imbalance_correction_scale
-
-        # Pass 1: combined single-batch inference to extract non-attention latency.
-        # Every decode request verifies one target token plus all scheduled
-        # drafts. Acceptance does not reduce this current-iteration work.
-        num_tokens_combined = step.context_tokens + decode_query_tokens
-        summary = self.run_static(
+        self._require_rust_engine_step(runtime_config, database, surface="mixed")
+        components = estimate_mixed_step_breakdown_with_rust(
             model,
             database,
             ctx_tokens=step.context_tokens,
@@ -1268,31 +1119,9 @@ class BaseBackend:
         the per-op dicts and fallback records are empty.
         """
         if gen_tokens <= 0:
-            return 0.0, 0.0, {}, {}
-        if should_use_rust_engine_step(runtime_config, database, model):
-            try:
-                latency_ms = estimate_decode_step_latency_with_rust(
-                    model,
-                    database,
-                    gen_tokens=gen_tokens,
-                    isl=isl,
-                    osl=osl,
-                    gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
-                )
-                return (
-                    latency_ms,
-                    0.0,
-                    {"rust_engine_step_generation": latency_ms},
-                    {"rust_engine_step_generation": "rust"},
-                )
-            except RustEngineUnsupportedError as exc:
-                logger.warning(
-                    "engine-step backend 'rust' cannot compile this model; using the python step: %s",
-                    exc,
-                )
-
-        gen_scale = runtime_config.gen_seq_imbalance_correction_scale
-        summary = self.run_static(
+            return 0.0, 0.0, {}, {}, ()
+        self._require_rust_engine_step(runtime_config, database, surface="decode")
+        return estimate_decode_step_breakdown_with_rust(
             model,
             database,
             gen_tokens=gen_tokens,
@@ -1362,7 +1191,6 @@ class BaseBackend:
         b = runtime_config.batch_size
         img_ctx_tokens = self._visual_context_tokens(model, runtime_config)
         isl = text_isl + img_ctx_tokens
-        engine_step_backend_key = "rust" if should_use_rust_engine_step(runtime_config, database, model) else "python"
         ctx_tokens = kwargs.get("ctx_tokens")
         assert ctx_tokens is not None, "ctx_tokens is required"
         # None (or an omitted kwarg) means the caller did not model speculative

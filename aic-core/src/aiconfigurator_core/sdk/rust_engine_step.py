@@ -13,7 +13,6 @@ onto that handle and cache one handle per engine identity.
 
 from __future__ import annotations
 
-import functools
 import json
 import logging
 import os
@@ -310,46 +309,22 @@ def validate_engine_step_backend(value: Any) -> str | None:
 
 
 def should_use_rust_engine_step(runtime_config: RuntimeConfig, database: Any = None, model: Any = None) -> bool:
-    """Route to the compiled engine only when it can give the SAME answer.
+    """Route the performance engine to Rust.
 
-    Returns ``False`` only for the one remaining delegation: by default (not
-    when ``"rust"`` is explicitly requested), a non-``PerfDatabase`` object —
-    the compiled engine re-loads perf data from disk by identity, which a
-    synthetic database does not have. Callers own what ``False`` means: the
-    AFD orchestration keeps its per-call twin-op loop, while the
-    engine-step surfaces in ``base_backend`` raise (there is no Python step
-    left to delegate to).
+    Python still constructs the model and OpSpec graph. Rust owns database
+    loading, interpolation, operator evaluation, and path composition. The
+    only ``False`` result is for an implicit route with a synthetic database
+    object that has no on-disk identity for Rust to reload; this is retained
+    solely for AFD's explicit op-list orchestration. Real SDK performance
+    calls use ``PerfDatabase`` and therefore always route to Rust.
 
-    * an explicit ``engine_step_backend="python"`` (config or env) — the
-      escape hatch retained for one release cycle;
-    * the SOL / SOL_FULL diagnostic modes, which only the Python step
-      implements (the compiled engine answers SILICON / HYBRID / EMPIRICAL);
-    * by default (not when ``"rust"`` is explicitly requested), a database
-      whose perf tables carry measured power columns — energy does not cross
-      the FFI yet, so rust-routing an agg sweep would silently zero its
-      ``power_w``. Explicit ``"rust"`` keeps its historical force semantics
-      (the parity scan tooling relies on it and measures latency only).
-    * a model using non-independent communication placement, because the Rust
-      engine does not carry the Python placement metadata into communication
-      operation queries yet.
+    ``model`` is accepted for source compatibility with older callers. The
+    engine identity and communication semantics are already serialized in the
+    model OpSpec, so routing must not inspect model topology and silently
+    reintroduce a Python performance path.
     """
     backend = getattr(runtime_config, "engine_step_backend", None) or os.environ.get(ENGINE_STEP_BACKEND_ENV)
-    requested = str(backend).lower() if backend else None
-    if requested is not None and requested != "rust":
-        return False
-    if database is not None:
-        system_spec = getattr(database, "system_spec", {}) or {}
-        from aiconfigurator_core.sdk.system_spec import architecture_family, is_single_supernode
-
-        placement = str(
-            getattr(getattr(model, "config", None), "communication_placement", "independent") or "independent"
-        ).lower()
-        if placement != "independent":
-            _warn_python_placement_fallback_once(str(getattr(database, "system", "<unknown>")), placement)
-            return False
-        if architecture_family(system_spec) == "domestic" or is_single_supernode(system_spec):
-            _warn_python_topology_fallback_once(str(getattr(database, "system", "<unknown>")))
-            return False
+    requested = validate_engine_step_backend(backend)
     if requested is None:
         # Deferred import: perf_database is heavy and this module must stay
         # light to import (engine.py imports it at top level).
@@ -361,107 +336,7 @@ def should_use_rust_engine_step(runtime_config: RuntimeConfig, database: Any = N
             # no on-disk identity it could resolve. Only an explicit "rust"
             # request bypasses this (and owns the resulting load error).
             return False
-        if _database_has_power_data(database):
-            logger.debug(
-                "engine-step backend defaulting to the python step: database %s/%s/%s carries "
-                "measured power data and energy does not cross the FFI yet "
-                "(set %s=rust to force the compiled engine).",
-                database.system,
-                database.backend,
-                database.version,
-                ENGINE_STEP_BACKEND_ENV,
-            )
-            return False
-    if database is not None:
-        mode = getattr(database, "_requested_database_mode", None) or getattr(
-            database, "get_default_database_mode", lambda: None
-        )()
-        if mode is not None and getattr(mode, "name", str(mode)) not in _RUST_SUPPORTED_DATABASE_MODES:
-            logger.debug(
-                "engine-step backend 'rust' requested but database_mode=%s; "
-                "using the python step (compiled engine implements SILICON/HYBRID/EMPIRICAL only).",
-                getattr(mode, "name", mode),
-            )
-            return False
     return True
-
-
-@functools.cache
-def _warn_python_topology_fallback_once(system: str) -> None:
-    logger.warning(
-        "Using Python engine-step for system %s: the Rust engine does not yet model "
-        "explicit architecture capabilities or single-supernode-only topology.",
-        system,
-    )
-
-
-@functools.cache
-def _warn_python_placement_fallback_once(system: str, placement: str) -> None:
-    logger.warning(
-        "Using Python engine-step for system %s with communication placement %s: "
-        "the Rust engine does not yet propagate placement-aware communication metadata.",
-        system,
-        placement,
-    )
-
-
-# Power-data probe results keyed by (system, backend, version). The probe is
-# a filesystem schema scan, so the answer is immutable for a given identity;
-# memoizing here keeps the per-step routing gate free of I/O.
-_POWER_DATA_CACHE: dict[tuple[str, str, str], bool] = {}
-
-
-def _database_has_power_data(database: Any) -> bool:
-    """True when the database's perf-data tree carries measured power columns.
-
-    Detection is a parquet *schema* scan (no row reads) over the database's
-    ``<data_dir>/<family>/<backend>/<version>/*.parquet`` tree, plus the
-    deprecated ``<data_dir>/<backend>/<version>`` layout. All sibling version
-    dirs of the backend are scanned, not just ``database.version``: the loader
-    may fill gaps from sibling-version channels, and over-matching only keeps
-    that database on the (status quo) Python step. Collectors write power
-    columns only when power was actually measured, so column presence is the
-    signal — no row values are inspected.
-
-    Any probe failure (mock database objects in tests, missing tree, no
-    pyarrow) means "no power data": those databases cannot produce energy on
-    the Python step either, so rust-routing them changes nothing.
-    """
-    system = getattr(database, "system", None)
-    backend = getattr(database, "backend", None)
-    if not system or not backend:
-        return False
-    key = (str(system), _backend_name(backend), str(getattr(database, "version", "")))
-    cached = _POWER_DATA_CACHE.get(key)
-    if cached is not None:
-        return cached
-    result = _scan_for_power_columns(database)
-    _POWER_DATA_CACHE[key] = result
-    return result
-
-
-def _scan_for_power_columns(database: Any) -> bool:
-    try:
-        import pyarrow.parquet as pq
-
-        systems_root = getattr(database, "systems_root", None)
-        spec = getattr(database, "system_spec", None)
-        data_dir_rel = spec.get("data_dir") if isinstance(spec, dict) else None
-        if not systems_root or not data_dir_rel:
-            return False
-        data_dir = Path(systems_root) / data_dir_rel
-        backend = _backend_name(database.backend)
-        candidates = list(data_dir.glob(f"*/{backend}/*/*.parquet")) + list(data_dir.glob(f"{backend}/*/*.parquet"))
-        for parquet_path in candidates:
-            try:
-                names = pq.read_schema(parquet_path).names
-            except Exception:  # one unreadable file must not poison the probe
-                continue
-            if any("power" in name for name in names):
-                return True
-        return False
-    except Exception:  # probe failures mean "no power data", see docstring
-        return False
 
 
 def _note_rust_provenance(handle: Any) -> None:

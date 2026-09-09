@@ -40,13 +40,14 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
 use crate::common::enums::{
-    CommQuantMode, FmhaQuantMode, GemmQuantMode, KvCacheQuantMode, MoeQuantMode,
+    CommQuantMode, DatabaseMode, FmhaQuantMode, GemmQuantMode, KvCacheQuantMode, MoeQuantMode,
 };
 use crate::operators::attention::default_lane_order;
 use crate::operators::dsa::DsaProjectionQuants;
 use crate::operators::{
     ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, ElementwiseOp, EmbeddingOp,
-    EncoderAttentionOp, GemmOp, GenerationAttentionOp, GenerationMlaOp, MhcModuleOp, MlaBmmOp,
+    DsaIndexScoreOp, DsaSparseAttentionOp, DsaTopKSelectOp, Dsv4KvAllGatherOp,
+    Dsv4SparseAttentionOp, EncoderAttentionOp, GemmOp, GenerationAttentionOp, GenerationMlaOp, MhcModuleOp, MlaBmmOp,
     MlaModuleOp, NcclOp, Op, P2POp,
 };
 
@@ -103,6 +104,20 @@ quant_extractor!(fmha_quant, FmhaQuantMode, "FMHA quant mode");
 quant_extractor!(moe_quant, MoeQuantMode, "MoE quant mode");
 quant_extractor!(comm_quant, CommQuantMode, "comm quant mode");
 
+/// Accept a Python `DatabaseMode` enum member or its uppercase wire token.
+fn database_mode(obj: &Bound<'_, PyAny>) -> PyResult<DatabaseMode> {
+    let name: String = if let Ok(s) = obj.extract::<String>() {
+        s
+    } else {
+        obj.getattr("name")
+            .map_err(|_| PyTypeError::new_err("database mode must be a common enum member or its name"))?
+            .extract()?
+    };
+    serde_json::from_value::<DatabaseMode>(serde_json::Value::String(name.clone())).map_err(|_| {
+        PyValueError::new_err(format!("unknown database mode: {name:?}"))
+    })
+}
+
 /// The retired base-class context-parallel audit gate: constructing with
 /// `seq_split > 1` on a family that has NOT opted in raises.
 fn cp_audit_gate(class_name: &str, cp_aware: bool, seq_split: u32) -> PyResult<()> {
@@ -146,6 +161,11 @@ pub(crate) fn wrap_op(py: Python<'_>, op: Op) -> PyResult<Py<PyAny>> {
         Op::MoeDispatch(_) => wrap!(PyMoEDispatch),
         Op::MoeAllToAll(_) => wrap!(PyMoEAllToAll),
         Op::MoeExpertCompute(_) => wrap!(PyMoEExpertCompute),
+        Op::DsaIndexScore(_) => wrap!(PyDSAIndexScore),
+        Op::DsaTopKSelect(_) => wrap!(PyDSATopKSelect),
+        Op::DsaSparseAttention(_) => wrap!(PyDSASparseAttention),
+        Op::Dsv4KvAllGather(_) => wrap!(PyDeepSeekV4KVAllGather),
+        Op::Dsv4SparseAttention(_) => wrap!(PyDeepSeekV4SparseAttention),
         Op::Dsv4MegaMoe(_) => wrap!(PyDeepSeekV4MegaMoEModule),
         Op::DsaContext(_) => wrap!(PyContextDSAModule),
         Op::DsaGeneration(_) => wrap!(PyGenerationDSAModule),
@@ -289,7 +309,7 @@ impl PyOperation {
     }
 }
 
-#[pymethods]
+    #[pymethods]
 impl PyOperation {
     /// Shim call-shape label (`None` on the base; each family overrides).
     /// Read by `OpShellKit._engine_query` and the composite phase walker
@@ -297,6 +317,14 @@ impl PyOperation {
     #[classattr]
     #[allow(non_upper_case_globals)]
     const _ENGINE_QUERY_SHAPE: Option<&'static str> = None;
+
+    /// Python operation shells call `super().__init__(name, scale_factor)`
+    /// for compatibility with the pre-Rust base class. Construction-time
+    /// state is already created by the Rust family `__new__`, so this inherited
+    /// initializer intentionally does nothing while accepting the legacy
+    /// positional/keyword shape.
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn __init__(&self, _args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) {}
 
     /// Constant weight bytes for this op, computed by the engine
     /// (`Op::weight_bytes`, scale treatment included per family). The Rust
@@ -870,7 +898,7 @@ impl PyDeepSeekV4MHCModule {
     const _ENGINE_QUERY_SHAPE: &'static str = "tokens";
 
     #[new]
-    #[pyo3(signature = (name, scale_factor, op, hidden_size, hc_mult, sinkhorn_iters, quant_mode, *, architecture, seq_split=1))]
+    #[pyo3(signature = (name, scale_factor, op, hidden_size, hc_mult, sinkhorn_iters, quant_mode, *, architecture="DeepseekV4ForCausalLM", seq_split=1))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         name: String,
@@ -880,7 +908,7 @@ impl PyDeepSeekV4MHCModule {
         hc_mult: u32,
         sinkhorn_iters: u32,
         quant_mode: &Bound<'_, PyAny>,
-        architecture: String,
+        architecture: &str,
         seq_split: u32,
     ) -> PyResult<(Self, PyOperation)> {
         if !matches!(op.as_str(), "pre" | "post" | "both") {
@@ -894,7 +922,7 @@ impl PyDeepSeekV4MHCModule {
             op,
             hc_mult,
             hidden_size,
-            architecture,
+            architecture: architecture.to_string(),
             sinkhorn_iters,
             quant_mode: gemm_quant(quant_mode)?,
             seq_split,
@@ -1130,7 +1158,7 @@ impl PyGenerationAttention {
     const _ENGINE_QUERY_SHAPE: &'static str = "generation";
 
     #[new]
-    #[pyo3(signature = (name, scale_factor, n, n_kv, kv_cache_dtype, window_size=0, head_size=128, use_qk_norm=false, lane_order=None))]
+    #[pyo3(signature = (name, scale_factor, n, n_kv, kv_cache_dtype, window_size=0, head_size=128, use_qk_norm=false, fmha_quant_mode=None, lane_order=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         name: String,
@@ -1141,6 +1169,7 @@ impl PyGenerationAttention {
         window_size: u32,
         head_size: u32,
         use_qk_norm: bool,
+        fmha_quant_mode: Option<&Bound<'_, PyAny>>,
         lane_order: Option<Vec<String>>,
     ) -> PyResult<(Self, PyOperation)> {
         // use_qk_norm is accepted for calling-shape compatibility; the decode
@@ -1155,6 +1184,7 @@ impl PyGenerationAttention {
             window_size,
             kv_cache_dtype: kv_quant(kv_cache_dtype)?,
             lane_order: lane_order.unwrap_or_else(default_lane_order),
+            fmha_quant_mode: fmha_quant_mode.map(fmha_quant).transpose()?,
         });
         Ok((PyGenerationAttention, PyOperation { inner }))
     }
@@ -1178,6 +1208,9 @@ impl PyGenerationAttention {
         // 8 is use_qk_norm, which this op discards (never round-tripped), so a
         // positional 8th slot would bind to the wrong parameter.
         let kwargs = PyDict::new(py);
+        if let Some(fmha) = o.fmha_quant_mode {
+            kwargs.set_item("fmha_quant_mode", enum_token(&fmha))?;
+        }
         kwargs.set_item("lane_order", o.lane_order.clone())?;
         Ok((args, kwargs))
     }
@@ -1209,6 +1242,28 @@ impl PyGenerationAttention {
             "KVCacheQuantMode",
             &enum_token(&slf.as_super().generation_attention()?.kv_cache_dtype),
         )
+    }
+
+    #[getter(_fmha_quant_mode)]
+    fn fmha_quant_mode<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        slf.as_super()
+            .generation_attention()?
+            .fmha_quant_mode
+            .map(|mode| py_enum_member(py, "FMHAQuantMode", &enum_token(&mode)))
+            .transpose()
+    }
+
+    #[setter(_fmha_quant_mode)]
+    fn set_fmha_quant_mode(
+        mut slf: PyRefMut<'_, Self>,
+        value: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        slf.as_super().generation_attention_mut()?.fmha_quant_mode =
+            value.map(fmha_quant).transpose()?;
+        Ok(())
     }
 
     #[getter(_lane_order)]
@@ -3969,10 +4024,377 @@ dsv4_class!(
 );
 
 // ---------------------------------------------------------------------------
+// Table-free granular DSA / DeepSeek-V4 operations
+// ---------------------------------------------------------------------------
+
+macro_rules! granular_common {
+    ($cls:ident, $py_name:literal, $variant:ident) => {
+        #[pyclass(extends = PyOperation, subclass, name = $py_name, module = "aiconfigurator_core._aiconfigurator_core")]
+        pub struct $cls;
+    };
+}
+
+granular_common!(PyDSAIndexScore, "DSAIndexScore", DsaIndexScore);
+granular_common!(PyDSATopKSelect, "DSATopKSelect", DsaTopKSelect);
+granular_common!(PyDSASparseAttention, "DSASparseAttention", DsaSparseAttention);
+granular_common!(PyDeepSeekV4KVAllGather, "DeepSeekV4KVAllGather", Dsv4KvAllGather);
+granular_common!(PyDeepSeekV4SparseAttention, "DeepSeekV4SparseAttention", Dsv4SparseAttention);
+
+#[pymethods]
+impl PyDSAIndexScore {
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _CP_AWARE: bool = true;
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _ENGINE_QUERY_SHAPE: &'static str = "context";
+
+    #[new]
+    #[pyo3(signature = (name, scale_factor, *, layout, index_heads, index_head_dim, index_topk, cp_size=1, context_stride=1))]
+    fn new(
+        name: String,
+        scale_factor: f64,
+        layout: String,
+        index_heads: u32,
+        index_head_dim: u32,
+        index_topk: u32,
+        cp_size: u32,
+        context_stride: u32,
+    ) -> PyResult<(Self, PyOperation)> {
+        if context_stride == 0 {
+            return Err(PyValueError::new_err("context_stride must be positive"));
+        }
+        Ok((
+            PyDSAIndexScore,
+            PyOperation {
+                inner: Op::DsaIndexScore(DsaIndexScoreOp {
+                    name,
+                    scale_factor,
+                    layout,
+                    index_heads,
+                    index_head_dim,
+                    index_topk,
+                    cp_size,
+                    context_stride,
+                }),
+            },
+        ))
+    }
+
+    #[getter(_layout)]
+    fn layout(slf: PyRef<'_, Self>) -> PyResult<String> { Ok(slf.as_super().dsa_index_score()?.layout.clone()) }
+    #[getter(_index_heads)]
+    fn index_heads(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_index_score()?.index_heads) }
+    #[getter(_index_head_dim)]
+    fn index_head_dim(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_index_score()?.index_head_dim) }
+    #[getter(_index_topk)]
+    fn index_topk(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_index_score()?.index_topk) }
+    #[getter(_cp_size)]
+    fn cp_size(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_index_score()?.cp_size) }
+    #[getter(_context_stride)]
+    fn context_stride(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_index_score()?.context_stride) }
+}
+
+#[pymethods]
+impl PyDSATopKSelect {
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _CP_AWARE: bool = true;
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _ENGINE_QUERY_SHAPE: &'static str = "context";
+
+    #[new]
+    #[pyo3(signature = (name, scale_factor, *, layout, index_topk, cp_size=1, context_stride=1, kernel_recipe="dsa"))]
+    fn new(
+        name: String,
+        scale_factor: f64,
+        layout: String,
+        index_topk: u32,
+        cp_size: u32,
+        context_stride: u32,
+        kernel_recipe: &str,
+    ) -> PyResult<(Self, PyOperation)> {
+        if context_stride == 0 {
+            return Err(PyValueError::new_err("context_stride must be positive"));
+        }
+        let kernel_recipe = kernel_recipe.to_ascii_lowercase();
+        if kernel_recipe != "dsa" && kernel_recipe != "dsv4" {
+            return Err(PyValueError::new_err("kernel_recipe must be dsa or dsv4"));
+        }
+        Ok((
+            PyDSATopKSelect,
+            PyOperation {
+                inner: Op::DsaTopKSelect(DsaTopKSelectOp {
+                    name,
+                    scale_factor,
+                    layout,
+                    index_topk,
+                    cp_size,
+                    context_stride,
+                    kernel_recipe,
+                }),
+            },
+        ))
+    }
+
+    #[getter(_layout)]
+    fn layout(slf: PyRef<'_, Self>) -> PyResult<String> { Ok(slf.as_super().dsa_topk_select()?.layout.clone()) }
+    #[getter(_index_topk)]
+    fn index_topk(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_topk_select()?.index_topk) }
+    #[getter(_cp_size)]
+    fn cp_size(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_topk_select()?.cp_size) }
+    #[getter(_context_stride)]
+    fn context_stride(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_topk_select()?.context_stride) }
+    #[getter(_kernel_recipe)]
+    fn kernel_recipe(slf: PyRef<'_, Self>) -> PyResult<String> { Ok(slf.as_super().dsa_topk_select()?.kernel_recipe.clone()) }
+}
+
+#[pymethods]
+impl PyDSASparseAttention {
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _CP_AWARE: bool = true;
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _ENGINE_QUERY_SHAPE: &'static str = "context";
+
+    #[new]
+    #[pyo3(signature = (name, scale_factor, *, layout, local_heads, index_topk, qk_latent_dim=576, value_latent_dim=512, qk_nope_dim=128, output_value_dim=128, cp_size=1))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        name: String,
+        scale_factor: f64,
+        layout: String,
+        local_heads: u32,
+        index_topk: u32,
+        qk_latent_dim: u32,
+        value_latent_dim: u32,
+        qk_nope_dim: u32,
+        output_value_dim: u32,
+        cp_size: u32,
+    ) -> PyResult<(Self, PyOperation)> {
+        Ok((
+            PyDSASparseAttention,
+            PyOperation {
+                inner: Op::DsaSparseAttention(DsaSparseAttentionOp {
+                    name,
+                    scale_factor,
+                    layout,
+                    local_heads,
+                    index_topk,
+                    qk_latent_dim,
+                    value_latent_dim,
+                    qk_nope_dim,
+                    output_value_dim,
+                    cp_size,
+                }),
+            },
+        ))
+    }
+
+    #[getter(_layout)]
+    fn layout(slf: PyRef<'_, Self>) -> PyResult<String> { Ok(slf.as_super().dsa_sparse_attention()?.layout.clone()) }
+    #[getter(_local_heads)]
+    fn local_heads(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_sparse_attention()?.local_heads) }
+    #[getter(_index_topk)]
+    fn index_topk(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_sparse_attention()?.index_topk) }
+    #[getter(_qk_latent_dim)]
+    fn qk_latent_dim(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_sparse_attention()?.qk_latent_dim) }
+    #[getter(_value_latent_dim)]
+    fn value_latent_dim(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_sparse_attention()?.value_latent_dim) }
+    #[getter(_qk_nope_dim)]
+    fn qk_nope_dim(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_sparse_attention()?.qk_nope_dim) }
+    #[getter(_output_value_dim)]
+    fn output_value_dim(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_sparse_attention()?.output_value_dim) }
+    #[getter(_cp_size)]
+    fn cp_size(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsa_sparse_attention()?.cp_size) }
+}
+
+#[pymethods]
+impl PyDeepSeekV4KVAllGather {
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _CP_AWARE: bool = true;
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _ENGINE_QUERY_SHAPE: &'static str = "context";
+
+    #[new]
+    #[pyo3(signature = (name, scale_factor, *, kind, width, cp_size, window_size=0, compress_ratio=1))]
+    fn new(
+        name: String,
+        scale_factor: f64,
+        kind: String,
+        width: u32,
+        cp_size: u32,
+        window_size: u32,
+        compress_ratio: u32,
+    ) -> PyResult<(Self, PyOperation)> {
+        if !matches!(kind.as_str(), "window" | "compressed" | "index") {
+            return Err(PyValueError::new_err("V4 KV all-gather kind must be window, compressed, or index"));
+        }
+        Ok((
+            PyDeepSeekV4KVAllGather,
+            PyOperation {
+                inner: Op::Dsv4KvAllGather(Dsv4KvAllGatherOp {
+                    name,
+                    scale_factor,
+                    kind,
+                    width,
+                    cp_size,
+                    window_size,
+                    compress_ratio,
+                }),
+            },
+        ))
+    }
+
+    #[getter(_kind)]
+    fn kind(slf: PyRef<'_, Self>) -> PyResult<String> { Ok(slf.as_super().dsv4_kv_all_gather()?.kind.clone()) }
+    #[getter(_width)]
+    fn width(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsv4_kv_all_gather()?.width) }
+    #[getter(_cp_size)]
+    fn cp_size(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsv4_kv_all_gather()?.cp_size) }
+    #[getter(_window_size)]
+    fn window_size(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsv4_kv_all_gather()?.window_size) }
+    #[getter(_compress_ratio)]
+    fn compress_ratio(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsv4_kv_all_gather()?.compress_ratio) }
+}
+
+#[pymethods]
+impl PyDeepSeekV4SparseAttention {
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _CP_AWARE: bool = true;
+    #[classattr]
+    #[allow(non_upper_case_globals)]
+    const _ENGINE_QUERY_SHAPE: &'static str = "context";
+
+    /// Compatibility helpers retained by the Python model construction
+    /// tests.  The pair-count arithmetic is owned by the Rust DSV4 database
+    /// implementation; exposing it here avoids restoring a second Python
+    /// implementation of the same formulas.
+    #[staticmethod]
+    #[pyo3(signature = (batch, query_len, prefix, limit))]
+    fn _causal_limited_pairs(batch: i64, query_len: i64, prefix: i64, limit: i64) -> i64 {
+        crate::perf_database::dsv4::causal_limited_pairs(
+            batch as i128,
+            query_len as i128,
+            prefix as i128,
+            limit as i128,
+        ) as i64
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (batch, query_len, prefix, ratio, limit))]
+    fn _compressed_causal_pairs(
+        batch: i64,
+        query_len: i64,
+        prefix: i64,
+        ratio: i64,
+        limit: i64,
+    ) -> i64 {
+        crate::perf_database::dsv4::compressed_context_pairs(
+            batch as i128,
+            query_len as i128,
+            prefix as i128,
+            ratio as i128,
+            limit as i128,
+        ) as i64
+    }
+
+    #[new]
+    #[pyo3(signature = (name, scale_factor, *, layout, local_heads, head_dim, window_size, compress_ratio, index_topk, kvcache_quant_mode, fmha_quant_mode, cp_size=1))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        name: String,
+        scale_factor: f64,
+        layout: String,
+        local_heads: u32,
+        head_dim: u32,
+        window_size: u32,
+        compress_ratio: u32,
+        index_topk: u32,
+        kvcache_quant_mode: &Bound<'_, PyAny>,
+        fmha_quant_mode: &Bound<'_, PyAny>,
+        cp_size: u32,
+    ) -> PyResult<(Self, PyOperation)> {
+        if !matches!(layout.as_str(), "ragged" | "paged") {
+            return Err(PyValueError::new_err("DeepSeek-V4 sparse attention layout must be ragged or paged"));
+        }
+        if !matches!(compress_ratio, 0 | 4 | 128) {
+            return Err(PyValueError::new_err("DeepSeek-V4 compress_ratio must be 0, 4, or 128"));
+        }
+        Ok((
+            PyDeepSeekV4SparseAttention,
+            PyOperation {
+                inner: Op::Dsv4SparseAttention(Dsv4SparseAttentionOp {
+                    name,
+                    scale_factor,
+                    layout,
+                    local_heads,
+                    head_dim,
+                    window_size,
+                    compress_ratio,
+                    index_topk,
+                    kv_cache_dtype: kv_quant(kvcache_quant_mode)?,
+                    fmha_quant_mode: fmha_quant(fmha_quant_mode)?,
+                    cp_size,
+                }),
+            },
+        ))
+    }
+
+    #[getter(_layout)]
+    fn layout(slf: PyRef<'_, Self>) -> PyResult<String> { Ok(slf.as_super().dsv4_sparse_attention()?.layout.clone()) }
+    #[getter(_local_heads)]
+    fn local_heads(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsv4_sparse_attention()?.local_heads) }
+    #[getter(_head_dim)]
+    fn head_dim(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsv4_sparse_attention()?.head_dim) }
+    #[getter(_window_size)]
+    fn window_size(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsv4_sparse_attention()?.window_size) }
+    #[getter(_compress_ratio)]
+    fn compress_ratio(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsv4_sparse_attention()?.compress_ratio) }
+    #[getter(_index_topk)]
+    fn index_topk(slf: PyRef<'_, Self>) -> PyResult<u32> { Ok(slf.as_super().dsv4_sparse_attention()?.index_topk) }
+}
+
+// ---------------------------------------------------------------------------
 // Composites
 // ---------------------------------------------------------------------------
 
 impl PyOperation {
+    fn dsa_index_score(&self) -> PyResult<&DsaIndexScoreOp> {
+        match &self.inner {
+            Op::DsaIndexScore(o) => Ok(o),
+            _ => Err(PyTypeError::new_err("not a DSAIndexScore op")),
+        }
+    }
+    fn dsa_topk_select(&self) -> PyResult<&DsaTopKSelectOp> {
+        match &self.inner {
+            Op::DsaTopKSelect(o) => Ok(o),
+            _ => Err(PyTypeError::new_err("not a DSATopKSelect op")),
+        }
+    }
+    fn dsa_sparse_attention(&self) -> PyResult<&DsaSparseAttentionOp> {
+        match &self.inner {
+            Op::DsaSparseAttention(o) => Ok(o),
+            _ => Err(PyTypeError::new_err("not a DSASparseAttention op")),
+        }
+    }
+    fn dsv4_kv_all_gather(&self) -> PyResult<&Dsv4KvAllGatherOp> {
+        match &self.inner {
+            Op::Dsv4KvAllGather(o) => Ok(o),
+            _ => Err(PyTypeError::new_err("not a DeepSeekV4KVAllGather op")),
+        }
+    }
+    fn dsv4_sparse_attention(&self) -> PyResult<&Dsv4SparseAttentionOp> {
+        match &self.inner {
+            Op::Dsv4SparseAttention(o) => Ok(o),
+            _ => Err(PyTypeError::new_err("not a DeepSeekV4SparseAttention op")),
+        }
+    }
     fn overlap(&self) -> PyResult<&crate::operators::OverlapOp> {
         match &self.inner {
             Op::Overlap(o) => Ok(o),
@@ -3981,6 +4403,13 @@ impl PyOperation {
     }
     fn fallback(&self) -> PyResult<&crate::operators::FallbackOp> {
         match &self.inner {
+            Op::Fallback(o) => Ok(o),
+            _ => Err(PyTypeError::new_err("not a FallbackOp")),
+        }
+    }
+
+    fn fallback_mut(&mut self) -> PyResult<&mut crate::operators::FallbackOp> {
+        match &mut self.inner {
             Op::Fallback(o) => Ok(o),
             _ => Err(PyTypeError::new_err("not a FallbackOp")),
         }
@@ -4084,18 +4513,28 @@ impl PyFallbackOp {
     const _ENGINE_QUERY_SHAPE: &'static str = "module";
 
     #[new]
-    #[pyo3(signature = (name, primary, fallback, *, seq_split=1))]
+    #[pyo3(signature = (name, primary, fallback, *, seq_split=1, silicon_primary_only=false, primary_excluded_modes=None))]
     fn new(
         name: String,
         primary: &Bound<'_, PyAny>,
         fallback: &Bound<'_, PyAny>,
         seq_split: u32,
+        silicon_primary_only: bool,
+        primary_excluded_modes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Self, PyOperation)> {
         let _ = seq_split;
+        let mut excluded = Vec::new();
+        if let Some(primary_excluded_modes) = primary_excluded_modes {
+            for item in primary_excluded_modes.try_iter()? {
+                excluded.push(database_mode(&item?)?);
+            }
+        }
         let inner = Op::Fallback(crate::operators::FallbackOp {
             name,
             primary: Box::new(extract_child_op(primary)?),
             fallback: extract_child_ops(fallback)?,
+            silicon_primary_only,
+            primary_excluded_modes: excluded,
         });
         Ok((PyFallbackOp, PyOperation { inner }))
     }
@@ -4111,7 +4550,16 @@ impl PyFallbackOp {
             wrap_ops(py, &o.fallback)?,
         )
             .into_pyobject(py)?;
-        Ok((args, PyDict::new(py)))
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("seq_split", 1u32)?;
+        kwargs.set_item("silicon_primary_only", o.silicon_primary_only)?;
+        let excluded: Vec<Bound<'_, PyAny>> = o
+            .primary_excluded_modes
+            .iter()
+            .map(|mode| py_enum_member(py, "DatabaseMode", &enum_token(mode)))
+            .collect::<PyResult<Vec<_>>>()?;
+        kwargs.set_item("primary_excluded_modes", excluded)?;
+        Ok((args, kwargs))
     }
 
     #[getter(_primary)]
@@ -4119,9 +4567,58 @@ impl PyFallbackOp {
         wrap_op(py, (*slf.as_super().fallback()?.primary).clone())
     }
 
+    #[setter(_primary)]
+    fn set_primary(mut slf: PyRefMut<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        slf.as_super().fallback_mut()?.primary = Box::new(extract_child_op(value)?);
+        Ok(())
+    }
+
     #[getter(_fallback)]
     fn fallback(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         wrap_ops(py, &slf.as_super().fallback()?.fallback)
+    }
+
+    #[setter(_fallback)]
+    fn set_fallback(mut slf: PyRefMut<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        slf.as_super().fallback_mut()?.fallback = extract_child_ops(value)?;
+        Ok(())
+    }
+
+    #[getter(_silicon_primary_only)]
+    fn silicon_primary_only(slf: PyRef<'_, Self>) -> PyResult<bool> {
+        Ok(slf.as_super().fallback()?.silicon_primary_only)
+    }
+
+    #[setter(_silicon_primary_only)]
+    fn set_silicon_primary_only(mut slf: PyRefMut<'_, Self>, value: bool) -> PyResult<()> {
+        slf.as_super().fallback_mut()?.silicon_primary_only = value;
+        Ok(())
+    }
+
+    #[getter(_primary_excluded_modes)]
+    fn primary_excluded_modes<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        slf.as_super()
+            .fallback()?
+            .primary_excluded_modes
+            .iter()
+            .map(|mode| py_enum_member(py, "DatabaseMode", &enum_token(mode)).map(|value| value.unbind()))
+            .collect()
+    }
+
+    #[setter(_primary_excluded_modes)]
+    fn set_primary_excluded_modes(
+        mut slf: PyRefMut<'_, Self>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let mut modes = Vec::new();
+        for item in value.try_iter()? {
+            modes.push(database_mode(&item?)?);
+        }
+        slf.as_super().fallback_mut()?.primary_excluded_modes = modes;
+        Ok(())
     }
 }
 
@@ -4152,6 +4649,11 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGenerationMSAModule>()?;
     m.add_class::<PyContextDeepSeekV4AttentionModule>()?;
     m.add_class::<PyGenerationDeepSeekV4AttentionModule>()?;
+    m.add_class::<PyDSAIndexScore>()?;
+    m.add_class::<PyDSATopKSelect>()?;
+    m.add_class::<PyDSASparseAttention>()?;
+    m.add_class::<PyDeepSeekV4KVAllGather>()?;
+    m.add_class::<PyDeepSeekV4SparseAttention>()?;
     m.add_class::<PyMamba2Kernel>()?;
     m.add_class::<PyGDNKernel>()?;
     m.add_class::<PyKDAKernel>()?;

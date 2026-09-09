@@ -163,7 +163,9 @@ mod tests {
     use crate::operators::moe_dispatch::DispatchFlavor;
     use crate::operators::op::{FallbackOp, OverlapOp};
     use crate::operators::{
-        ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaModuleOp, Dsv4MegaMoeOp,
+        ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaIndexScoreOp, DsaModuleOp,
+        DsaSparseAttentionOp, DsaTopKSelectOp, Dsv4KvAllGatherOp, Dsv4MegaMoeOp,
+        Dsv4SparseAttentionOp,
         Dsv4ModuleOp, ElementwiseOp, EmbeddingOp, EncoderAttentionOp, GdnOp, GemmOp,
         GenerationAttentionOp, GenerationMlaOp, KdaOp, Mamba2Op, MhcModuleOp, MlaBmmOp,
         MlaModuleOp, MoEDispatchOp, MoeAllToAllOp, MoeExpertComputeOp, MoeOp, NcclOp, P2POp,
@@ -240,6 +242,7 @@ mod tests {
             window_size: 4096,
             kv_cache_dtype: KvCacheQuantMode::Int8,
             lane_order: vec!["triton".into(), "trtllm_mha".into(), "default".into()],
+            fmha_quant_mode: None,
         }
     }
 
@@ -449,6 +452,74 @@ mod tests {
         }
     }
 
+    fn dsa_index_score() -> DsaIndexScoreOp {
+        DsaIndexScoreOp {
+            name: "dsa_index_score".into(),
+            scale_factor: 1.0,
+            layout: "ragged".into(),
+            index_heads: 64,
+            index_head_dim: 128,
+            index_topk: 2048,
+            cp_size: 1,
+            context_stride: 4,
+        }
+    }
+
+    fn dsa_topk_select() -> DsaTopKSelectOp {
+        DsaTopKSelectOp {
+            name: "dsa_topk_select".into(),
+            scale_factor: 1.0,
+            layout: "ragged".into(),
+            index_topk: 2048,
+            cp_size: 1,
+            context_stride: 4,
+            kernel_recipe: "dsa".into(),
+        }
+    }
+
+    fn dsa_sparse_attention() -> DsaSparseAttentionOp {
+        DsaSparseAttentionOp {
+            name: "dsa_sparse_attention".into(),
+            scale_factor: 1.0,
+            layout: "ragged".into(),
+            local_heads: 128,
+            index_topk: 2048,
+            qk_latent_dim: 512,
+            value_latent_dim: 512,
+            qk_nope_dim: 128,
+            output_value_dim: 128,
+            cp_size: 1,
+        }
+    }
+
+    fn dsv4_kv_all_gather() -> Dsv4KvAllGatherOp {
+        Dsv4KvAllGatherOp {
+            name: "dsv4_kv_all_gather".into(),
+            scale_factor: 1.0,
+            kind: "window".into(),
+            width: 128,
+            cp_size: 2,
+            window_size: 128,
+            compress_ratio: 4,
+        }
+    }
+
+    fn dsv4_sparse_attention() -> Dsv4SparseAttentionOp {
+        Dsv4SparseAttentionOp {
+            name: "dsv4_sparse_attention".into(),
+            scale_factor: 1.0,
+            layout: "ragged".into(),
+            local_heads: 128,
+            head_dim: 128,
+            window_size: 128,
+            compress_ratio: 4,
+            index_topk: 512,
+            kv_cache_dtype: KvCacheQuantMode::Fp8,
+            fmha_quant_mode: FmhaQuantMode::Bfloat16,
+            cp_size: 1,
+        }
+    }
+
     fn dsv4_megamoe() -> Dsv4MegaMoeOp {
         Dsv4MegaMoeOp {
             name: "context_megamoe".into(),
@@ -648,6 +719,8 @@ mod tests {
                 OpSpec::ContextMla(context_mla()),
                 OpSpec::Overlap(overlap()),
             ],
+            silicon_primary_only: false,
+            primary_excluded_modes: Vec::new(),
         }
     }
 
@@ -679,6 +752,11 @@ mod tests {
             OpSpec::MsaGeneration(msa_module()),
             OpSpec::Dsv4Context(dsv4_module()),
             OpSpec::Dsv4Generation(dsv4_module()),
+            OpSpec::DsaIndexScore(dsa_index_score()),
+            OpSpec::DsaTopKSelect(dsa_topk_select()),
+            OpSpec::DsaSparseAttention(dsa_sparse_attention()),
+            OpSpec::Dsv4KvAllGather(dsv4_kv_all_gather()),
+            OpSpec::Dsv4SparseAttention(dsv4_sparse_attention()),
             OpSpec::Mhc(mhc()),
             OpSpec::Mamba2(mamba2()),
             OpSpec::Gdn(gdn()),
@@ -724,6 +802,11 @@ mod tests {
                 | OpSpec::MsaGeneration(_)
                 | OpSpec::Dsv4Context(_)
                 | OpSpec::Dsv4Generation(_)
+                | OpSpec::DsaIndexScore(_)
+                | OpSpec::DsaTopKSelect(_)
+                | OpSpec::DsaSparseAttention(_)
+                | OpSpec::Dsv4KvAllGather(_)
+                | OpSpec::Dsv4SparseAttention(_)
                 | OpSpec::Mhc(_)
                 | OpSpec::Mamba2(_)
                 | OpSpec::Gdn(_)
@@ -775,7 +858,8 @@ mod tests {
         }
     }
 
-    /// Pin the bincode POSITIONAL variant index of the first and the two last
+    /// Pin the bincode POSITIONAL variant index of the first, historical tail,
+    /// and current terminal `Op` variants.
     /// `Op` variants. bincode encodes an enum as a leading 4-byte LE variant
     /// index, so inserting or removing a variant mid-enum silently reinterprets
     /// every later variant on the wire.
@@ -787,9 +871,11 @@ mod tests {
     fn op_variant_indices_are_pinned() {
         const GEMM_INDEX: u32 = 0;
         // Re-derived after current main's Kda and FpmForward tail variants,
-        // and after retiring the two mid-enum wideEP MoE variants.
+        // retiring the two mid-enum wideEP MoE variants, and appending the
+        // table-free granular DSA/DSV4 variants.
         const MOE_ALL_TO_ALL_INDEX: u32 = 33;
         const MOE_EXPERT_COMPUTE_INDEX: u32 = 34;
+        const DSV4_SPARSE_ATTENTION_INDEX: u32 = 39;
 
         let index_of = |op: &OpSpec| -> u32 {
             let bytes = bincode::serialize(op).expect("serialize op");
@@ -811,12 +897,17 @@ mod tests {
             MOE_EXPERT_COMPUTE_INDEX,
             "MoeExpertCompute index moved"
         );
+        assert_eq!(
+            index_of(&OpSpec::Dsv4SparseAttention(dsv4_sparse_attention())),
+            DSV4_SPARSE_ATTENTION_INDEX,
+            "Dsv4SparseAttention terminal index moved"
+        );
 
-        // The two last variants must stay adjacent and terminal: appending is
-        // the only safe growth direction.
+        // The historical large-EP pair remains adjacent, while new variants
+        // are appended after it. Appending is the only safe growth direction.
         assert_eq!(MOE_EXPERT_COMPUTE_INDEX, MOE_ALL_TO_ALL_INDEX + 1);
         assert_eq!(
-            MOE_EXPERT_COMPUTE_INDEX as usize + 1,
+            DSV4_SPARSE_ATTENTION_INDEX as usize + 1,
             all_op_variants().len(),
             "all_op_variants() must cover exactly the pinned variant count"
         );

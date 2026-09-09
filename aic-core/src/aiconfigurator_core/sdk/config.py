@@ -70,6 +70,13 @@ class ModelConfig:
     # size-only bandwidth selection; ``tp_first`` is an explicit analytical
     # what-if layout and is not a claim about NCCL rank placement.
     communication_placement: str = "independent"
+    # Forward-pass modeling switch. ``op_level`` keeps the granular OpSpec
+    # graph; ``fpm`` uses the whole-model forward-pass operator.
+    forward_model: str = "op_level"
+    # Per-phase large-EP communication backend selected by the enumerator.
+    moe_comm_backend: dict[str, str] | None = None
+    # Physical node width used when resolving large-EP communication paths.
+    num_gpus_per_node: int | None = None
 
     def resolve_moe_parallelism(self) -> tuple[int, int]:
         """Resolve and validate MoE parallelism dimensions in-place.

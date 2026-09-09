@@ -33,7 +33,10 @@ use pyo3::prelude::*;
 use pyo3::sync::GILOnceCell;
 use pyo3::types::PyType;
 
+use crate::common::analytical::{self, AnalyticalConfig};
+use crate::common::enums::{GemmQuantMode, MoeQuantMode};
 use crate::common::error::AicError;
+use crate::common::system_spec::{AnalyticalGpuSpec, GpuSpec, MiscSpec, NodeSpec, SystemSpec};
 use crate::engine::runtime::{
     Engine, PerOpSolValue, PerOpValue, PerOpValueWithMetadata, RuntimeConfig, StaticMode,
     StaticResult, DEFAULT_STATIC_STRIDE,
@@ -45,6 +48,440 @@ use crate::{BackendKind, DataType, EngineConfig, ENGINE_CONFIG_SCHEMA_VERSION};
 #[pyfunction]
 fn _build_smoke() -> u32 {
     ENGINE_CONFIG_SCHEMA_VERSION
+}
+
+fn analytical_system_spec(
+    mem_bw: f64,
+    bfloat16_tc_flops: Option<f64>,
+    fp8_tc_flops: Option<f64>,
+    fp4_tc_flops: Option<f64>,
+    sm_count: Option<u32>,
+    clock_hz: Option<f64>,
+    shared_memory_per_sm_bytes: Option<u64>,
+    l2_capacity_bytes: Option<u64>,
+    l2_bandwidth_bytes_s: Option<f64>,
+    vector_peak_flops: Option<f64>,
+) -> SystemSpec {
+    SystemSpec {
+        data_dir: PathBuf::new(),
+        gpu: GpuSpec {
+            mem_bw,
+            mem_bw_empirical_scaling_factor: 1.0,
+            mem_empirical_constant_latency: 0.0,
+            mem_capacity: None,
+            bfloat16_tc_flops,
+            int8_tc_flops: None,
+            fp8_tc_flops,
+            fp4_tc_flops,
+            power: None,
+            sm_version: None,
+            analytical: AnalyticalGpuSpec {
+                sm_count,
+                clock_hz,
+                shared_memory_per_sm_bytes,
+                l2_capacity_bytes,
+                l2_bandwidth_bytes_s,
+                vector_peak_flops,
+            },
+        },
+        // Analytical GEMM/MoE formulas only use GPU fields. Keep the required
+        // node shape explicit so this helper cannot accidentally grow a hidden
+        // dependency on a YAML file or on the perf database.
+        node: NodeSpec {
+            num_gpus_per_node: 1,
+            inter_node_bw: 1.0,
+            intra_node_bw: 1.0,
+            pcie_bw: None,
+            p2p_latency: 0.0,
+            num_gpus_per_rack: None,
+            inter_rack_bw: None,
+        },
+        misc: MiscSpec {
+            exp_flop_equivalent: 35.0,
+            ..MiscSpec::default()
+        },
+    }
+}
+
+fn analytical_config(level: &str, fp8_gemm_recipe: &str) -> AnalyticalConfig {
+    let extra = [
+        ("analytical_level".to_owned(), level.to_owned()),
+        (
+            "analytical_fp8_gemm_recipe".to_owned(),
+            fp8_gemm_recipe.to_owned(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    AnalyticalConfig::from_extra(&extra)
+}
+
+fn analytical_config_with_attention(
+    level: &str,
+    fp8_gemm_recipe: &str,
+    attention_algorithm: &str,
+) -> AnalyticalConfig {
+    let extra = [
+        ("analytical_level".to_owned(), level.to_owned()),
+        ("analytical_fp8_gemm_recipe".to_owned(), fp8_gemm_recipe.to_owned()),
+        ("analytical_attention_algorithm".to_owned(), attention_algorithm.to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    AnalyticalConfig::from_extra(&extra)
+}
+
+fn gemm_mapping(name: &str) -> Result<crate::common::enums::QuantMapping, AicError> {
+    let mapping = match name {
+        "bfloat16" => GemmQuantMode::Bfloat16.mapping(),
+        "int8_wo" => GemmQuantMode::Int8Wo.mapping(),
+        "int4_wo" => GemmQuantMode::Int4Wo.mapping(),
+        "fp8" => GemmQuantMode::Fp8.mapping(),
+        "fp8_static" => GemmQuantMode::Fp8Static.mapping(),
+        "sq" => GemmQuantMode::Sq.mapping(),
+        "fp8_block" => GemmQuantMode::Fp8Block.mapping(),
+        "fp8_ootb" => GemmQuantMode::Fp8Ootb.mapping(),
+        "nvfp4" => GemmQuantMode::Nvfp4.mapping(),
+        "nvfp4_wo" => GemmQuantMode::Nvfp4Wo.mapping(),
+        "w4a16_nvfp4" => GemmQuantMode::W4a16Nvfp4.mapping(),
+        other => {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "unknown analytical GEMM quant mode {other:?}"
+            )))
+        }
+    };
+    Ok(mapping)
+}
+
+fn moe_mapping(name: &str) -> Result<crate::common::enums::QuantMapping, AicError> {
+    let mapping = match name {
+        "bfloat16" => MoeQuantMode::Bfloat16.mapping(),
+        "int8_wo" => MoeQuantMode::Int8Wo.mapping(),
+        "int4_wo" => MoeQuantMode::Int4Wo.mapping(),
+        "fp8" => MoeQuantMode::Fp8.mapping(),
+        "fp8_block" => MoeQuantMode::Fp8Block.mapping(),
+        "w4afp8" => MoeQuantMode::W4afp8.mapping(),
+        "nvfp4" => MoeQuantMode::Nvfp4.mapping(),
+        "nvfp4_wo" => MoeQuantMode::Nvfp4Wo.mapping(),
+        "w4a16_mxfp4" => MoeQuantMode::W4a16Mxfp4.mapping(),
+        "w4a8_mxfp4_mxfp8" => MoeQuantMode::W4a8Mxfp4Mxfp8.mapping(),
+        "w4a8_mxfp4_mxfp8_trtllm" => MoeQuantMode::W4a8Mxfp4Mxfp8Trtllm.mapping(),
+        "w4a16_mxfp4_cutlass" => MoeQuantMode::W4a16Mxfp4Cutlass.mapping(),
+        "w4a16_nvfp4" => MoeQuantMode::W4a16Nvfp4.mapping(),
+        other => {
+            return Err(AicError::InvalidEngineConfig(format!(
+                "unknown analytical MoE quant mode {other:?}"
+            )))
+        }
+    };
+    Ok(mapping)
+}
+
+/// Rust owner for the table-free analytical GEMM model. The Python SDK only
+/// normalizes enum/config names and passes primitive hardware fields here.
+#[pyfunction]
+#[pyo3(signature = (m, n, k, quant_mode, mem_bw, bfloat16_tc_flops=None, fp8_tc_flops=None, fp4_tc_flops=None, level="standard", fp8_gemm_recipe="sglang"))]
+#[allow(clippy::too_many_arguments)]
+fn analytical_gemm_latency_ms(
+    m: u32,
+    n: u32,
+    k: u32,
+    quant_mode: &str,
+    mem_bw: f64,
+    bfloat16_tc_flops: Option<f64>,
+    fp8_tc_flops: Option<f64>,
+    fp4_tc_flops: Option<f64>,
+    level: &str,
+    fp8_gemm_recipe: &str,
+) -> PyResult<f64> {
+    let spec = analytical_system_spec(mem_bw, bfloat16_tc_flops, fp8_tc_flops, fp4_tc_flops, None, None, None, None, None, None);
+    analytical::gemm_latency_ms(
+        &spec,
+        &analytical_config(level, fp8_gemm_recipe),
+        gemm_mapping(quant_mode).map_err(aic_to_py)?,
+        m,
+        n,
+        k,
+    )
+    .map_err(aic_to_py)
+}
+
+/// Rust owner for the table-free analytical MoE model. This deliberately
+/// mirrors the same quantization and hardware axes as the compiled engine.
+#[pyfunction]
+#[pyo3(signature = (num_tokens, hidden_size, inter_size, topk, num_experts, moe_tp_size, moe_ep_size, quant_mode, mem_bw, bfloat16_tc_flops=None, fp8_tc_flops=None, fp4_tc_flops=None, level="standard"))]
+#[allow(clippy::too_many_arguments)]
+fn analytical_moe_latency_ms(
+    num_tokens: u32,
+    hidden_size: u32,
+    inter_size: u32,
+    topk: u32,
+    num_experts: u32,
+    moe_tp_size: u32,
+    moe_ep_size: u32,
+    quant_mode: &str,
+    mem_bw: f64,
+    bfloat16_tc_flops: Option<f64>,
+    fp8_tc_flops: Option<f64>,
+    fp4_tc_flops: Option<f64>,
+    level: &str,
+) -> PyResult<f64> {
+    let spec = analytical_system_spec(mem_bw, bfloat16_tc_flops, fp8_tc_flops, fp4_tc_flops, None, None, None, None, None, None);
+    analytical::moe_latency_ms(
+        &spec,
+        &analytical_config(level, "sglang"),
+        moe_mapping(quant_mode).map_err(aic_to_py)?,
+        num_tokens,
+        hidden_size,
+        inter_size,
+        topk,
+        num_experts,
+        moe_tp_size,
+        moe_ep_size,
+        true,
+    )
+    .map_err(aic_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (batch, query_length, kv_length, query_heads, kv_heads, head_dim, dtype, mem_bw, bfloat16_tc_flops=None, fp8_tc_flops=None, sm_count=None, clock_hz=None, shared_memory_per_sm_bytes=None, l2_capacity_bytes=None, l2_bandwidth_bytes_s=None, vector_peak_flops=None, causal=true, value_head_dim=None, kv_storage_dim=None, kv_cache_bytes_per_token=None, include_kv_cache_update=true, level="standard", attention_algorithm="fa2"))]
+#[allow(clippy::too_many_arguments)]
+fn analytical_attention_latency_ms(
+    batch: u32,
+    query_length: u32,
+    kv_length: u32,
+    query_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    dtype: &str,
+    mem_bw: f64,
+    bfloat16_tc_flops: Option<f64>,
+    fp8_tc_flops: Option<f64>,
+    sm_count: Option<u32>,
+    clock_hz: Option<f64>,
+    shared_memory_per_sm_bytes: Option<u64>,
+    l2_capacity_bytes: Option<u64>,
+    l2_bandwidth_bytes_s: Option<f64>,
+    vector_peak_flops: Option<f64>,
+    causal: bool,
+    value_head_dim: Option<u32>,
+    kv_storage_dim: Option<u32>,
+    kv_cache_bytes_per_token: Option<f64>,
+    include_kv_cache_update: bool,
+    level: &str,
+    attention_algorithm: &str,
+) -> PyResult<f64> {
+    let spec = analytical_system_spec(
+        mem_bw, bfloat16_tc_flops, fp8_tc_flops, None, sm_count, clock_hz,
+        shared_memory_per_sm_bytes, l2_capacity_bytes, l2_bandwidth_bytes_s, vector_peak_flops,
+    );
+    analytical::attention_model_latency_ms(
+        &spec,
+        &analytical_config_with_attention(level, "sglang", attention_algorithm),
+        batch,
+        query_length,
+        kv_length,
+        query_heads,
+        kv_heads,
+        head_dim,
+        value_head_dim.unwrap_or(head_dim),
+        kv_storage_dim.unwrap_or(head_dim + value_head_dim.unwrap_or(head_dim)),
+        dtype,
+        causal,
+        kv_cache_bytes_per_token,
+        include_kv_cache_update,
+    )
+    .map_err(aic_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (phase, batch, query_length, sequence_length, local_heads, dtype, mem_bw, bfloat16_tc_flops=None, fp8_tc_flops=None, sm_count=None, clock_hz=None, shared_memory_per_sm_bytes=None, l2_capacity_bytes=None, l2_bandwidth_bytes_s=None, vector_peak_flops=None, level="standard", attention_algorithm="fa2"))]
+#[allow(clippy::too_many_arguments)]
+fn analytical_mla_latency_ms(
+    phase: &str,
+    batch: u32,
+    query_length: u32,
+    sequence_length: u32,
+    local_heads: u32,
+    dtype: &str,
+    mem_bw: f64,
+    bfloat16_tc_flops: Option<f64>,
+    fp8_tc_flops: Option<f64>,
+    sm_count: Option<u32>,
+    clock_hz: Option<f64>,
+    shared_memory_per_sm_bytes: Option<u64>,
+    l2_capacity_bytes: Option<u64>,
+    l2_bandwidth_bytes_s: Option<f64>,
+    vector_peak_flops: Option<f64>,
+    level: &str,
+    attention_algorithm: &str,
+) -> PyResult<f64> {
+    let spec = analytical_system_spec(
+        mem_bw, bfloat16_tc_flops, fp8_tc_flops, None, sm_count, clock_hz,
+        shared_memory_per_sm_bytes, l2_capacity_bytes, l2_bandwidth_bytes_s, vector_peak_flops,
+    );
+    analytical::mla_model_latency_ms(
+        &spec,
+        &analytical_config_with_attention(level, "sglang", attention_algorithm),
+        phase,
+        batch,
+        query_length,
+        sequence_length,
+        local_heads,
+        dtype,
+    )
+    .map_err(aic_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (num_tokens, num_heads, if_pre, dtype, peak_flops_s, mem_bandwidth_bytes_s, level="standard"))]
+fn analytical_bmm_latency_ms(
+    num_tokens: u32,
+    num_heads: u32,
+    if_pre: bool,
+    dtype: &str,
+    peak_flops_s: f64,
+    mem_bandwidth_bytes_s: f64,
+    level: &str,
+) -> PyResult<f64> {
+    analytical::bmm_model_latency_ms(
+        &analytical_config(level, "sglang"),
+        num_tokens,
+        num_heads,
+        if_pre,
+        dtype,
+        peak_flops_s,
+        mem_bandwidth_bytes_s,
+    )
+    .map_err(aic_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (layout, dtype, batch, query_length, context_length, index_heads, head_dim, sm_count, clock_hz, mem_bw, fp8_tc_flops=None, bfloat16_tc_flops=None, level="standard"))]
+#[allow(clippy::too_many_arguments)]
+fn analytical_index_mqa_latency_ms(
+    layout: &str,
+    dtype: &str,
+    batch: u32,
+    query_length: u32,
+    context_length: u32,
+    index_heads: u32,
+    head_dim: u32,
+    sm_count: u32,
+    clock_hz: f64,
+    mem_bw: f64,
+    fp8_tc_flops: Option<f64>,
+    bfloat16_tc_flops: Option<f64>,
+    level: &str,
+) -> PyResult<f64> {
+    analytical::index_mqa_latency_ms(
+        layout,
+        dtype,
+        batch,
+        query_length,
+        context_length,
+        index_heads,
+        head_dim,
+        sm_count,
+        clock_hz,
+        fp8_tc_flops,
+        bfloat16_tc_flops,
+        mem_bw,
+        level,
+    )
+    .map_err(aic_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (layout, batch, query_length, context_length, topk, mem_bw, level="standard"))]
+fn analytical_index_topk_latency_ms(
+    layout: &str,
+    batch: u32,
+    query_length: u32,
+    context_length: u32,
+    topk: u32,
+    mem_bw: f64,
+    level: &str,
+) -> PyResult<f64> {
+    analytical::index_topk_latency_ms(layout, batch, query_length, context_length, topk, mem_bw, level)
+        .map_err(aic_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (variant, batch, fresh_tokens, prefix_tokens, topk, compression_ratio, sm_count, level="standard"))]
+fn analytical_dsv4_topk_latency_ms(
+    variant: &str,
+    batch: u32,
+    fresh_tokens: u32,
+    prefix_tokens: u32,
+    topk: u32,
+    compression_ratio: u32,
+    sm_count: u32,
+    level: &str,
+) -> PyResult<f64> {
+    analytical::dsv4_topk_latency_ms(variant, batch, fresh_tokens, prefix_tokens, topk, compression_ratio, sm_count, level)
+        .map_err(aic_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (phase, batch, query_length, context_length, index_heads, head_dim, sm_count, mem_bw, level="standard"))]
+fn analytical_msa_index_latency_ms(
+    phase: &str,
+    batch: u32,
+    query_length: u32,
+    context_length: u32,
+    index_heads: u32,
+    head_dim: u32,
+    sm_count: u32,
+    mem_bw: f64,
+    level: &str,
+) -> PyResult<f64> {
+    analytical::msa_index_latency_ms(phase, batch, query_length, context_length, index_heads, head_dim, sm_count, mem_bw, level)
+        .map_err(aic_to_py)
+}
+
+#[pyfunction]
+#[pyo3(signature = (batch, query_length, selected_pairs, local_heads, qk_latent_dim, value_latent_dim, qk_nope_dim, output_value_dim, mem_bw, bfloat16_tc_flops=None, sm_count=None, clock_hz=None, shared_memory_per_sm_bytes=None, l2_capacity_bytes=None, l2_bandwidth_bytes_s=None, vector_peak_flops=None, level="standard", sparse_attention_head_quantum=None))]
+#[allow(clippy::too_many_arguments)]
+fn analytical_dsa_sparse_attention_latency_ms(
+    batch: u32,
+    query_length: u32,
+    selected_pairs: u64,
+    local_heads: u32,
+    qk_latent_dim: u32,
+    value_latent_dim: u32,
+    qk_nope_dim: u32,
+    output_value_dim: u32,
+    mem_bw: f64,
+    bfloat16_tc_flops: Option<f64>,
+    sm_count: Option<u32>,
+    clock_hz: Option<f64>,
+    shared_memory_per_sm_bytes: Option<u64>,
+    l2_capacity_bytes: Option<u64>,
+    l2_bandwidth_bytes_s: Option<f64>,
+    vector_peak_flops: Option<f64>,
+    level: &str,
+    sparse_attention_head_quantum: Option<u32>,
+) -> PyResult<f64> {
+    let spec = analytical_system_spec(
+        mem_bw, bfloat16_tc_flops, None, None, sm_count, clock_hz,
+        shared_memory_per_sm_bytes, l2_capacity_bytes, l2_bandwidth_bytes_s, vector_peak_flops,
+    );
+    let mut config = analytical_config(level, "sglang");
+    config.sparse_attention_head_quantum = sparse_attention_head_quantum;
+    analytical::dsa_sparse_attention_latency_ms(
+        &spec,
+        &config,
+        batch,
+        query_length,
+        selected_pairs,
+        local_heads,
+        qk_latent_dim,
+        value_latent_dim,
+        qk_nope_dim,
+        output_value_dim,
+    )
+    .map_err(aic_to_py)
 }
 
 /// Cached handles to the canonical SDK exception classes
@@ -1473,6 +1910,16 @@ impl PyForwardPassPerfModel {
 #[pymodule]
 fn _aiconfigurator_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_build_smoke, m)?)?;
+    m.add_function(wrap_pyfunction!(analytical_gemm_latency_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(analytical_moe_latency_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(analytical_attention_latency_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(analytical_mla_latency_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(analytical_bmm_latency_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(analytical_index_mqa_latency_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(analytical_index_topk_latency_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(analytical_dsv4_topk_latency_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(analytical_msa_index_latency_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(analytical_dsa_sparse_attention_latency_ms, m)?)?;
     m.add_function(wrap_pyfunction!(engine_spec_bincode_from_json, m)?)?;
     m.add_function(wrap_pyfunction!(weights_ops_json, m)?)?;
     m.add_function(wrap_pyfunction!(gemm_quant_util_levels, m)?)?;
@@ -1595,6 +2042,7 @@ mod tests {
                 window_size: 0,
                 kv_cache_dtype: KvCacheQuantMode::Fp8,
                 lane_order: crate::operators::attention::b200_vllm_generation_lane_order(),
+                fmha_quant_mode: None,
             }),
         ]
     }

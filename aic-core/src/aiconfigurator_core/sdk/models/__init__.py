@@ -169,7 +169,8 @@ def get_model(
         model_config.cp_style = "none"
 
     model = cls.create(model_info, model_config, backend_name)
-    model.bind_parallel_layout()
+    if forward_model == "fpm":
+        model = _apply_forward_model_fpm(model)
     return model
 
 

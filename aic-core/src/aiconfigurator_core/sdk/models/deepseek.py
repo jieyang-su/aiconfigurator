@@ -591,10 +591,12 @@ class DeepSeekModel(BaseModel):
             ),
             *(
                 [
-                    ops.MLAConcatK(
+                    ops.ElementWise(
                         "context_mla_concat_k",
                         self._num_layers,
-                        self._num_heads // tp_size,
+                        self._num_heads // tp_size * 128 + 64,
+                        self._num_heads // tp_size * 192,
+                        0.8,
                         seq_split=cp,
                     )
                 ]

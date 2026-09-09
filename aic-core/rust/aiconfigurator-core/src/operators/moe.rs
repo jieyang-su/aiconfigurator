@@ -37,6 +37,7 @@
 //! `_moe_data` table only — the wideep/DeepEP tables stay latency-only in
 //! Rust, see the module docs of `perf_database::wideep`).
 
+use crate::common::analytical;
 use crate::common::enums::{DatabaseMode, MoeQuantMode, TransferKind, TransferPolicy};
 use crate::common::error::AicError;
 use crate::common::system_spec::SystemSpec;
@@ -285,6 +286,24 @@ impl MoeOp {
         // SILICON is unchanged; SOL (and the retired SOL_FULL alias) is the
         // pure roofline with `Source::Sol` and zero energy.
         match db.database_mode {
+            DatabaseMode::Analytical => Ok(PerformanceResult::new(
+                analytical::moe_latency_ms(
+                    &db.system_spec,
+                    &db.analytical_config,
+                    self.quant_mode.mapping(),
+                    num_tokens,
+                    self.hidden_size,
+                    self.inter_size,
+                    self.topk,
+                    self.num_experts,
+                    self.moe_tp_size,
+                    self.moe_ep_size,
+                    self.is_gated,
+                )?,
+                Source::Analytical,
+            )
+            .clamp_non_negative()
+            .scaled(self.scale_factor)),
             // Python `_query_moe_table`: `get_sol(num_tokens, hidden_size,
             // inter_size, topk, num_experts, moe_tp_size, moe_ep_size,
             // quant_mode, workload_distribution)[0]` — the distribution never

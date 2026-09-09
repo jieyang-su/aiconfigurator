@@ -57,6 +57,7 @@ pub enum DatabaseMode {
     Silicon,
     Hybrid,
     Empirical,
+    Analytical,
     Sol,
     SolFull,
 }

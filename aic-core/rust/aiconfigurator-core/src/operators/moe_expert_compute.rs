@@ -27,6 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::analytical;
 use crate::common::enums::{DatabaseMode, MoeQuantMode};
 use crate::common::error::AicError;
 use crate::operators::base::{PerformanceResult, Source};
@@ -153,6 +154,32 @@ impl MoeExpertComputeOp {
         // moe_comm.py:1291 — attention DP globalizes tokens through the A2A
         // dispatch.
         let mut tokens = num_tokens.saturating_mul(self.attention_dp_size.max(1));
+        validate_ep_phase(&self.inference_phase)?;
+        if db.database_mode == DatabaseMode::Analytical {
+            if self.enable_eplb
+                && self.inference_phase == "context"
+                && SGLANG_ADAPTED_KERNEL_SOURCES.contains(&"deepep_moe")
+            {
+                tokens = (f64::from(tokens) * 0.8) as u32;
+            }
+            return Ok(PerformanceResult::new(
+                analytical::moe_latency_ms(
+                    &db.system_spec,
+                    &db.analytical_config,
+                    self.quant_mode.mapping(),
+                    tokens,
+                    self.hidden_size,
+                    self.inter_size,
+                    self.topk,
+                    self.num_experts,
+                    1,
+                    self.moe_ep_size,
+                    self.is_gated,
+                )?,
+                Source::Analytical,
+            )
+            .scaled(self.scale_factor));
+        }
         // moe_comm.py:1292-1294.
         let kernel_source = match &self.kernel_source {
             Some(kernel) => kernel.clone(),
@@ -167,7 +194,6 @@ impl MoeExpertComputeOp {
         }
         // moe_comm.py:1195 — validation precedes the mode gate (:1206), so an
         // invalid phase is a ValueError even under SOL/EMPIRICAL.
-        validate_ep_phase(&self.inference_phase)?;
         match db.database_mode {
             DatabaseMode::Silicon | DatabaseMode::Hybrid => {}
             mode => {

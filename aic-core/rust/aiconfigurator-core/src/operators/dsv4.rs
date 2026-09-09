@@ -16,6 +16,7 @@
 //! so the table is collapsed to the last (max) tp measurement at load time. See
 //! `perf_database::dsv4` and Python `load_context_dsv4_kind_module_data`.
 
+use crate::common::analytical;
 use crate::common::enums::{
     DatabaseMode, FmhaQuantMode, GemmQuantMode, KvCacheQuantMode, MoeQuantMode,
 };
@@ -266,6 +267,28 @@ impl Dsv4ModuleOp {
         prefix: u32,
     ) -> Result<PerformanceResult, AicError> {
         match db.database_mode {
+            DatabaseMode::Analytical => {
+                let spec = &db.system_spec;
+                let dims = self.sol_dims();
+                let flops = dsv4_sol_flops(spec, self.gemm_quant_mode, self.fmha_quant_mode)?;
+                Ok(PerformanceResult::new(
+                    dsv4_attention_sol_ms(
+                        spec,
+                        &dims,
+                        self.attn_kind.compress_ratio(),
+                        true,
+                        self.kv_cache_dtype,
+                        self.fmha_quant_mode,
+                        self.gemm_quant_mode,
+                        i64::from(batch_size),
+                        i64::from(s),
+                        i64::from(prefix),
+                        i64::from(self.num_heads),
+                        flops,
+                    ),
+                    Source::Analytical,
+                ))
+            }
             // Python `_query_context_attn_table`: `get_sol()[0]` — the
             // pre-bound `_deepseek_v4_attention_sol(is_context=True, b, s,
             // prefix, ...)` at the op's own shape/quant modes.
@@ -452,6 +475,14 @@ impl Dsv4ModuleOp {
         isl: u32,
         prefix: u32,
     ) -> Result<PerformanceResult, AicError> {
+        if db.database_mode == DatabaseMode::Analytical {
+            // CP sparse MQA/top-k correction tables are measured artifacts.
+            // Analytical mode prices the local DSV4 shape without loading
+            // those auxiliary tables.
+            return self
+                .module_base(db, batch_size, isl, prefix)
+                .map(|r| r.clamp_non_negative().scaled(self.scale_factor));
+        }
         // CP (round-robin sequence split) prefill takes the sparse-CP
         // composition path (Python `ContextDeepSeekV4AttentionModule.query`
         // -> `_query_cp` when `_cp_size > 1`).
@@ -632,6 +663,29 @@ impl Dsv4ModuleOp {
         s: u32,
     ) -> Result<PerformanceResult, AicError> {
         let result = match db.database_mode {
+            DatabaseMode::Analytical => {
+                let spec = &db.system_spec;
+                let dims = self.sol_dims();
+                let fmha = generation_attn_mode(spec, self.kv_cache_dtype);
+                let flops = dsv4_sol_flops(spec, self.gemm_quant_mode, fmha)?;
+                PerformanceResult::new(
+                    dsv4_attention_sol_ms(
+                        spec,
+                        &dims,
+                        self.attn_kind.compress_ratio(),
+                        false,
+                        self.kv_cache_dtype,
+                        fmha,
+                        self.gemm_quant_mode,
+                        i64::from(batch_size),
+                        i64::from(s),
+                        0,
+                        i64::from(self.num_heads),
+                        flops,
+                    ),
+                    Source::Analytical,
+                )
+            }
             // Python `_query_generation_attn_table`: `get_sol()[0]` — the
             // pre-bound `_deepseek_v4_attention_sol(is_context=False, b, s,
             // prefix=0, ...)` with the fmha label rebound from the kv-cache
@@ -847,6 +901,25 @@ impl Dsv4MegaMoeOp {
                      database_mode={mode:?}."
                 )))
             }
+        }
+        if db.database_mode == DatabaseMode::Analytical {
+            return Ok(PerformanceResult::new(
+                analytical::moe_latency_ms(
+                    &db.system_spec,
+                    &db.analytical_config,
+                    self.quant_mode.mapping(),
+                    num_tokens,
+                    self.hidden_size,
+                    self.inter_size,
+                    self.topk,
+                    self.num_experts,
+                    self.moe_tp_size,
+                    self.moe_ep_size,
+                    true,
+                )?,
+                Source::Analytical,
+            )
+            .scaled(self.scale_factor));
         }
         // Python `_normalize_distribution` (op ctor): uniform -> balanced.
         // The Python emitter sends the already-normalized value; re-apply for

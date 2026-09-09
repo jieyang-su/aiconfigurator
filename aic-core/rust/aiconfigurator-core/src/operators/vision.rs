@@ -10,7 +10,7 @@
 //! `VisionEncoderOp` that bundles those pieces — the model layer calls it
 //! once for the encoder phase.
 
-use crate::common::enums::{FmhaQuantMode, GemmQuantMode};
+use crate::common::enums::{DatabaseMode, FmhaQuantMode, GemmQuantMode};
 use crate::common::error::AicError;
 use crate::operators::attention::EncoderAttentionOp;
 use crate::operators::base::{PerformanceResult, Source};
@@ -113,7 +113,12 @@ impl VisionEncoderOp {
 
         let per_layer = total;
         let all_layers = per_layer * self.num_layers as f64;
-        Ok(PerformanceResult::new(all_layers, Source::Silicon)
+        let source = if db.database_mode == DatabaseMode::Analytical {
+            Source::Analytical
+        } else {
+            Source::Silicon
+        };
+        Ok(PerformanceResult::new(all_layers, source)
             .clamp_non_negative()
             .scaled(self.scale_factor))
     }

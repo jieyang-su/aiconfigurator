@@ -209,10 +209,7 @@ class MiniMaxM3Model(BaseModel):
                     0.8,
                 ),
                 _shared_ffn2("context_shared_ffn2_gemm", sparse_layers),
-                _router("context_router_gemm", sparse_layers),
-                _dispatch("context_moe_pre_dispatch", sparse_layers, True),
-                _moe("context_moe", sparse_layers),
-                _dispatch("context_moe_post_dispatch", sparse_layers, False),
+                *_routed_moe_ops("context", sparse_layers),
                 ops.GEMM("context_logits_gemm", 1, self._vocab_size // tp_size, h, common.GEMMQuantMode.bfloat16),
             ]
         )
@@ -267,12 +264,6 @@ class MiniMaxM3Model(BaseModel):
                 0.8,
             ),
             _shared_ffn2("generation_shared_ffn2_gemm", sparse_layers * mtp),
-        ]
-        gen_routed_ops = [
-            _router("generation_router_gemm", sparse_layers * mtp),
-            _dispatch("generation_moe_pre_dispatch", sparse_layers * mtp, True),
-            _moe("generation_moe", sparse_layers * mtp),
-            _dispatch("generation_moe_post_dispatch", sparse_layers * mtp, False),
         ]
         self.generation_ops.append(
             ops.OverlapOp(

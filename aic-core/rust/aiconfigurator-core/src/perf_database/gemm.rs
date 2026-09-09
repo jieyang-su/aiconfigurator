@@ -1263,6 +1263,7 @@ mod tests {
                 fp4_tc_flops: None,
                 power: None,
                 sm_version: None,
+                analytical: Default::default(),
             },
             node: NodeSpec {
                 num_gpus_per_node: 8,

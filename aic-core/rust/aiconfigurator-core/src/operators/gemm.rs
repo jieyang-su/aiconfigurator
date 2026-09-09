@@ -15,6 +15,7 @@
 //! `latency_floor = query_gemm(..., DatabaseMode.SOL)` — not at 0.
 
 use crate::common::enums::{DatabaseMode, GemmQuantMode, TransferKind};
+use crate::common::analytical;
 use crate::common::error::AicError;
 use crate::operators::base::{subtract_sol, PerformanceResult, SolComponents, Source};
 use crate::operators::moe::policy_fingerprint;
@@ -117,7 +118,7 @@ impl GemmOp {
         let mut sol = base.sol;
         let mut latency_floor = 0.0_f64;
 
-        if quant == GemmQuantMode::Fp8Static {
+        if quant == GemmQuantMode::Fp8Static && db.database_mode != DatabaseMode::Analytical {
             // The component sources are irrelevant: the whole fp8_static
             // path is tagged Estimated below regardless of mode. Energy is
             // subtracted alongside latency (Python `GEMM.query`).
@@ -198,6 +199,10 @@ fn query_gemm_table(
         PerformanceResult::with_energy(v.latency, v.energy, Source::Silicon)
     };
     match db.database_mode {
+        DatabaseMode::Analytical => Ok(PerformanceResult::new(
+            analytical::gemm_latency_ms(&db.system_spec, &db.analytical_config, quant.mapping(), m, n, k)?,
+            Source::Analytical,
+        )),
         // Python `_query_gemm_table`: `get_sol(m, n, k, quant_mode)[0]` at the
         // RAW quant mode (not the fp8_static-normalized table quant).
         DatabaseMode::Sol | DatabaseMode::SolFull => {

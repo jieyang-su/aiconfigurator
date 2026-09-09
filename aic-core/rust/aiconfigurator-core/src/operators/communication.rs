@@ -19,6 +19,7 @@
 //!   p2p_latency) * 1000`, with SOL mode dropping the constant latency
 //!   term (like Python's `_query_p2p_table`). No CSV.
 
+use crate::common::analytical;
 use crate::common::enums::{CommQuantMode, DatabaseMode};
 use crate::common::error::AicError;
 use crate::common::system_spec::SystemSpec;
@@ -26,6 +27,19 @@ use crate::operators::base::{PerformanceResult, SolComponents, Source};
 use crate::operators::util_empirical::{self, UtilGrid};
 use crate::perf_database::PerfDatabase;
 use serde::{Deserialize, Serialize};
+
+const PREFER_NCCL_FOR_CUSTOM_ALLREDUCE_ENV: &str = "AIC_PREFER_NCCL_FOR_CUSTOM_ALLREDUCE";
+
+fn parse_truthy_env(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn prefer_nccl_for_custom_allreduce_enabled() -> bool {
+    parse_truthy_env(std::env::var(PREFER_NCCL_FOR_CUSTOM_ALLREDUCE_ENV).ok().as_deref())
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CustomAllReduceOp {
@@ -92,6 +106,22 @@ fn query_custom_allreduce_table(
     tp_size: u32,
     size: f64,
 ) -> Result<PerformanceResult, AicError> {
+    query_custom_allreduce_table_with_preference(
+        db,
+        quant,
+        tp_size,
+        size,
+        prefer_nccl_for_custom_allreduce_enabled(),
+    )
+}
+
+fn query_custom_allreduce_table_with_preference(
+    db: &PerfDatabase,
+    quant: CommQuantMode,
+    tp_size: u32,
+    size: f64,
+    prefer_nccl: bool,
+) -> Result<PerformanceResult, AicError> {
     // GB200 NVL72 reroute — inside get_silicon only (Python
     // `communication.py:188-190`): custom AR is only collected up to tp4
     // there, so (SILICON and HYBRID) queries reroute to the MODE-AWARE
@@ -116,11 +146,28 @@ fn query_custom_allreduce_table(
     // beyond-range bandwidth correction inside), mirroring Python
     // `_query_custom_allreduce_table.get_silicon`.
     let silicon = |db: &PerfDatabase| {
+        if prefer_nccl {
+            // Compatibility path from the Python SDK: when enabled, use the
+            // system-wide NCCL all_reduce curve instead of CustomAllReduce.
+            // Keep this inside the silicon closure so SOL and EMPIRICAL modes
+            // retain their original semantics.
+            return query_nccl_table(db, quant, tp_size, "all_reduce", size);
+        }
         db.communication
             .query_custom_allreduce_scaled(&db.system_spec, quant, tp_size, size)
             .map(|v| PerformanceResult::with_energy(v.latency, v.energy, Source::Silicon))
     };
     match db.database_mode {
+        DatabaseMode::Analytical => Ok(PerformanceResult::new(
+            analytical::communication_latency_ms(
+                &db.system_spec,
+                &db.analytical_config,
+                quant,
+                tp_size,
+                size,
+            )?,
+            Source::Analytical,
+        )),
         // Python `_query_custom_allreduce_table`:
         // `get_sol(quant_mode, tp_size, size)[0]`; the SOL_FULL triple is
         // `(sol_time, 0, 0)` — the ring bound is neither a FLOP nor a
@@ -282,6 +329,17 @@ fn query_nccl_table(
         PerformanceResult::with_energy(v.latency, v.energy, Source::Silicon)
     };
     match db.database_mode {
+        DatabaseMode::Analytical => Ok(PerformanceResult::new(
+            analytical::collective_latency_ms(
+                &db.system_spec,
+                &db.analytical_config,
+                dtype,
+                num_gpus,
+                message_size,
+                operation,
+            )?,
+            Source::Analytical,
+        )),
         // Python `_query_nccl_table`:
         // `get_sol(dtype, num_gpus, operation, message_size)[0]`
         // (unknown collectives yield 0.0, not an error). The SOL_FULL
@@ -434,7 +492,16 @@ impl P2POp {
 
     pub fn query(&self, db: &PerfDatabase, x: u32) -> Result<PerformanceResult, AicError> {
         if self.pp_size <= 1 {
-            return Ok(PerformanceResult::zero());
+            // Python's zero-cost pp=1 shortcut is still a real analytical
+            // answer when the engine is running in ANALYTICAL mode.  Do not
+            // let PerformanceResult::default() report its generic Silicon
+            // provenance for this no-op path.
+            let source = match db.database_mode {
+                DatabaseMode::Analytical => Source::Analytical,
+                DatabaseMode::Sol | DatabaseMode::SolFull => Source::Sol,
+                _ => Source::Empirical,
+            };
+            return Ok(PerformanceResult::new(0.0, source));
         }
         let spec = &db.system_spec;
         let per_rank_tokens = x.div_ceil(self.seq_split.max(1)); // CP: busiest rank
@@ -447,6 +514,14 @@ impl P2POp {
         // The P2P SOL_FULL triple is `(sol_time, 0, sol_time)` — the
         // inter-node bandwidth bound rides in the mem slot.
         let result = match db.database_mode {
+            DatabaseMode::Analytical => PerformanceResult::new(
+                analytical::p2p_latency_ms(
+                    &db.system_spec,
+                    &db.analytical_config,
+                    bytes,
+                )?,
+                Source::Analytical,
+            ),
             DatabaseMode::Sol | DatabaseMode::SolFull => {
                 PerformanceResult::sol(SolComponents::new(0.0, bytes / inter_bw * 1000.0))
             }
@@ -476,6 +551,81 @@ mod tests {
             .join("../..")
             .join("src/aiconfigurator_core/systems");
         PerfDatabase::load(&systems_root, "b200_sxm", "vllm", "0.19.0").expect("db must load")
+    }
+
+    fn h20_sglang_db() -> PerfDatabase {
+        let systems_root = PathBuf::from(REPO_ROOT_HINT)
+            .join("../..")
+            .join("src/aiconfigurator_core/systems");
+        PerfDatabase::load(&systems_root, "h20_sxm", "sglang", "0.5.18")
+            .expect("H20 SGLang 0.5.18 database must load")
+    }
+
+    #[test]
+    fn prefer_nccl_env_values_match_python_switch() {
+        for value in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(parse_truthy_env(Some(value)), "{value:?} should be truthy");
+        }
+        for value in ["", "0", "false", "off", "random"] {
+            assert!(!parse_truthy_env(Some(value)), "{value:?} should be false");
+        }
+        assert!(!parse_truthy_env(None));
+    }
+
+    #[test]
+    fn prefer_nccl_skips_missing_custom_allreduce_table() {
+        let mut db = b200_vllm_db();
+        let systems_root = PathBuf::from(REPO_ROOT_HINT)
+            .join("../..")
+            .join("src/aiconfigurator_core/systems");
+        let temp = tempfile::tempdir().expect("temporary custom-allreduce root");
+        let missing_custom_root = temp.path().join("sglang/0.5.18");
+        let nccl_root = systems_root.join("data/b200_sxm/comm/nccl/2.27.3");
+
+        // Deliberately remove the CustomAllReduce source while keeping the
+        // NCCL table available. The enabled path must never load the former.
+        db.tables_mut().communication = CommunicationTable::new(
+            missing_custom_root,
+            Some(nccl_root),
+            None,
+        );
+        db.database_mode = DatabaseMode::Silicon;
+
+        let result = query_custom_allreduce_table_with_preference(
+            &db,
+            CommQuantMode::Half,
+            8,
+            300_000.0,
+            true,
+        )
+        .expect("NCCL substitute should answer without custom-allreduce data");
+
+        assert!(result.latency_ms.is_finite() && result.latency_ms > 0.0);
+        assert_eq!(result.source, Source::Silicon);
+    }
+
+    #[test]
+    fn h20_family_first_nccl_backfills_custom_allreduce() {
+        let mut db = h20_sglang_db();
+        db.database_mode = DatabaseMode::Silicon;
+
+        // H20's packaged SGLang data has no custom_allreduce_perf.parquet;
+        // the compatibility switch must use the system-wide NCCL table.
+        let result = query_custom_allreduce_table_with_preference(
+            &db,
+            CommQuantMode::Half,
+            8,
+            300_000.0,
+            true,
+        )
+        .expect("H20 NCCL substitute should answer");
+        let nccl = query_nccl_table(&db, CommQuantMode::Half, 8, "all_reduce", 300_000.0)
+            .expect("H20 NCCL table should answer");
+
+        assert!(result.latency_ms.is_finite() && result.latency_ms > 0.0);
+        assert_eq!(result.source, Source::Silicon);
+        assert_eq!(nccl.source, Source::Silicon);
+        assert!((result.latency_ms - nccl.latency_ms).abs() < 1e-12);
     }
 
     /// Oracle values generated from the Python reference on the same data:

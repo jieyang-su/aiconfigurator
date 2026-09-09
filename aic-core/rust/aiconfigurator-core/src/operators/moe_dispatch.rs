@@ -294,7 +294,12 @@ impl MoEDispatchOp {
                     }
                 };
 
-                Ok(PerformanceResult::new(comm_latency_ms, Source::Silicon)
+                let source = if db.database_mode == DatabaseMode::Analytical {
+                    Source::Analytical
+                } else {
+                    Source::Silicon
+                };
+                Ok(PerformanceResult::new(comm_latency_ms, source)
                     .clamp_non_negative()
                     .scaled(self.scale_factor))
             }
@@ -415,7 +420,12 @@ impl MoEDispatchOp {
                     0.0
                 };
 
-                Ok(PerformanceResult::new(comm_latency_ms, Source::Silicon)
+                let source = if db.database_mode == DatabaseMode::Analytical {
+                    Source::Analytical
+                } else {
+                    Source::Silicon
+                };
+                Ok(PerformanceResult::new(comm_latency_ms, source)
                     .clamp_non_negative()
                     .scaled(self.scale_factor))
             }
@@ -582,6 +592,9 @@ fn query_alltoall_table(
     if kernel_source == "NotEnabled" {
         // Python: `source = "sol" if database_mode == SOL else "empirical"`
         // (SOL_FULL's raw tuple collapses to the same 0.0 "sol" result).
+        if db.database_mode == DatabaseMode::Analytical {
+            return Ok(PerformanceResult::new(0.0, Source::Analytical));
+        }
         if matches!(db.database_mode, DatabaseMode::Sol | DatabaseMode::SolFull) {
             return Ok(PerformanceResult::sol(SolComponents::new(0.0, 0.0)));
         }
@@ -620,6 +633,20 @@ fn query_alltoall_table(
         )
     };
     match db.database_mode {
+        DatabaseMode::Analytical => Ok(PerformanceResult::new(
+            alltoall_sol_ms(
+                &db.system_spec,
+                op_name,
+                quant,
+                node_num,
+                num_tokens as f64,
+                hidden_size,
+                topk,
+                num_experts,
+                moe_ep_size,
+            ),
+            Source::Analytical,
+        )),
         // Python `_query_alltoall_table`: `get_sol(num_tokens, hidden_size,
         // topk, num_experts, moe_ep_size, quant_mode, node_num)[0]` — the RAW
         // quant (not the table-normalized one) and the defaulted node_num.

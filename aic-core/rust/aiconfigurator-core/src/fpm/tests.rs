@@ -79,10 +79,11 @@ fn generation_ops() -> Vec<Op> {
             n: 32,
             n_kv: 8,
             head_size: 128,
-            window_size: 0,
-            kv_cache_dtype: KvCacheQuantMode::Fp8,
-            lane_order: crate::operators::attention::b200_vllm_generation_lane_order(),
-        }),
+        window_size: 0,
+        kv_cache_dtype: KvCacheQuantMode::Fp8,
+        lane_order: crate::operators::attention::b200_vllm_generation_lane_order(),
+        fmha_quant_mode: None,
+    }),
     ]
 }
 

@@ -13,7 +13,8 @@
 //! as part of slice selection (silicon inside the perf-DB query, empirical
 //! before grid construction).
 
-use crate::common::enums::{DatabaseMode, FmhaQuantMode, GemmQuantMode, KvCacheQuantMode};
+use crate::common::analytical;
+use crate::common::enums::{ComputeDtype, DatabaseMode, FmhaQuantMode, GemmQuantMode, KvCacheQuantMode};
 use crate::common::error::AicError;
 use crate::operators::base::{PerformanceResult, Source};
 use crate::operators::util_empirical::{self, UtilGrid};
@@ -279,6 +280,26 @@ fn query_context_mla_table(
         ))
     };
     match db.database_mode {
+        DatabaseMode::Analytical => {
+            if fmha_quant.mapping().compute_dtype != Some(ComputeDtype::Bfloat16) {
+                return Err(AicError::InvalidEngineConfig(
+                    "ANALYTICAL MLA supports BF16 compute only; FP8 FMHA is unsupported".into(),
+                ));
+            }
+            Ok(PerformanceResult::new(
+                analytical::mla_model_latency_ms(
+                    &db.system_spec,
+                    &db.analytical_config,
+                    "prefill",
+                    b,
+                    s,
+                    s.saturating_add(prefix),
+                    num_heads,
+                    "bf16",
+                )?,
+                Source::Analytical,
+            ))
+        }
         // Python `_query_context_mla_table`: `get_sol(b, s, prefix, num_heads,
         // kvcache_quant_mode, fmha_quant_mode)[0]` — prefix lives inside the
         // SOL formula, so no prefix correction applies here.
@@ -367,6 +388,21 @@ fn query_generation_mla_table(
         PerformanceResult::with_energy(v.latency, v.energy, Source::Silicon)
     };
     match db.database_mode {
+        DatabaseMode::Analytical => {
+            Ok(PerformanceResult::new(
+                analytical::mla_model_latency_ms(
+                    &db.system_spec,
+                    &db.analytical_config,
+                    "decode",
+                    b,
+                    1,
+                    s.max(1),
+                    num_heads,
+                    "bf16",
+                )?,
+                Source::Analytical,
+            ))
+        }
         // Python `_query_generation_mla_table`: `get_sol(b, s, num_heads,
         // kvcache_quant_mode)[0]` — flops implied by the kv-cache dtype.
         DatabaseMode::Sol | DatabaseMode::SolFull => {
@@ -470,16 +506,30 @@ fn query_mla_bmm_table(
     // Python `_query_mla_bmm_table` dispatches the SOL modes BEFORE the head
     // routing — the SOL is exactly linear in num_heads and touches no table
     // (`get_sol(num_tokens, num_heads, quant_mode, if_pre)[0]`, if_pre unused).
-    if matches!(db.database_mode, DatabaseMode::Sol | DatabaseMode::SolFull) {
+    if matches!(
+        db.database_mode,
+        DatabaseMode::Analytical | DatabaseMode::Sol | DatabaseMode::SolFull
+    ) {
         let spec = &db.system_spec;
+        if db.database_mode == DatabaseMode::Analytical {
+            return Ok(PerformanceResult::new(
+                analytical::bmm_model_latency_ms(
+                    &db.analytical_config,
+                    num_tokens,
+                    num_heads,
+                    is_pre,
+                    "bf16",
+                    spec.gpu.bfloat16_tc_flops.ok_or_else(|| {
+                        AicError::MissingSystemFlops("MLA BMM analytical mode requires bfloat16_tc_flops".into())
+                    })?,
+                    spec.gpu.mem_bw,
+                )?,
+                Source::Analytical,
+            ));
+        }
         let bmm_flops = quant_tc_flops(spec, quant.mapping())?;
-        return Ok(PerformanceResult::sol(mla_bmm_sol(
-            spec,
-            quant,
-            num_heads as f64,
-            num_tokens as f64,
-            bmm_flops,
-        )));
+        let sol = mla_bmm_sol(spec, quant, num_heads as f64, num_tokens as f64, bmm_flops);
+        return Ok(PerformanceResult::sol(sol));
     }
     // Exact-head-first routing with a data-presence fallback: query the
     // exact head slice at scale 1.0 when it has rows, otherwise the
@@ -604,6 +654,21 @@ fn query_context_mla_module_table(
         ))
     };
     match db.database_mode {
+        DatabaseMode::Analytical => {
+            Ok(PerformanceResult::new(
+                analytical::mla_model_latency_ms(
+                    &db.system_spec,
+                    &db.analytical_config,
+                    "prefill",
+                    b,
+                    s,
+                    s.saturating_add(prefix),
+                    num_heads,
+                    "bf16",
+                )?,
+                Source::Analytical,
+            ))
+        }
         // Python `_query_context_mla_module_table`: same SOL model as the
         // op-level context MLA — `get_sol(b, s, prefix, num_heads,
         // kvcache_quant_mode, fmha_quant_mode)[0]` (gemm quant / native heads
@@ -726,6 +791,21 @@ fn query_generation_mla_module_table(
         PerformanceResult::with_energy(v.latency, v.energy, Source::Silicon)
     };
     match db.database_mode {
+        DatabaseMode::Analytical => {
+            Ok(PerformanceResult::new(
+                analytical::mla_model_latency_ms(
+                    &db.system_spec,
+                    &db.analytical_config,
+                    "decode",
+                    b,
+                    1,
+                    s.max(1),
+                    num_heads,
+                    "bf16",
+                )?,
+                Source::Analytical,
+            ))
+        }
         // Python `_query_generation_mla_module_table`: `get_sol(b, s,
         // num_heads, kv_cache_dtype)[0]` — MLA attention SOL plus the BMM
         // pre+post SOL folded into the same math/mem terms before the max.

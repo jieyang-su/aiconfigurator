@@ -90,7 +90,7 @@ def _dsv4_attention_granular_ops(
                 f"{phase}_dsv4_main_compress_store_c{compress_ratio}",
                 scale_factor,
                 compressor_mult * compress_ratio * head_dim,
-                head_dim + common.deepseek_v4_indexer_cache_entry_bytes(head_dim),
+                int(head_dim + common.deepseek_v4_indexer_cache_entry_bytes(head_dim)),
                 0.65,
                 seq_split=seq_split,
             )
@@ -137,7 +137,7 @@ def _dsv4_attention_granular_ops(
                     f"{phase}_dsv4_index_norm_rope_quant",
                     scale_factor,
                     index_n_heads * index_head_dim + 2 * 4 * index_head_dim,
-                    index_n_heads * index_head_dim + common.deepseek_v4_indexer_cache_entry_bytes(index_head_dim),
+                    int(index_n_heads * index_head_dim + common.deepseek_v4_indexer_cache_entry_bytes(index_head_dim)),
                     0.65,
                     seq_split=seq_split,
                 ),
@@ -264,6 +264,7 @@ def _dsv4_attention_with_granular(
     o_groups: int,
     kvcache_quant_mode,
     fmha_quant_mode,
+    architecture: str,
     gemm_quant_mode,
     cp_size: int = 1,
     silicon_compress_ratio: int | None = None,
@@ -288,6 +289,7 @@ def _dsv4_attention_with_granular(
         kvcache_quant_mode=kvcache_quant_mode,
         fmha_quant_mode=fmha_quant_mode,
         gemm_quant_mode=gemm_quant_mode,
+        architecture=architecture,
     )
     if is_context:
         primary_kwargs["cp_size"] = cp_size
@@ -318,10 +320,8 @@ def _dsv4_attention_with_granular(
         fallback=fallback,
         primary_excluded_modes=(common.DatabaseMode.ANALYTICAL,),
     )
-    # FallbackOp delegates scaling to children, but model/SDK callers inspect
-    # this metadata to recover the number of represented layers.
-    wrapper._scale_factor = scale_factor
-    wrapper._gemm_quant_mode = gemm_quant_mode
+    # This model-construction metadata selects the ratio-specific wrapper. It
+    # stays in the Python shell and is not part of the engine latency query.
     wrapper._compress_ratio = compress_ratio
     return wrapper
 
@@ -457,6 +457,7 @@ class DeepSeekV4Model(BaseModel):
                     kvcache_quant_mode=kvcache_quant_mode,
                     fmha_quant_mode=fmha_quant_mode,
                     gemm_quant_mode=gemm_quant_mode,
+                    architecture=self.architecture,
                     cp_size=(cp if is_context else 1),
                     # Keep the historical silicon approximation for pure SWA;
                     # ANALYTICAL always executes the true ratio-0 fallback.

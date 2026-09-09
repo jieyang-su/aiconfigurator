@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import logging
 import os
-import csv
 from collections import defaultdict
 from typing import TYPE_CHECKING, ClassVar
 
@@ -146,34 +145,6 @@ def resolve_op_data_path(system_data_root: str, backend: str, version: str, op_f
             return candidate
     legacy = _resolve_perf_data_path(os.path.join(system_data_root, backend, version, op_filename))
     return legacy
-
-
-def _read_perf_rows(path: str) -> list[dict]:
-    """Read a legacy CSV or packaged Parquet table as row dictionaries."""
-    if path.lower().endswith(".parquet"):
-        import pandas as pd
-
-        return pd.read_parquet(path).to_dict("records")
-    with open(path, newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
-
-
-def _read_filtered_rows(file_or_sources):
-    """Read one table or ordered filtered table sources for operation loaders."""
-    if isinstance(file_or_sources, str):
-        path = _resolve_perf_data_path(file_or_sources)
-        return _read_perf_rows(path) if os.path.exists(path) else None
-    rows: list[dict] = []
-    any_exists = False
-    for path, kernel_source_filter in file_or_sources:
-        path = _resolve_perf_data_path(path)
-        if not os.path.exists(path):
-            continue
-        any_exists = True
-        for row in _read_perf_rows(path):
-            if kernel_source_filter is None or row.get("kernel_source") in kernel_source_filter:
-                rows.append(row)
-    return rows if any_exists else None
 
 
 # The op base class IS the compiled engine's: every engine-backed op family
@@ -375,41 +346,6 @@ class PythonOperation(OpShellKit):
 
     def get_weights(self, **kwargs):
         raise NotImplementedError(f"{type(self).__name__} must define get_weights")
-
-
-class CommunicationDatabaseView:
-    """Read-only database facade carrying communication placement metadata."""
-
-    def __init__(self, database, parallel_layout, communication_group: str | None):
-        self._database = database
-        self._parallel_layout = parallel_layout
-        self._communication_group = communication_group
-
-    def __getattr__(self, name):
-        return getattr(self._database, name)
-
-    def _call(self, name, *args, **kwargs):
-        kwargs.setdefault("parallel_layout", self._parallel_layout)
-        kwargs.setdefault("communication_group", self._communication_group)
-        return getattr(self._database, name)(*args, **kwargs)
-
-    def query_custom_allreduce(self, *args, **kwargs):
-        return self._call("query_custom_allreduce", *args, **kwargs)
-
-    def query_nccl(self, *args, **kwargs):
-        return self._call("query_nccl", *args, **kwargs)
-
-    def query_p2p(self, *args, **kwargs):
-        return self._call("query_p2p", *args, **kwargs)
-
-    def query_wideep_deepep_ll(self, *args, **kwargs):
-        return self._call("query_wideep_deepep_ll", *args, **kwargs)
-
-    def query_wideep_deepep_normal(self, *args, **kwargs):
-        return self._call("query_wideep_deepep_normal", *args, **kwargs)
-
-    def query_trtllm_alltoall(self, *args, **kwargs):
-        return self._call("query_trtllm_alltoall", *args, **kwargs)
 
 
 def _all_operation_subclasses(root: type | None = None) -> set[type]:

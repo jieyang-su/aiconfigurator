@@ -9,6 +9,7 @@
 
 pub mod enums;
 pub mod error;
+pub mod analytical;
 pub mod system_spec;
 
 pub use error::AicError;

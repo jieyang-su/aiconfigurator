@@ -23,6 +23,7 @@ pub mod embedding;
 pub mod fpm_forward;
 pub(crate) mod fpm_sol;
 pub mod gemm;
+pub mod granular;
 pub mod mamba;
 pub mod mhc;
 pub mod mla;
@@ -46,6 +47,10 @@ pub use elementwise::ElementwiseOp;
 pub use embedding::EmbeddingOp;
 pub use fpm_forward::{FpmForwardOp, FpmPhase};
 pub use gemm::GemmOp;
+pub use granular::{
+    DsaIndexScoreOp, DsaSparseAttentionOp, DsaTopKSelectOp, Dsv4KvAllGatherOp,
+    Dsv4SparseAttentionOp,
+};
 pub use mamba::{GdnOp, KdaOp, Mamba2Op};
 pub use mhc::MhcModuleOp;
 pub use mla::{ContextMlaOp, GenerationMlaOp, MlaBmmOp, MlaModuleOp};

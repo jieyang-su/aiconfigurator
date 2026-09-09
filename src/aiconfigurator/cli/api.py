@@ -1693,6 +1693,7 @@ def _run_agg_estimate(
         moe_quant_mode,
         comm_quant_mode,
         forward_model=forward_model,
+        attention_backend=attention_backend,
         enable_encoder_dp=enable_encoder_dp,
         communication_placement=communication_placement,
     )
@@ -1807,6 +1808,8 @@ def _run_static_estimate(
     load_database,
     get_backend,
     get_model,
+    forward_model=None,
+    attention_backend: str | None = None,
     communication_placement: str = "independent",
 ) -> EstimateResult:
     """Run a single-pass static-batching estimation.
@@ -1838,6 +1841,7 @@ def _run_static_estimate(
         moe_quant_mode,
         comm_quant_mode,
         forward_model=forward_model,
+        attention_backend=attention_backend,
         enable_encoder_dp=enable_encoder_dp,
         communication_placement=communication_placement,
     )
@@ -2013,6 +2017,7 @@ def _run_disagg_estimate(
         moe_quant_mode,
         comm_quant_mode,
         forward_model=forward_model,
+        attention_backend=attention_backend,
         enable_encoder_dp=enable_encoder_dp,
         communication_placement=communication_placement,
     )
@@ -2028,6 +2033,7 @@ def _run_disagg_estimate(
         moe_quant_mode,
         comm_quant_mode,
         forward_model=forward_model,
+        attention_backend=attention_backend,
         enable_encoder_dp=enable_encoder_dp,
         communication_placement=communication_placement,
     )
@@ -2368,6 +2374,7 @@ def _run_afd_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        attention_backend=attention_backend,
         communication_placement=communication_placement,
     )
     f_model_config = _build_model_config(
@@ -2381,6 +2388,7 @@ def _run_afd_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        attention_backend=attention_backend,
         communication_placement=communication_placement,
     )
     # Pass speculative decode knobs through to A/F model configs. TODO:

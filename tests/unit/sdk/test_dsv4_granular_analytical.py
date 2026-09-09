@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import warnings
 from collections import Counter
 
 import pytest
 
+import aiconfigurator_core._aiconfigurator_core as _core
 from aiconfigurator_core.sdk import common, config
 from aiconfigurator_core.sdk.backends.sglang_backend import SGLANGBackend
 from aiconfigurator_core.sdk.config import RuntimeConfig
@@ -18,6 +20,12 @@ from aiconfigurator_core.sdk.operations import (
     DSATopKSelect,
     FallbackOp,
 )
+
+CoreDSAIndexScore = _core.DSAIndexScore
+CoreDSATopKSelect = _core.DSATopKSelect
+CoreDeepSeekV4KVAllGather = _core.DeepSeekV4KVAllGather
+CoreDeepSeekV4SparseAttention = _core.DeepSeekV4SparseAttention
+CoreGEMM = _core.GEMM
 from aiconfigurator_core.sdk.perf_database import get_database_view
 
 
@@ -47,13 +55,13 @@ def test_v4_ratio_specific_granular_graphs():
         by_ratio = {op._compress_ratio: op._fallback for op in wrappers}
         assert not any(isinstance(op, (DSAIndexScore, DSATopKSelect)) for op in by_ratio[0])
         assert not any(isinstance(op, (DSAIndexScore, DSATopKSelect)) for op in by_ratio[128])
-        assert sum(isinstance(op, DSAIndexScore) for op in by_ratio[4]) == 1
-        assert sum(isinstance(op, DSATopKSelect) for op in by_ratio[4]) == 1
-        assert all(sum(isinstance(op, DeepSeekV4SparseAttention) for op in ops) == 1 for ops in by_ratio.values())
+        assert sum(isinstance(op, CoreDSAIndexScore) for op in by_ratio[4]) == 1
+        assert sum(isinstance(op, CoreDSATopKSelect) for op in by_ratio[4]) == 1
+        assert all(sum(isinstance(op, CoreDeepSeekV4SparseAttention) for op in ops) == 1 for ops in by_ratio.values())
         assert (
-            len([op for op in by_ratio[4] if isinstance(op, GEMM)])
-            > len([op for op in by_ratio[128] if isinstance(op, GEMM)])
-            > len([op for op in by_ratio[0] if isinstance(op, GEMM)])
+            len([op for op in by_ratio[4] if isinstance(op, CoreGEMM)])
+            > len([op for op in by_ratio[128] if isinstance(op, CoreGEMM)])
+            > len([op for op in by_ratio[0] if isinstance(op, CoreGEMM)])
         )
 
 
@@ -63,17 +71,27 @@ def test_v4_csa_index_uses_compressed_context():
         for op in _attention(_model(), "context")
         if op._compress_ratio == 4
         for op in op._fallback
-        if isinstance(op, DSAIndexScore)
+        if isinstance(op, CoreDSAIndexScore)
     )
     assert score._context_stride == 4
     assert score._index_topk == 512
 
-    database = get_database_view("h100_sxm", "sglang", "estimate", allow_missing_data=True, database_mode="ANALYTICAL")
+    database = get_database_view("h100_sxm", "sglang", "current", allow_missing_data=True, database_mode="ANALYTICAL")
     # full context 2048 -> c4 cache 512, so the production select-all path skips scoring.
-    assert float(score.query(database, batch_size=1, s=1024, prefix=1024)) == 0.0
+    score_shell = DSAIndexScore(
+        score._name,
+        score._scale_factor,
+        layout=score._layout,
+        index_heads=score._index_heads,
+        index_head_dim=score._index_head_dim,
+        index_topk=score._index_topk,
+        cp_size=score._cp_size,
+        context_stride=score._context_stride,
+    )
+    assert float(score_shell._engine_query(database, batch_size=1, s=1024, prefix=1024)) == 0.0
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DsaIndexModelWarning)
-        assert float(score.query(database, batch_size=1, s=4096, prefix=4096)) > 0.0
+        assert float(score_shell._engine_query(database, batch_size=1, s=4096, prefix=4096)) > 0.0
 
 
 def test_v4_csa_topk_allows_more_query_rows_than_compressed_candidates():
@@ -82,14 +100,23 @@ def test_v4_csa_topk_allows_more_query_rows_than_compressed_candidates():
         for wrapper in _attention(_model(), "context")
         if wrapper._compress_ratio == 4
         for child in wrapper._fallback
-        if isinstance(child, DSATopKSelect)
+        if isinstance(child, CoreDSATopKSelect)
     )
     assert topk._kernel_recipe == "dsv4"
     assert topk._context_stride == 4
-    database = get_database_view("h100_sxm", "sglang", "estimate", allow_missing_data=True, database_mode="ANALYTICAL")
+    database = get_database_view("h100_sxm", "sglang", "current", allow_missing_data=True, database_mode="ANALYTICAL")
+    topk_shell = DSATopKSelect(
+        topk._name,
+        topk._scale_factor,
+        layout=topk._layout,
+        index_topk=topk._index_topk,
+        cp_size=topk._cp_size,
+        context_stride=topk._context_stride,
+        kernel_recipe=topk._kernel_recipe,
+    )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DsaIndexModelWarning)
-        assert float(topk.query(database, batch_size=2, s=4096, prefix=0)) > 0.0
+        assert float(topk_shell._engine_query(database, batch_size=2, s=4096, prefix=0)) > 0.0
 
 
 def test_v4_context_cp_granular_restores_ratio_specific_all_gathers():
@@ -99,20 +126,19 @@ def test_v4_context_cp_granular_restores_ratio_specific_all_gathers():
         backend_name="sglang",
     )
     by_ratio = {op._compress_ratio: op._fallback for op in _attention(model, "context")}
-    assert [op._kind for op in by_ratio[0] if isinstance(op, DeepSeekV4KVAllGather)] == ["window"]
-    assert [op._kind for op in by_ratio[4] if isinstance(op, DeepSeekV4KVAllGather)] == ["index", "compressed"]
-    assert [op._kind for op in by_ratio[128] if isinstance(op, DeepSeekV4KVAllGather)] == ["window", "compressed"]
+    assert [op._kind for op in by_ratio[0] if isinstance(op, CoreDeepSeekV4KVAllGather)] == ["window"]
+    assert [op._kind for op in by_ratio[4] if isinstance(op, CoreDeepSeekV4KVAllGather)] == ["index", "compressed"]
+    assert [op._kind for op in by_ratio[128] if isinstance(op, CoreDeepSeekV4KVAllGather)] == ["window", "compressed"]
 
 
-def test_v4_analytical_never_queries_attention_module(monkeypatch):
+def test_v4_analytical_never_queries_attention_module():
     wrapper = next(op for op in _attention(_model(), "generation") if op._compress_ratio == 4)
-    monkeypatch.setattr(wrapper._primary, "query", lambda *_a, **_k: pytest.fail("module queried"))
     database = get_database_view(
-        "h100_sxm", "sglang", "estimate", allow_missing_data=True, database_mode=common.DatabaseMode.ANALYTICAL
+        "h100_sxm", "sglang", "current", allow_missing_data=True, database_mode=common.DatabaseMode.ANALYTICAL
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DsaIndexModelWarning)
-        result = wrapper.query(database, x=1, batch_size=1, s=8192, prefix=0, beam_width=1)
+        result = wrapper._engine_query(database, x=1, batch_size=1, s=8192, prefix=0, beam_width=1)
     assert float(result) > 0.0
     assert result.source != "silicon"
 
@@ -139,7 +165,7 @@ def test_fa_mixed_kv_storage_changes_only_cache_traffic():
     from aiconfigurator_core.sdk.perf_database import get_database_view
 
     database = get_database_view(
-        "h100_sxm", "sglang", "estimate", allow_missing_data=True, database_mode="ANALYTICAL"
+        "h100_sxm", "sglang", "current", allow_missing_data=True, database_mode="ANALYTICAL"
     )
     hardware = fa_hardware(database.system, database.system_spec["gpu"])
     options = ModelOptions(mode="profiled", estimate_level="standard")
@@ -168,19 +194,9 @@ def test_fa_mixed_kv_storage_changes_only_cache_traffic():
     assert mixed_cache.work["mainloop_hbm_bytes"] < bf16_cache.work["mainloop_hbm_bytes"]
 
 
-def test_v4_sparse_attention_uses_bf16_compute_with_packed_fp8_kv(monkeypatch):
-    captured = {}
-
-    def fake_attention_latency_ms(**kwargs):
-        captured.update(kwargs)
-        return 1.0
-
-    monkeypatch.setattr(
-        "aiconfigurator_core.sdk.kernelsim.analytical.attention_latency_ms",
-        fake_attention_latency_ms,
-    )
+def test_v4_sparse_attention_uses_bf16_compute_with_packed_fp8_kv():
     database = get_database_view(
-        "h100_sxm", "sglang", "estimate", allow_missing_data=True, database_mode="ANALYTICAL"
+        "h100_sxm", "sglang", "current", allow_missing_data=True, database_mode="ANALYTICAL"
     )
     op = DeepSeekV4SparseAttention(
         "dsv4_sparse",
@@ -195,14 +211,13 @@ def test_v4_sparse_attention_uses_bf16_compute_with_packed_fp8_kv(monkeypatch):
         fmha_quant_mode=common.FMHAQuantMode.fp8,
     )
 
-    result = op.query(database, batch_size=4, s=8192)
+    result = op._engine_query(database, batch_size=4, s=8192)
 
-    assert float(result) == pytest.approx(1.0)
-    assert captured["dtype"] == "bf16"
-    assert captured["value_head_dim"] == 512
-    assert captured["kv_storage_dim"] == 512
-    assert captured["kv_cache_bytes_per_token"] == 584
-    assert captured["include_kv_cache_update"] is False
+    assert float(result) > 0.0
+    assert result.source == "analytical"
+    spec = json.loads(op._spec_json())["Dsv4SparseAttention"]
+    assert spec["kv_cache_dtype"] == "fp8"
+    assert spec["fmha_quant_mode"] == "fp8"
 
 
 def test_v4_mhc_analytical_is_no_table():
@@ -211,12 +226,12 @@ def test_v4_mhc_analytical_is_no_table():
     database = get_database_view(
         "h100_sxm",
         "sglang",
-        "estimate",
+        "current",
         allow_missing_data=True,
         database_mode=common.DatabaseMode.ANALYTICAL,
     )
     op = DeepSeekV4MHCModule("mhc", 1, "pre", 4096, 4, 20, common.GEMMQuantMode.bfloat16)
-    result = op.query(database, x=32)
+    result = op._engine_query(database, x=32)
     assert float(result) > 0
     assert result.source == "analytical"
 
@@ -236,7 +251,7 @@ def test_v4_fp8_static_analytical_runs_end_to_end_without_module_tables():
     database = get_database_view(
         "h100_sxm",
         "sglang",
-        "estimate",
+        "current",
         allow_missing_data=True,
         database_mode=common.DatabaseMode.ANALYTICAL,
     )

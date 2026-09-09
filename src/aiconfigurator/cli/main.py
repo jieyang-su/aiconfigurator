@@ -340,6 +340,17 @@ def _add_analytical_arguments(parser: argparse.ArgumentParser) -> None:
         )
 
 
+def _add_attention_backend_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the optional attention kernel-lane override shared by CLI modes."""
+    parser.add_argument(
+        "--attention-backend",
+        choices=["fa3", "triton", "trtllm_mha", "flashinfer", "fla", "default"],
+        type=str,
+        default=None,
+        help="Attention kernel lane override. Omit to use the framework and hardware default.",
+    )
+
+
 def _add_default_mode_arguments(parser):
     _add_analytical_arguments(parser)
     parser.add_argument(

@@ -641,6 +641,7 @@ mod tests {
             window_size: 0,
             kv_cache_dtype: KvCacheQuantMode::Fp8,
             lane_order: crate::operators::attention::b200_vllm_generation_lane_order(),
+            fmha_quant_mode: None,
         };
         let (b, sq) = (256.0, 8441.75_f64);
         let kv_len = sq - 1.0;

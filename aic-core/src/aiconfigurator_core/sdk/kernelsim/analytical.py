@@ -9,33 +9,20 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from aiconfigurator_core import (
+    analytical_attention_latency_ms as _rust_analytical_attention_latency_ms,
+    analytical_bmm_latency_ms as _rust_analytical_bmm_latency_ms,
+    analytical_dsa_sparse_attention_latency_ms as _rust_analytical_dsa_sparse_attention_latency_ms,
+    analytical_dsv4_topk_latency_ms as _rust_analytical_dsv4_topk_latency_ms,
+    analytical_gemm_latency_ms as _rust_analytical_gemm_latency_ms,
+    analytical_index_mqa_latency_ms as _rust_analytical_index_mqa_latency_ms,
+    analytical_index_topk_latency_ms as _rust_analytical_index_topk_latency_ms,
+    analytical_mla_latency_ms as _rust_analytical_mla_latency_ms,
+    analytical_msa_index_latency_ms as _rust_analytical_msa_index_latency_ms,
+    analytical_moe_latency_ms as _rust_analytical_moe_latency_ms,
+)
 from aiconfigurator_core.sdk import common
-from aiconfigurator_core.sdk.kernelsim.bmm.model import estimate_mla_bmm
-from aiconfigurator_core.sdk.kernelsim.dsa import (
-    IndexMqaShape,
-    IndexTopKShape,
-    estimate_index_mqa,
-    estimate_index_topk,
-)
-from aiconfigurator_core.sdk.kernelsim.dsv4_topk import Dsv4TopKShape, estimate_dsv4_topk
-from aiconfigurator_core.sdk.kernelsim.fa import (
-    AttentionShape,
-    HardwareSpec,
-    MlaModelOptions,
-    MlaRequest,
-    ModelOptions,
-    estimate_attention,
-    estimate_mla,
-)
-from aiconfigurator_core.sdk.kernelsim.fa.profiles import get_reference_profile
-from aiconfigurator_core.sdk.kernelsim.gemm.model import (
-    estimate_bf16_gemm,
-    estimate_deepgemm_fp8,
-    estimate_sglang_fp8,
-    estimate_w8a16_gemm,
-)
-from aiconfigurator_core.sdk.kernelsim.moe.model import estimate_sglang_moe
-from aiconfigurator_core.sdk.kernelsim.msa import MsaIndexShape, estimate_msa_index
+from aiconfigurator_core.sdk.kernelsim.fa import HardwareSpec
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +30,44 @@ _LEVELS = frozenset({"standard", "low", "high"})
 _FP8_GEMM_RECIPES = frozenset({"sglang", "deepgemm-hopper", "deepgemm-blackwell"})
 _COMMUNICATION_DTYPES = frozenset({"half", "fp8", "int8"})
 _COMMUNICATION_PLACEMENTS = frozenset({"independent", "tp_first"})
+
+
+def fa_hardware(system: str, gpu: dict) -> HardwareSpec:
+    """Compatibility adapter for callers that still inspect FA hardware.
+
+    Production Analytical queries use the Rust model directly. This helper is
+    retained for diagnostics and older tests that compare the legacy Python FA
+    shape model; it does not participate in the operator query path.
+    """
+    required = {
+        "sm_count",
+        "clock_hz",
+        "shared_memory_per_sm_bytes",
+        "l2_capacity_bytes",
+        "l2_bandwidth_bytes_s",
+        "vector_peak_flops",
+        "mem_bw",
+        "bfloat16_tc_flops",
+    }
+    missing = sorted(required - gpu.keys())
+    if missing:
+        raise ValueError(
+            f"FA/MLA analytical hardware details are incomplete for system {system!r}; "
+            f"missing gpu fields: {', '.join(missing)}"
+        )
+    peaks = {"bf16": float(gpu["bfloat16_tc_flops"])}
+    if gpu.get("fp8_tc_flops") is not None:
+        peaks["fp8"] = float(gpu["fp8_tc_flops"])
+    return HardwareSpec(
+        sm_count=int(gpu["sm_count"]),
+        clock_hz=float(gpu["clock_hz"]),
+        shared_memory_per_sm_bytes=int(gpu["shared_memory_per_sm_bytes"]),
+        l2_capacity_bytes=int(gpu["l2_capacity_bytes"]),
+        l2_bandwidth_bytes_s=float(gpu["l2_bandwidth_bytes_s"]),
+        hbm_bandwidth_bytes_s=float(gpu["mem_bw"]),
+        matrix_peak_flops=peaks,
+        vector_peak_flops=float(gpu["vector_peak_flops"]),
+    )
 
 
 @dataclass(frozen=True)
@@ -128,87 +153,24 @@ def warn_backend_compatibility(backend: str) -> None:
         )
 
 
-def fa_hardware(system: str, gpu: dict) -> HardwareSpec:
-    """Build the fine-grained attention hardware model from the system YAML."""
-    required = {
-        "sm_count",
-        "clock_hz",
-        "shared_memory_per_sm_bytes",
-        "l2_capacity_bytes",
-        "l2_bandwidth_bytes_s",
-        "vector_peak_flops",
-        "mem_bw",
-        "bfloat16_tc_flops",
-    }
-    missing = sorted(required - gpu.keys())
-    if missing:
-        raise ValueError(
-            f"FA/MLA analytical hardware details are incomplete for system {system!r}; "
-            f"missing gpu fields: {', '.join(missing)}"
-        )
-    peaks = {}
-    key_map = {
-        "bf16": "bfloat16_tc_flops",
-        "fp16": "bfloat16_tc_flops",
-        "fp8": "fp8_tc_flops",
-        "fp32": "float32_flops",
-    }
-    for dtype, key in key_map.items():
-        if key in gpu:
-            peaks[dtype] = float(gpu[key])
-    return HardwareSpec(
-        sm_count=int(gpu["sm_count"]),
-        clock_hz=float(gpu["clock_hz"]),
-        shared_memory_per_sm_bytes=int(gpu["shared_memory_per_sm_bytes"]),
-        l2_capacity_bytes=int(gpu["l2_capacity_bytes"]),
-        l2_bandwidth_bytes_s=float(gpu["l2_bandwidth_bytes_s"]),
-        hbm_bandwidth_bytes_s=float(gpu["mem_bw"]),
-        matrix_peak_flops=peaks,
-        vector_peak_flops=float(gpu["vector_peak_flops"]),
-    )
-
-
 def gemm_latency_ms(m: int, n: int, k: int, quant_mode, gpu: dict, config: AnalyticalConfig) -> float:
-    if quant_mode == common.GEMMQuantMode.bfloat16:
-        result = estimate_bf16_gemm(m, n, k, gpu["bfloat16_tc_flops"], gpu["mem_bw"], parameter_level=config.level)
-    elif quant_mode == common.GEMMQuantMode.int8_wo:
-        result = estimate_w8a16_gemm(
-            m,
-            n,
-            k,
-            gpu["bfloat16_tc_flops"],
-            gpu["mem_bw"],
-            parameter_level=config.level,
-        )
-    elif quant_mode in {
-        common.GEMMQuantMode.fp8,
-        common.GEMMQuantMode.fp8_static,
-        common.GEMMQuantMode.fp8_block,
-        common.GEMMQuantMode.fp8_ootb,
-    }:
-        try:
-            peak = gpu["fp8_tc_flops"]
-        except KeyError as error:
-            raise ValueError("FP8 analytical GEMM requires gpu.fp8_tc_flops") from error
-        if config.fp8_gemm_recipe == "sglang":
-            result = estimate_sglang_fp8(m, n, k, peak, gpu["mem_bw"], parameter_level=config.level)
-        else:
-            architecture = config.fp8_gemm_recipe.removeprefix("deepgemm-")
-            result = estimate_deepgemm_fp8(
-                m,
-                n,
-                k,
-                peak,
-                gpu["mem_bw"],
-                architecture,
-                parameter_level=config.level,
-            )
-    else:
+    if not isinstance(quant_mode, common.GEMMQuantMode):
         raise ValueError(
-            f"ANALYTICAL GEMM does not support quant mode {quant_mode.name!r}; "
+            f"ANALYTICAL GEMM does not support quant mode {getattr(quant_mode, 'name', quant_mode)!r}; "
             "supported modes are BF16, W8A16, and FP8 variants"
         )
-    return result.latency_us / 1000.0
+    return _rust_analytical_gemm_latency_ms(
+        int(m),
+        int(n),
+        int(k),
+        quant_mode.name,
+        float(gpu["mem_bw"]),
+        gpu.get("bfloat16_tc_flops"),
+        gpu.get("fp8_tc_flops"),
+        gpu.get("fp4_tc_flops"),
+        config.level,
+        config.fp8_gemm_recipe,
+    )
 
 
 def attention_latency_ms(
@@ -229,30 +191,14 @@ def attention_latency_ms(
     kv_cache_bytes_per_token: float | None = None,
     include_kv_cache_update: bool = True,
 ) -> float:
-    result = estimate_attention(
-        fa_hardware(system, gpu),
-        AttentionShape(
-            batch_size=batch,
-            query_length=query_length,
-            kv_length_total=kv_length,
-            query_heads=query_heads,
-            kv_heads=kv_heads,
-            head_dim=head_dim,
-            dtype=dtype,
-            causal=causal,
-            value_head_dim=value_head_dim,
-            kv_storage_dim=kv_storage_dim,
-            kv_cache_bytes_per_token=kv_cache_bytes_per_token,
-        ),
-        ModelOptions(
-            algorithm=config.attention_algorithm,
-            mode="profiled",
-            estimate_level=config.level,
-            assume_query_tile_l2_reuse=True,
-            include_kv_cache_update=include_kv_cache_update,
-        ),
+    return _rust_analytical_attention_latency_ms(
+        int(batch), int(query_length), int(kv_length), int(query_heads), int(kv_heads), int(head_dim), dtype,
+        float(gpu["mem_bw"]), gpu.get("bfloat16_tc_flops"), gpu.get("fp8_tc_flops"),
+        gpu.get("sm_count"), gpu.get("clock_hz"), gpu.get("shared_memory_per_sm_bytes"),
+        gpu.get("l2_capacity_bytes"), gpu.get("l2_bandwidth_bytes_s"), gpu.get("vector_peak_flops"),
+        bool(causal), value_head_dim, kv_storage_dim, kv_cache_bytes_per_token,
+        bool(include_kv_cache_update), config.level, config.attention_algorithm,
     )
-    return result.latency_us / 1000.0
 
 
 def mla_latency_ms(
@@ -267,22 +213,13 @@ def mla_latency_ms(
     dtype: str,
     config: AnalyticalConfig,
 ) -> float:
-    result = estimate_mla(
-        fa_hardware(system, gpu),
-        MlaRequest(
-            phase=phase,
-            batch_size=batch,
-            local_query_heads=local_heads,
-            sequence_length=sequence_length,
-            query_length=query_length,
-            dtype=dtype,
-        ),
-        MlaModelOptions(
-            algorithm=config.attention_algorithm,
-            estimate_level=config.level,
-        ),
+    return _rust_analytical_mla_latency_ms(
+        phase, int(batch), int(query_length), int(sequence_length), int(local_heads), dtype,
+        float(gpu["mem_bw"]), gpu.get("bfloat16_tc_flops"), gpu.get("fp8_tc_flops"),
+        gpu.get("sm_count"), gpu.get("clock_hz"), gpu.get("shared_memory_per_sm_bytes"),
+        gpu.get("l2_capacity_bytes"), gpu.get("l2_bandwidth_bytes_s"), gpu.get("vector_peak_flops"),
+        config.level, config.attention_algorithm,
     )
-    return result.latency_us / 1000.0
 
 
 def bmm_latency_ms(
@@ -295,16 +232,10 @@ def bmm_latency_ms(
     mem_bandwidth_bytes_s: float,
     config: AnalyticalConfig,
 ) -> float:
-    result = estimate_mla_bmm(
-        num_tokens,
-        num_heads,
-        "pre" if if_pre else "post",
-        dtype,
-        peak_flops_s,
-        mem_bandwidth_bytes_s,
-        parameter_level=config.level,
+    return _rust_analytical_bmm_latency_ms(
+        int(num_tokens), int(num_heads), bool(if_pre), dtype, float(peak_flops_s),
+        float(mem_bandwidth_bytes_s), config.level,
     )
-    return result.latency_us / 1000.0
 
 
 def index_mqa_latency_ms(
@@ -317,41 +248,20 @@ def index_mqa_latency_ms(
     index_heads: int,
     index_head_dim: int,
     config: AnalyticalConfig,
+    dtype: str | None = None,
 ) -> float:
     required = {"sm_count", "clock_hz", "mem_bw"}
     missing = sorted(required - gpu.keys())
     if missing:
         raise ValueError(f"DSA Index MQA analytical hardware fields missing: {', '.join(missing)}")
-    if "fp8_tc_flops" in gpu:
-        dtype = "fp8"
-        fp8_peak = float(gpu["fp8_tc_flops"])
-        bf16_peak = None
-    else:
-        if "bfloat16_tc_flops" not in gpu:
-            raise ValueError(
-                "DSA Index MQA analytical hardware fields missing: fp8_tc_flops or bfloat16_tc_flops"
-            )
-        dtype = "bf16"
-        fp8_peak = None
-        bf16_peak = float(gpu["bfloat16_tc_flops"])
-    result = estimate_index_mqa(
-        IndexMqaShape(
-            layout=layout,
-            batch_size=batch,
-            query_length=query_length,
-            context_length=context_length,
-            index_heads=index_heads,
-            head_dim=index_head_dim,
-            dtype=dtype,
-        ),
-        sm_count=int(gpu["sm_count"]),
-        clock_hz=float(gpu["clock_hz"]),
-        fp8_peak_flops_s=fp8_peak,
-        bf16_peak_flops_s=bf16_peak,
-        hbm_bandwidth_bytes_s=float(gpu["mem_bw"]),
-        parameter_level=config.level,
+    effective_dtype = (dtype or ("fp8" if gpu.get("fp8_tc_flops") is not None else "bf16")).strip().lower()
+    if effective_dtype == "bf16" and gpu.get("bfloat16_tc_flops") is None:
+        raise ValueError("DSA Index MQA analytical hardware fields missing: fp8_tc_flops or bfloat16_tc_flops")
+    return _rust_analytical_index_mqa_latency_ms(
+        layout, effective_dtype, int(batch), int(query_length), int(context_length), int(index_heads), int(index_head_dim),
+        int(gpu["sm_count"]), float(gpu["clock_hz"]), float(gpu["mem_bw"]),
+        gpu.get("fp8_tc_flops"), gpu.get("bfloat16_tc_flops"), config.level,
     )
-    return result.latency_us / 1000.0
 
 
 def index_topk_latency_ms(
@@ -364,22 +274,10 @@ def index_topk_latency_ms(
     index_topk: int,
     config: AnalyticalConfig,
 ) -> float:
-    result = estimate_index_topk(
-        IndexTopKShape(
-            layout=layout,
-            batch_size=batch,
-            query_length=query_length,
-            context_length=context_length,
-            topk=index_topk,
-            variant="fused",
-            # Production DSA consumes the natural score emitted by Index MQA.
-            # flat/top_last are collector diagnostics, not serving defaults.
-            score_distribution="natural",
-        ),
-        hbm_bandwidth_bytes_s=float(gpu["mem_bw"]),
-        parameter_level=config.level,
+    return _rust_analytical_index_topk_latency_ms(
+        layout, int(batch), int(query_length), int(context_length), int(index_topk),
+        float(gpu["mem_bw"]), config.level,
     )
-    return result.latency_us / 1000.0
 
 
 def dsv4_topk_latency_ms(
@@ -393,19 +291,10 @@ def dsv4_topk_latency_ms(
     compression_ratio: int,
     config: AnalyticalConfig,
 ) -> float:
-    result = estimate_dsv4_topk(
-        Dsv4TopKShape(
-            variant=variant,
-            batch_size=batch,
-            fresh_tokens=fresh_tokens,
-            prefix_tokens=prefix_tokens,
-            topk=index_topk,
-            compression_ratio=compression_ratio,
-        ),
-        sm_count=int(gpu["sm_count"]),
-        parameter_level=config.level,
+    return _rust_analytical_dsv4_topk_latency_ms(
+        variant, int(batch), int(fresh_tokens), int(prefix_tokens), int(index_topk),
+        int(compression_ratio), int(gpu["sm_count"]), config.level,
     )
-    return result.latency_us / 1000.0
 
 
 def msa_index_latency_ms(
@@ -424,13 +313,10 @@ def msa_index_latency_ms(
     missing = sorted(required - gpu.keys())
     if missing:
         raise ValueError(f"MSA index analytical hardware fields missing: {', '.join(missing)}")
-    result = estimate_msa_index(
-        MsaIndexShape(phase, batch, query_length, context_length, index_heads, index_head_dim),
-        sm_count=int(gpu["sm_count"]),
-        hbm_bandwidth_bytes_s=float(gpu["mem_bw"]),
-        parameter_level=config.level,
+    return _rust_analytical_msa_index_latency_ms(
+        phase, int(batch), int(query_length), int(context_length), int(index_heads), int(index_head_dim),
+        int(gpu["sm_count"]), float(gpu["mem_bw"]), config.level,
     )
-    return result.latency_us / 1000.0
 
 
 def msa_topk_elementwise_latency_ms(
@@ -470,27 +356,14 @@ def dsa_sparse_attention_latency_ms(
     Random gather, backend fusion and split scheduling remain uncalibrated; this
     is a granular no-table fallback, not a claim of FlashMLA kernel parity.
     """
-    profile = get_reference_profile(config.level)
-    peak_key = "bfloat16_tc_flops"
-    if peak_key not in gpu:
-        raise ValueError(f"DSA sparse attention analytical model requires gpu.{peak_key}")
-    tokens = batch * query_length
-    executed_heads = config.sparse_attention_executed_heads(local_heads)
-    attention_flops = 2.0 * selected_pairs * executed_heads * (qk_latent_dim + value_latent_dim)
-    absorption_flops = 2.0 * tokens * executed_heads * value_latent_dim * (qk_nope_dim + output_value_dim)
-    flops = attention_flops + absorption_flops
-    # One latent KV stream is shared by all query heads. Use average selected
-    # rows per query for the unique-cache lower bound and retain output traffic.
-    average_selected = selected_pairs / max(1, tokens)
-    logical_bytes = (
-        tokens * executed_heads * qk_latent_dim * 2
-        + batch * average_selected * qk_latent_dim * 2
-        + tokens * executed_heads * value_latent_dim * 2
-        + executed_heads * value_latent_dim * (qk_nope_dim + output_value_dim) * 2
+    return _rust_analytical_dsa_sparse_attention_latency_ms(
+        int(batch), int(query_length), int(selected_pairs), int(local_heads), int(qk_latent_dim),
+        int(value_latent_dim), int(qk_nope_dim), int(output_value_dim), float(gpu["mem_bw"]),
+        gpu.get("bfloat16_tc_flops"), gpu.get("sm_count"), gpu.get("clock_hz"),
+        gpu.get("shared_memory_per_sm_bytes"), gpu.get("l2_capacity_bytes"),
+        gpu.get("l2_bandwidth_bytes_s"), gpu.get("vector_peak_flops"), config.level,
+        config.sparse_attention_head_quantum,
     )
-    compute_ms = flops / (float(gpu[peak_key]) * profile.compute_efficiency) * 1000
-    memory_ms = logical_bytes / (float(gpu["mem_bw"]) * profile.hbm_efficiency) * 1000
-    return profile.fixed_overhead_us / 1000 + max(compute_ms, memory_ms)
 
 
 def moe_latency_ms(
@@ -506,47 +379,22 @@ def moe_latency_ms(
     gpu: dict,
     config: AnalyticalConfig,
 ) -> float:
-    recipe_map = {
-        "bfloat16": "bf16_triton",
-        "int8_wo": "w8a16_int8wo_bf16_transfer",
-        "fp8": "fp8_block_triton",
-        "fp8_block": "fp8_block_triton",
-        "nvfp4": "nvfp4_cutedsl",
-        # Provisional scheme-1 support: retain BF16 execution efficiencies and
-        # compute peak while reducing only MXFP4 weight traffic. The model emits
-        # a one-time low-confidence warning; no dedicated W4A16 fit is used.
-        "w4a16_mxfp4": "w4a16_mxfp4_bf16_transfer",
-        "w4a16_mxfp4_cutlass": "w4a16_mxfp4_bf16_transfer",
-        # Kimi-K3's routed experts use W4A8 MXFP4/MXFP8.  The archived
-        # no-GPU MoE model has no separate MXFP4 fit; its NVFP4 CuTeDSL
-        # contract is the closest calibrated low-bit weight recipe.
-        "w4a8_mxfp4_mxfp8": "nvfp4_cutedsl",
-        "w4a8_mxfp4_mxfp8_trtllm": "nvfp4_cutedsl",
-    }
-    try:
-        recipe = recipe_map[quant_mode.name]
-    except KeyError as error:
-        raise ValueError(f"ANALYTICAL MoE does not support quant mode {quant_mode.name!r}") from error
-    peak_key = {
-        "bf16_triton": "bfloat16_tc_flops",
-        "w8a16_int8wo_bf16_transfer": "bfloat16_tc_flops",
-        "fp8_block_triton": "fp8_tc_flops",
-        "w4a16_mxfp4_bf16_transfer": "bfloat16_tc_flops",
-        "nvfp4_cutedsl": "fp4_tc_flops",
-    }[recipe]
-    if peak_key not in gpu:
-        raise ValueError(f"ANALYTICAL MoE recipe {recipe!r} requires gpu.{peak_key}")
-    result = estimate_sglang_moe(
-        recipe,
-        num_tokens,
-        hidden_size,
-        inter_size,
-        topk,
-        num_experts,
-        moe_tp_size,
-        moe_ep_size,
-        gpu[peak_key],
-        gpu["mem_bw"],
-        parameter_level=config.level,
+    if not isinstance(quant_mode, common.MoEQuantMode):
+        raise ValueError(
+            f"ANALYTICAL MoE does not support quant mode {getattr(quant_mode, 'name', quant_mode)!r}"
+        )
+    return _rust_analytical_moe_latency_ms(
+        int(num_tokens),
+        int(hidden_size),
+        int(inter_size),
+        int(topk),
+        int(num_experts),
+        int(moe_tp_size),
+        int(moe_ep_size),
+        quant_mode.name,
+        float(gpu["mem_bw"]),
+        gpu.get("bfloat16_tc_flops"),
+        gpu.get("fp8_tc_flops"),
+        gpu.get("fp4_tc_flops"),
+        config.level,
     )
-    return result.latency_us / 1000.0

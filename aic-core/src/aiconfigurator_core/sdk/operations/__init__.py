@@ -44,13 +44,13 @@ from aiconfigurator_core.sdk.operations.dsv4 import (
 )
 from aiconfigurator_core.sdk.operations.elementwise import ElementWise
 from aiconfigurator_core.sdk.operations.embedding import Embedding
+from aiconfigurator_core.sdk.operations.fpm_forward import FPMForwardOp
 from aiconfigurator_core.sdk.operations.gemm import GEMM, ContextKVBProjGEMM
-from aiconfigurator_core.sdk.operations.mamba import GDNKernel, KDAKernel, Mamba2, Mamba2Kernel
+from aiconfigurator_core.sdk.operations.mamba import GDNKernel, KDAKernel, Mamba2Kernel
 from aiconfigurator_core.sdk.operations.mla import (
     ContextMLA,
     GenerationMLA,
     MLABmm,
-    MLAConcatK,
     MLAModule,
     WideEPContextMLA,
     WideEPGenerationMLA,
@@ -100,7 +100,6 @@ __all__ = [
     "GenerationMSAModule",
     "KDAKernel",
     "MLABmm",
-    "MLAConcatK",
     "MLAModule",
     "Mamba2Kernel",
     "MoE",

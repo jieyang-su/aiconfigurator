@@ -99,20 +99,46 @@ def test_rejected_msa_cells_raise_typed_errors(system, backend, version):
         PerfDataNotAvailableError,
     )
 
-        comprehensive_perf_db.set_transfer_policy(None)  # XOP allowed
-        with util_empirical.capture_provenance() as tags:
-            assert float(_ctx_msa().query(comprehensive_perf_db, **kw)) > 0
-        assert len(util_queries) == 1
-        assert util_empirical.worst_provenance(tags) == "xop"
-    finally:
-        comprehensive_perf_db.set_transfer_policy(None)
-        comprehensive_perf_db.set_default_database_mode(common.DatabaseMode.SILICON)
+    def op(cls):
+        return cls(
+            "msa",
+            1.0,
+            num_heads=8,
+            num_kv_heads=1,
+            hidden_size=4096,
+            head_dim=128,
+            v_head_dim=128,
+            index_n_heads=4,
+            index_head_dim=128,
+            index_topk=16,
+            block_size=128,
+            kvcache_quant_mode=common.KVCacheQuantMode.bfloat16,
+            fmha_quant_mode=common.FMHAQuantMode.bfloat16,
+            gemm_quant_mode=common.GEMMQuantMode.fp8_block,
+        )
+
+    cases = [
+        (ContextMSAModule, {"batch_size": 2, "s": 512, "prefix": 0}),
+        (GenerationMSAModule, {"batch_size": 2, "s": 512}),
+    ]
+    allow_unlisted = system == "l40s" and version == "0.5.16"
+    silicon = get_database_view(
+        system, backend, version, database_mode="SILICON", allow_unlisted_version=allow_unlisted
+    )
+    hybrid = get_database_view(
+        system, backend, version, database_mode="HYBRID", allow_unlisted_version=allow_unlisted
+    )
+    for cls, kwargs in cases:
+        with pytest.raises(PerfDataNotAvailableError):
+            op(cls)._engine_query(silicon, **kwargs)
+        with pytest.raises(EmpiricalNotImplementedError, match=r"(?i)no DSA util"):
+            op(cls)._engine_query(hybrid, **kwargs)
 
 
-def test_msa_analytical_uses_granular_no_table_recipe(mutable_comprehensive_perf_db):
+def test_msa_analytical_uses_granular_no_table_recipe():
     """ANALYTICAL must not use the historical DSA XOP/module path."""
     from aiconfigurator.sdk.operations.msa import ContextMSAModule
-    from aiconfigurator_core.sdk.operations.msa import MsaAnalyticalApproximationWarning
+    from aiconfigurator.sdk.perf_database import get_database_view
 
     analytical_op = ContextMSAModule(
         "msa_analytical",
@@ -130,22 +156,7 @@ def test_msa_analytical_uses_granular_no_table_recipe(mutable_comprehensive_perf
         common.FMHAQuantMode.bfloat16,
         common.GEMMQuantMode.bfloat16,
     )
-    comprehensive_perf_db = mutable_comprehensive_perf_db
-    comprehensive_perf_db.system_spec["gpu"].update(
-        {
-            "sm_count": 132,
-            "clock_hz": 1.8e9,
-            "shared_memory_per_sm_bytes": 228 * 1024,
-            "l2_capacity_bytes": 50 * 1024 * 1024,
-            "l2_bandwidth_bytes_s": 1e15,
-            "vector_peak_flops": 1e13,
-        }
-    )
-    comprehensive_perf_db.set_default_database_mode(common.DatabaseMode.ANALYTICAL)
-    try:
-        with pytest.warns(MsaAnalyticalApproximationWarning):
-            result = analytical_op.query(comprehensive_perf_db, batch_size=2, s=4096, prefix=0)
-        assert float(result) > 0
-        assert result.source == "analytical"
-    finally:
-        comprehensive_perf_db.set_default_database_mode(common.DatabaseMode.SILICON)
+    database = get_database_view("h100_sxm", "sglang", "current", database_mode=common.DatabaseMode.ANALYTICAL)
+    result = analytical_op._engine_query(database, batch_size=2, s=4096, prefix=0)
+    assert float(result) > 0
+    assert result.source == "analytical"

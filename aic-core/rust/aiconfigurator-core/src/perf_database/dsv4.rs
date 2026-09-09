@@ -1126,7 +1126,7 @@ pub(crate) fn dsv4_sol_flops(
 
 /// Python `PerfDatabase._causal_limited_pairs`: sum over queries of
 /// `min(prefix + query_index + 1, limit)`, times batch.
-fn causal_limited_pairs(batch: i128, query_len: i128, prefix: i128, limit: i128) -> i128 {
+pub(crate) fn causal_limited_pairs(batch: i128, query_len: i128, prefix: i128, limit: i128) -> i128 {
     if limit <= 0 || query_len <= 0 {
         return 0;
     }
@@ -1153,7 +1153,7 @@ fn sum_floor_upto(n: i128, divisor: i128) -> i128 {
 }
 
 /// Python `PerfDatabase._compressed_context_pairs`.
-fn compressed_context_pairs(
+pub(crate) fn compressed_context_pairs(
     batch: i128,
     query_len: i128,
     prefix: i128,

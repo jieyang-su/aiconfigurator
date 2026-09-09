@@ -39,23 +39,6 @@ EXEMPT: dict[str, str] = {
     "AFDCombine": "AFD orchestration is Python-side; op-list FFI planned",
     "AFDFAllGather": "AFD orchestration is Python-side; op-list FFI planned",
     "AFDFReduceScatter": "AFD orchestration is Python-side; op-list FFI planned",
-    # Prefix-aware MLA granular helpers have no equivalent shape adjustment
-    # or memory recipe in the compiled engine yet. They remain on the Python
-    # fallback until that semantic contract is ported, rather than silently
-    # dropping cached-token work in Rust.
-    "ContextKVBProjGEMM": "prefix-aware GEMM token correction is Python-only",
-    "MLAConcatK": "prefix-aware MLA K assembly recipe is Python-only",
-    # Provisional sparse-attention KernelSim operations are intentionally
-    # Python-only. ANALYTICAL mode routes to Python before graph conversion;
-    # Silicon module paths may retain these as granular fallbacks.
-    "DSAIndexScore": "provisional Analytical KernelSim operation is Python-only",
-    "DSATopKSelect": "provisional Analytical KernelSim operation is Python-only",
-    "DSASparseAttention": "provisional Analytical KernelSim operation is Python-only",
-    "DeepSeekV4KVAllGather": "V4 granular CP communication recipe is Python-only",
-    "DeepSeekV4SparseAttention": "provisional Analytical KernelSim operation is Python-only",
-    # Dead class: no model instantiates it (Mamba2Kernel is the live op and
-    # converts). Remove the class or this entry together.
-    "Mamba2": "dead code — never instantiated; Mamba2Kernel is the live op",
 }
 
 # Python-side classes with an explicit adapter branch in

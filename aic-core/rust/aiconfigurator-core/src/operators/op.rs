@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::common::error::AicError;
 use crate::operators::{
     ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaModuleOp, Dsv4MegaMoeOp, Dsv4ModuleOp,
-    ElementwiseOp, EmbeddingOp, EncoderAttentionOp, FpmForwardOp, GdnOp, GemmOp,
+    DsaIndexScoreOp, DsaSparseAttentionOp, DsaTopKSelectOp, Dsv4KvAllGatherOp,
+    Dsv4SparseAttentionOp, ElementwiseOp, EmbeddingOp, EncoderAttentionOp, FpmForwardOp, GdnOp, GemmOp,
     GenerationAttentionOp, GenerationMlaOp, KdaOp, Mamba2Op, MhcModuleOp, MlaBmmOp, MlaModuleOp,
     MoEDispatchOp, MoeAllToAllOp, MoeExpertComputeOp, MoeOp, MsaModuleOp, NcclOp, P2POp,
     PerformanceResult, Source, VisionEncoderOp, WideEpContextMlaOp, WideEpGenerationMlaOp,
@@ -172,6 +173,13 @@ pub enum Op {
     /// the op's `inference_phase` field selects the slice.
     /// Measured-SILICON-only; see `operators/moe_expert_compute.rs`.
     MoeExpertCompute(MoeExpertComputeOp),
+    /// Table-free granular DSA/DSV4 operations used by analytical fallback
+    /// graphs. Appended to preserve the positional bincode schema.
+    DsaIndexScore(DsaIndexScoreOp),
+    DsaTopKSelect(DsaTopKSelectOp),
+    DsaSparseAttention(DsaSparseAttentionOp),
+    Dsv4KvAllGather(Dsv4KvAllGatherOp),
+    Dsv4SparseAttention(Dsv4SparseAttentionOp),
 }
 
 /// Inline-defined here (rather than a sibling module under `operators/`)
@@ -201,6 +209,15 @@ pub struct FallbackOp {
     /// file / missing data point), the fallback chain is used instead.
     pub primary: Box<Op>,
     pub fallback: Vec<Op>,
+    /// If true, the primary is only eligible for measured SILICON/HYBRID
+    /// queries. The theoretical modes use the granular fallback sequence.
+    #[serde(default)]
+    pub silicon_primary_only: bool,
+    /// Database modes for which the primary must be skipped even when it is
+    /// otherwise eligible. This carries Python FallbackOp's
+    /// `primary_excluded_modes` across the engine wire.
+    #[serde(default)]
+    pub primary_excluded_modes: Vec<crate::common::enums::DatabaseMode>,
 }
 
 impl FallbackOp {
@@ -209,6 +226,8 @@ impl FallbackOp {
             name: name.into(),
             primary: Box::new(primary),
             fallback,
+            silicon_primary_only: false,
+            primary_excluded_modes: Vec::new(),
         }
     }
 }
@@ -270,7 +289,12 @@ impl Op {
             | Op::Kda(_)
             | Op::WideEpContextMla(_)
             | Op::WideEpGenerationMla(_)
-            | Op::MoeAllToAll(_) => 0.0,
+            | Op::MoeAllToAll(_)
+            | Op::DsaIndexScore(_)
+            | Op::DsaTopKSelect(_)
+            | Op::DsaSparseAttention(_)
+            | Op::Dsv4KvAllGather(_)
+            | Op::Dsv4SparseAttention(_) => 0.0,
         }
     }
 
@@ -314,6 +338,11 @@ impl Op {
             Op::Kda(o) => &o.name,
             Op::MoeAllToAll(o) => &o.name,
             Op::MoeExpertCompute(o) => &o.name,
+            Op::DsaIndexScore(o) => &o.name,
+            Op::DsaTopKSelect(o) => &o.name,
+            Op::DsaSparseAttention(o) => &o.name,
+            Op::Dsv4KvAllGather(o) => &o.name,
+            Op::Dsv4SparseAttention(o) => &o.name,
         }
     }
 
@@ -357,6 +386,11 @@ impl Op {
             Op::Kda(o) => o.name = name,
             Op::MoeAllToAll(o) => o.name = name,
             Op::MoeExpertCompute(o) => o.name = name,
+            Op::DsaIndexScore(o) => o.name = name,
+            Op::DsaTopKSelect(o) => o.name = name,
+            Op::DsaSparseAttention(o) => o.name = name,
+            Op::Dsv4KvAllGather(o) => o.name = name,
+            Op::Dsv4SparseAttention(o) => o.name = name,
         }
     }
 
@@ -498,19 +532,32 @@ impl Op {
                 // fall to the granular fallback chain, not be hybrid-
                 // estimated at module level. The fallback ops then run
                 // against the ORIGINAL (hybrid) database.
-                let silicon_db;
-                let primary_db: &PerfDatabase =
-                    if db.database_mode == crate::common::enums::DatabaseMode::Hybrid {
-                        silicon_db = db.silicon_view();
-                        &silicon_db
-                    } else {
-                        db
-                    };
-                match op.primary.query(primary_db, ctx) {
+                let mode = db.database_mode;
+                let primary_allowed = (!op.silicon_primary_only
+                    || matches!(
+                        mode,
+                        crate::common::enums::DatabaseMode::Silicon
+                            | crate::common::enums::DatabaseMode::Hybrid
+                    ))
+                    && !op.primary_excluded_modes.contains(&mode);
+                let primary_result = if primary_allowed {
+                    let silicon_db;
+                    let primary_db: &PerfDatabase =
+                        if mode == crate::common::enums::DatabaseMode::Hybrid {
+                            silicon_db = db.silicon_view();
+                            &silicon_db
+                        } else {
+                            db
+                        };
+                    Some(op.primary.query(primary_db, ctx))
+                } else {
+                    None
+                };
+                match primary_result {
                     // Primary result passes through verbatim — its energy
                     // rides along (Python returns `self._primary.query(...)`).
-                    Ok(r) => Ok(r),
-                    Err(AicError::PerfDatabase(_)) | Err(AicError::Io { .. }) => {
+                    Some(Ok(r)) => Ok(r),
+                    None | Some(Err(AicError::PerfDatabase(_))) | Some(Err(AicError::Io { .. })) => {
                         // Fallback chain: Python sums PerformanceResults
                         // from a zero/empirical seed (`total =
                         // PerformanceResult(0.0, energy=0.0,
@@ -533,7 +580,7 @@ impl Op {
                         .with_moe_comm_fallbacks(total.moe_comm_fallbacks)
                         .clamp_non_negative())
                     }
-                    Err(other) => Err(other),
+                    Some(Err(other)) => Err(other),
                 }
             }
             // Rank-LOCAL token count, like Moe/MoeDispatch (Python passes the
@@ -550,6 +597,11 @@ impl Op {
             // each `query`, exactly where Python does it.
             Op::MoeAllToAll(op) => op.query(db, ctx.num_tokens),
             Op::MoeExpertCompute(op) => op.query(db, ctx.num_tokens),
+            Op::DsaIndexScore(op) => op.query(db, ctx.batch_size, ctx.s, ctx.prefix),
+            Op::DsaTopKSelect(op) => op.query(db, ctx.batch_size, ctx.s, ctx.prefix),
+            Op::DsaSparseAttention(op) => op.query(db, ctx.batch_size, ctx.s, ctx.prefix),
+            Op::Dsv4KvAllGather(op) => op.query(db, ctx.batch_size, ctx.s),
+            Op::Dsv4SparseAttention(op) => op.query(db, ctx.batch_size, ctx.s, ctx.prefix),
         }
     }
 }

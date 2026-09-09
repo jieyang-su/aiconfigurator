@@ -88,6 +88,11 @@ impl FpmForwardOp {
         db: &PerfDatabase,
         ctx: &RuntimeContext,
     ) -> Result<PerformanceResult, AicError> {
+        if db.database_mode == crate::common::enums::DatabaseMode::Analytical {
+            return Err(AicError::SolNotImplemented(
+                "forward_model='fpm' requires collected whole-model FPM data; use forward_model='op_level' for table-free Analytical evaluation".into(),
+            ));
+        }
         let batch_size = ctx.batch_size;
         let s = ctx.s;
         if batch_size < 1 || s < 1 {
@@ -129,6 +134,11 @@ impl FpmForwardOp {
         db: &PerfDatabase,
         coords: &[f64],
     ) -> Result<PerformanceResult, AicError> {
+        if db.database_mode == crate::common::enums::DatabaseMode::Analytical {
+            return Err(AicError::SolNotImplemented(
+                "forward_model='fpm' requires collected whole-model FPM data; use forward_model='op_level' for table-free Analytical evaluation".into(),
+            ));
+        }
         let expected = match self.phase {
             FpmPhase::Prefill => 3,
             FpmPhase::Decode => 2,
@@ -155,6 +165,11 @@ impl FpmForwardOp {
         db: &PerfDatabase,
         batch_size: u32,
     ) -> Result<PerformanceResult, AicError> {
+        if db.database_mode == crate::common::enums::DatabaseMode::Analytical {
+            return Err(AicError::SolNotImplemented(
+                "forward_model='fpm' requires collected whole-model FPM data; use forward_model='op_level' for table-free Analytical evaluation".into(),
+            ));
+        }
         if self.phase != FpmPhase::Decode {
             return Err(data_err(format!(
                 "query_pass_baseline is decode-only, called on phase {:?}",

@@ -20,6 +20,7 @@
 //!   plus the cross-head_size (XSHAPE) transfer ladder
 
 use crate::common::enums::{DatabaseMode, FmhaQuantMode, KvCacheQuantMode, TransferKind};
+use crate::common::analytical;
 use crate::common::error::AicError;
 use crate::common::system_spec::SystemSpec;
 use crate::operators::base::{PerformanceResult, SolComponents, Source};
@@ -49,6 +50,15 @@ pub(crate) fn mem_op_latency_ms(spec: &SystemSpec, mem_bytes: f64) -> f64 {
 /// other mode shares the empirical formula tagged `Source::Empirical`.
 pub(crate) fn query_mem_op(db: &PerfDatabase, mem_bytes: f64) -> PerformanceResult {
     match db.database_mode {
+        DatabaseMode::Analytical => PerformanceResult::new(
+            analytical::memory_latency_ms(
+                &db.system_spec,
+                &db.analytical_config,
+                mem_bytes,
+            )
+            .unwrap_or(0.0),
+            Source::Analytical,
+        ),
         // Pure memory bound: SOL components are `(math=0, mem=sol_time)`.
         DatabaseMode::Sol | DatabaseMode::SolFull => PerformanceResult::sol(SolComponents::new(
             0.0,
@@ -318,6 +328,11 @@ pub struct GenerationAttentionOp {
     /// bincode payloads are positional, current ENGINE_SPEC_SCHEMA_VERSION 15).
     #[serde(default = "default_lane_order")]
     pub lane_order: Vec<String>,
+    /// Optional FMHA compute precision used by the Analytical path. Silicon
+    /// generation tables remain keyed by KV-cache dtype and therefore keep
+    /// the historical KV-derived precision when this is absent.
+    #[serde(default)]
+    pub fmha_quant_mode: Option<FmhaQuantMode>,
 }
 
 impl GenerationAttentionOp {
@@ -337,6 +352,7 @@ impl GenerationAttentionOp {
             window_size: 0,
             kv_cache_dtype,
             lane_order: default_lane_order(),
+            fmha_quant_mode: None,
         }
     }
 
@@ -357,6 +373,7 @@ impl GenerationAttentionOp {
             self.head_size,
             self.window_size,
             self.kv_cache_dtype,
+            self.fmha_quant_mode,
         )?;
         if gen_seq_imbalance_correction_scale != 1.0 {
             // Python `result * scale` scales latency AND energy.
@@ -485,6 +502,37 @@ fn query_context_attention_table(
         ))
     };
     match db.database_mode {
+        DatabaseMode::Analytical => {
+            if s == 0 {
+                return Ok(PerformanceResult::new(0.0, Source::Analytical));
+            }
+            let full_s = s.saturating_add(prefix);
+            let kv_len = s.max(if window_size > 0 {
+                full_s.min(window_size)
+            } else {
+                full_s
+            });
+            let dtype = analytical::dtype_name(fmha_quant.mapping())?;
+            Ok(PerformanceResult::new(
+                analytical::attention_model_latency_ms(
+                    &db.system_spec,
+                    &db.analytical_config,
+                    b,
+                    s,
+                    kv_len,
+                    n,
+                    n_kv,
+                    head_size,
+                    head_size,
+                    head_size.saturating_mul(2),
+                    dtype,
+                    true,
+                    Some(2.0 * f64::from(head_size) * kv_quant.mapping().memory),
+                    true,
+                )?,
+                Source::Analytical,
+            ))
+        }
         // Python `_query_context_attention_table`: `get_sol(b, s, prefix, n,
         // n_kv, head_size, window_size, kvcache_quant_mode, fmha_quant_mode)[0]`
         // at the REAL n_kv (no MHA sentinel).
@@ -796,11 +844,40 @@ fn query_generation_attention_table(
     head_size: u32,
     window_size: u32,
     kv_quant: KvCacheQuantMode,
+    fmha_quant: Option<FmhaQuantMode>,
 ) -> Result<PerformanceResult, AicError> {
     let silicon = |v: crate::perf_database::perf_interp::LeafValue| {
         PerformanceResult::with_energy(v.latency, v.energy, Source::Silicon)
     };
     match db.database_mode {
+        DatabaseMode::Analytical => {
+            let kv_len = if window_size > 0 { s.min(window_size) } else { s };
+            let effective_fmha =
+                fmha_quant.unwrap_or_else(|| crate::perf_database::attention::generation_attn_mode(
+                    &db.system_spec,
+                    kv_quant,
+                ));
+            let dtype = analytical::dtype_name(effective_fmha.mapping())?;
+            Ok(PerformanceResult::new(
+                analytical::attention_model_latency_ms(
+                    &db.system_spec,
+                    &db.analytical_config,
+                    b,
+                    1,
+                    kv_len.max(1),
+                    n,
+                    n_kv,
+                    head_size,
+                    head_size,
+                    head_size.saturating_mul(2),
+                    dtype,
+                    true,
+                    Some(2.0 * f64::from(head_size) * kv_quant.mapping().memory),
+                    true,
+                )?,
+                Source::Analytical,
+            ))
+        }
         // Python `_query_generation_attention_table`: `get_sol(b, s, n, n_kv,
         // head_size, window_size, kvcache_quant_mode)[0]` — the FMHA flops are
         // implied by the kv-cache dtype (`generation_attn_flops`). Passing the
@@ -1083,6 +1160,28 @@ fn query_encoder_attention_table(
         PerformanceResult::with_energy(v.latency, v.energy, Source::Silicon)
     };
     match db.database_mode {
+        DatabaseMode::Analytical => {
+            let dtype = analytical::dtype_name(fmha_quant.mapping())?;
+            Ok(PerformanceResult::new(
+            analytical::attention_model_latency_ms(
+                &db.system_spec,
+                &db.analytical_config,
+                b,
+                s,
+                s,
+                n,
+                n,
+                head_size,
+                head_size,
+                head_size.saturating_mul(2),
+                dtype,
+                false,
+                None,
+                false,
+            )?,
+            Source::Analytical,
+        ))
+        }
         // Python `_query_encoder_attention_table`:
         // `get_sol(b, s, n, head_size, fmha_quant_mode)[0]`.
         DatabaseMode::Sol | DatabaseMode::SolFull => {
@@ -1487,6 +1586,7 @@ mod tests {
                 hs,
                 w,
                 kv,
+                None,
             )
             .expect("empirical query");
             assert!(result.latency_ms.is_finite() && result.latency_ms > 0.0);
@@ -1650,6 +1750,7 @@ mod tests {
             192,
             0,
             KvCacheQuantMode::Fp8,
+            None,
         );
         assert!(
             matches!(gen, Err(AicError::EmpiricalNotImplemented(_))),
@@ -1986,6 +2087,7 @@ mod tests {
                 hs,
                 0,
                 KvCacheQuantMode::Bfloat16,
+                None,
             )
             .expect("empirical query");
             (result, db.worst_provenance())

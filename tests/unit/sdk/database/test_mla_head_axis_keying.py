@@ -166,7 +166,9 @@ def test_context_mla_module_view_keys_by_native_then_local(tmp_path):
     by_native = data[fmha][kv][gemm]
     assert set(by_native.keys()) == {128}
     assert set(by_native[128].keys()) == {16, 128}
-    assert by_native[128][16][0][2048][4]["latency"] == pytest.approx(1.6)
+    # Context module tables are keyed by total sequence length. Prefix is a
+    # runtime correction applied by the Rust operator, not a stored axis.
+    assert by_native[128][16][2048][4]["latency"] == pytest.approx(1.6)
 
 
 def test_generation_mla_module_view_keys_by_native_then_local(tmp_path):
@@ -196,24 +198,25 @@ def test_module_aliases_collapse_into_one_native_bucket(tmp_path):
     gemm = next(iter(data[fmha][kv]))
     by_native = data[fmha][kv][gemm]
     assert set(by_native.keys()) == {128}
-    assert by_native[128][16][0][1024][1]["latency"] == pytest.approx(0.4)
+    assert by_native[128][16][1024][1]["latency"] == pytest.approx(0.4)
 
 
-def test_context_module_loader_preserves_prefix_axis(tmp_path):
+def test_context_module_view_preserves_total_sequence_axis(tmp_path):
     rows = [
         _module_row(num_heads=16, bs=2, isl=64, step=0, lat=0.1),
-        _module_row(num_heads=16, bs=2, isl=64, step=128, lat=0.3),
+        _module_row(num_heads=16, bs=2, isl=128, step=0, lat=0.3),
     ]
-    path = _write_csv(tmp_path / "ctx_prefix.txt", _MODULE_HEADER, rows)
-    data = load_context_mla_module_data(path)
+    data = _module_view(tmp_path, "mla_context_module_perf.parquet", "_context_mla_module_data", rows)
     fmha = next(iter(data))
     kv = next(iter(data[fmha]))
     gemm = next(iter(data[fmha][kv]))
-    by_prefix = data[fmha][kv][gemm][128][16]
+    by_sequence = data[fmha][kv][gemm][128][16]
 
-    assert set(by_prefix) == {0, 128}
-    assert by_prefix[0][64][2]["latency"] == pytest.approx(0.1)
-    assert by_prefix[128][64][2]["latency"] == pytest.approx(0.3)
+    # ``step`` is provenance for context rows and is intentionally not a
+    # stored prefix dimension; only ``isl`` is part of the module grid.
+    assert set(by_sequence) == {64, 128}
+    assert by_sequence[64][2]["latency"] == pytest.approx(0.1)
+    assert by_sequence[128][2]["latency"] == pytest.approx(0.3)
 
 
 def test_mla_module_view_rejects_unpinned_model(tmp_path):

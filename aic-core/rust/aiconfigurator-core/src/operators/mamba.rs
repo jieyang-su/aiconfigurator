@@ -6,6 +6,8 @@
 //!
 //! Each wraps `db.state_space.query_*` with `scale_factor` + `clamp`.
 
+use crate::common::analytical;
+use crate::common::enums::DatabaseMode;
 use crate::common::error::AicError;
 use crate::operators::base::{PerformanceResult, Source};
 use crate::perf_database::PerfDatabase;
@@ -36,6 +38,16 @@ impl Mamba2Op {
         batch_size: u32,
         seq_len: u32,
     ) -> Result<PerformanceResult, AicError> {
+        if db.database_mode == DatabaseMode::Analytical {
+            let sol = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
+            let bytes = sol / 1000.0 * db.system_spec.gpu.mem_bw.max(1.0);
+            return Ok(PerformanceResult::new(
+                analytical::memory_latency_ms(&db.system_spec, &db.analytical_config, bytes)?,
+                Source::Analytical,
+            )
+            .clamp_non_negative()
+            .scaled(self.scale_factor));
+        }
         // Mirrors Python `Mamba2Kernel.query`: silicon-first, SOL fallback
         // on perf-DB miss. The op's arg-style SOL is threaded into the table
         // query so the perf_interp engine can util-hold beyond-range queries
@@ -145,6 +157,16 @@ impl GdnOp {
         batch_size: u32,
         seq_len: u32,
     ) -> Result<PerformanceResult, AicError> {
+        if db.database_mode == DatabaseMode::Analytical {
+            let sol = self.sol_latency_ms(db, batch_size as f64, seq_len as f64);
+            let bytes = sol / 1000.0 * db.system_spec.gpu.mem_bw.max(1.0);
+            return Ok(PerformanceResult::new(
+                analytical::memory_latency_ms(&db.system_spec, &db.analytical_config, bytes)?,
+                Source::Analytical,
+            )
+            .clamp_non_negative()
+            .scaled(self.scale_factor));
+        }
         // Mirrors Python `GDNKernel.query`: try the silicon table; on a
         // `PerfDataNotAvailableError`-class miss (the perf DB doesn't ship
         // every kernel/phase slice), fall back to a per-kernel SOL formula.
@@ -286,6 +308,21 @@ impl KdaOp {
         // Verify batching is normalized ONCE here — both the table lookup and
         // the SOL fallback see the adjusted `(batch, seq)` coordinates.
         let (batch_size, seq_len) = self.effective_coords(batch_size, seq_len);
+        if db.database_mode == DatabaseMode::Analytical {
+            let sol = self.sol_latency_ms_with(
+                db,
+                &self.kernel_source,
+                batch_size as f64,
+                seq_len as f64,
+            );
+            let bytes = sol / 1000.0 * db.system_spec.gpu.mem_bw.max(1.0);
+            return Ok(PerformanceResult::new(
+                analytical::memory_latency_ms(&db.system_spec, &db.analytical_config, bytes)?,
+                Source::Analytical,
+            )
+            .clamp_non_negative()
+            .scaled(self.scale_factor));
+        }
         // SM100 sglang datasets verify DSPARK speculation through the fused
         // CuTeDSL kernel (`fused_kda_decode_mtp_dspark`) — one row covering
         // BOTH the conv update and the chain-verify recurrence, with no

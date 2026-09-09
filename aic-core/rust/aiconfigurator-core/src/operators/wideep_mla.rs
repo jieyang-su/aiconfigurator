@@ -636,6 +636,24 @@ fn query_wideep_context_mla_table(
         Ok(raw * prefix_correction(full_s, prefix))
     };
     match db.database_mode {
+        DatabaseMode::Analytical => {
+            let spec = &db.system_spec;
+            let main_flops = quant_tc_flops(spec, fmha_quant.mapping())?;
+            let bf16_flops = quant_tc_flops(spec, FmhaQuantMode::Bfloat16.mapping())?;
+            Ok((
+                wideep_context_mla_sol_ms(
+                    spec,
+                    fmha_quant,
+                    num_heads as f64,
+                    s as f64,
+                    prefix as f64,
+                    b as f64,
+                    main_flops,
+                    bf16_flops,
+                ),
+                Source::Analytical,
+            ))
+        }
         // Python `_query_wideep_context_mla_table`: `get_sol(b, s, prefix,
         // tp_size, kvcache_quant_mode, fmha_quant_mode)[0]` — the kv quant is
         // unused inside the formula; the caller's fmha label is used as-is.
@@ -783,6 +801,24 @@ fn query_wideep_generation_mla_table(
             .query_generation(b, s, num_heads, kv_quant, attn_backend)
     };
     match db.database_mode {
+        DatabaseMode::Analytical => {
+            let spec = &db.system_spec;
+            let fmha_quant = generation_attn_mode(spec, kv_quant);
+            let main_flops = quant_tc_flops(spec, fmha_quant.mapping())?;
+            let bf16_flops = quant_tc_flops(spec, FmhaQuantMode::Bfloat16.mapping())?;
+            Ok((
+                wideep_generation_mla_sol_ms(
+                    spec,
+                    fmha_quant,
+                    num_heads as f64,
+                    b as f64,
+                    s as f64,
+                    main_flops,
+                    bf16_flops,
+                ),
+                Source::Analytical,
+            ))
+        }
         // Python `_query_wideep_generation_mla_table`: the fmha label is
         // rebound to `generation_attn_mode(spec, kv)` BEFORE `get_sol` is
         // defined, then `get_sol(b, s, tp_size, kvcache_quant_mode,

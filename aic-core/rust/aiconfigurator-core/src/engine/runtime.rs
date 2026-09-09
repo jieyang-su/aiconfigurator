@@ -441,9 +441,15 @@ impl Engine {
             // loaded the same identity through backward fill) also skips the
             // gate — the source resolver serves every table from sibling
             // versions. All other loads keep the loud gate.
-            spec.engine.database_mode == DatabaseMode::Sol || spec.engine.tolerate_dirless_version,
+            matches!(
+                spec.engine.database_mode,
+                DatabaseMode::Analytical | DatabaseMode::Sol
+            ) || spec.engine.tolerate_dirless_version,
         )?
-        .with_mode(spec.engine.database_mode, transfer_policy);
+        .with_mode(spec.engine.database_mode, transfer_policy)
+        .with_analytical_config(crate::common::analytical::AnalyticalConfig::from_extra(
+            &spec.engine.extra,
+        ));
         Engine::build(spec, Arc::new(db))
     }
 
@@ -1652,6 +1658,7 @@ mod tests {
                 window_size: 0,
                 kv_cache_dtype: KvCacheQuantMode::Fp8,
                 lane_order: crate::operators::attention::b200_vllm_generation_lane_order(),
+                fmha_quant_mode: None,
             }),
         ]
     }
