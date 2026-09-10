@@ -129,7 +129,7 @@ def test_dsv4_native_checkpoints_remap_by_system_family():
 
     for path in ("deepseek-ai/DeepSeek-V4-Pro", "deepseek-ai/DeepSeek-V4-Flash"):
         assert resolve_dsv4_moe_arch_mode(path, "b200_sxm", "sglang") is common.MoEQuantMode.w4a8_mxfp4_mxfp8_trtllm
-        assert resolve_dsv4_moe_arch_mode(path, "h200_sxm", "sglang") is common.MoEQuantMode.w4a16_mxfp4_cutlass
+        assert resolve_dsv4_moe_arch_mode(path, "h200_sxm", "sglang") is common.MoEQuantMode.w4a16_mxfp4
     # Requant artifacts, other backends, and megamoe stay untouched.
     assert resolve_dsv4_moe_arch_mode("sgl-project/DeepSeek-V4-Pro-FP8", "b200_sxm", "sglang") is None
     assert resolve_dsv4_moe_arch_mode("deepseek-ai/DeepSeek-V4-Pro", "b200_sxm", "trtllm") is None

@@ -171,16 +171,34 @@ def _resolve_quant_str(key: str, value: Any) -> Any:
 # Models that get a Blackwell MoE-quant promotion on the TRT-LLM backend.
 _GPTOSS_BLACKWELL_MODELS = frozenset({"openai/gpt-oss-120b", "openai/gpt-oss-20b"})
 
-# Native FP4 routed-expert DeepSeek-V4 checkpoints and their FP8 replacements.
-# The native FP4 weights are unsupported on Hopper.
-_DEEPSEEK_V4_NATIVE_FP4_TO_FP8_MODEL = {
-    "deepseek-ai/DeepSeek-V4-Flash": "sgl-project/DeepSeek-V4-Flash-FP8",
-    "deepseek-ai/DeepSeek-V4-Pro": "sgl-project/DeepSeek-V4-Pro-FP8",
-    # The ModelOpt NVFP4 exports carry the same FP4 routed-expert weights.
-    "nvidia/DeepSeek-V4-Flash-NVFP4": "sgl-project/DeepSeek-V4-Flash-FP8",
-    "nvidia/DeepSeek-V4-Pro-NVFP4": "sgl-project/DeepSeek-V4-Pro-FP8",
-}
 
+def _is_dsv4_nvfp4_expert_model(
+    model_path: str,
+    *,
+    architecture: str | None = None,
+    raw_config: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether a DeepSeek-V4 checkpoint explicitly carries NVFP4 experts.
+
+    The model identifier is part of the contract: an explicit ``NVFP4`` model
+    name must keep the hardware gate even when its config is not available
+    locally. The raw config is checked as well for repositories whose name does
+    not expose the execution format.
+    """
+    if architecture != "DeepseekV4ForCausalLM":
+        return False
+    if "NVFP4" in model_path.upper():
+        return True
+    config = raw_config if isinstance(raw_config, dict) else {}
+    quant_config = config.get("quantization_config")
+    candidates = [config]
+    if isinstance(quant_config, dict):
+        candidates.append(quant_config)
+    return any(
+        str(candidate.get(key) or "").upper() == "NVFP4"
+        for candidate in candidates
+        for key in ("moe_quant_algo", "quant_algo", "quantization_algo")
+    )
 
 # SGLang MegaMoE (DeepSeek-V4) — only these checkpoints have packaged perf data.
 _DEEPSEEK_V4_MEGAMOE_SUPPORTED_MODELS = {
@@ -923,8 +941,8 @@ class Task:
         # so it is resolved and validated in _resolve_model_identity.
         if self.nextn != "auto":
             self.nextn, self.nextn_accepted = normalize_speculative_decoding(self.nextn, self.nextn_accepted)
-        self._validate_deepseek_v4_hardware()
         self._resolve_model_identity()
+        self._validate_deepseek_v4_hardware()
         if self.nextn == "auto":
             raise ValueError("nextn='auto' requires a model path to resolve num_nextn_predict_layers.")
         self._resolve_backend_version()
@@ -939,6 +957,33 @@ class Task:
         self._resolve_search_space()
         self._apply_fmha_data_fallback()
         self._validate_megamoe_backend_support()
+
+    def _validate_deepseek_v4_hardware(self) -> None:
+        """Keep NVFP4 hardware validation while allowing native MXFP4 V4 paths.
+
+        The native ``deepseek-ai/DeepSeek-V4-*`` checkpoints are resolved to
+        the backend-specific MXFP4 execution mode (for example Hopper
+        ``w4a16_mxfp4`` on the current H20 Marlin lane). ModelOpt NVFP4 exports are different: they
+        still require native FP4 tensor-core support and remain rejected on
+        H-series systems.
+        """
+        roles = ["agg"] if self.serving_mode in ("agg", "afd") else ["prefill", "decode"]
+        for role in roles:
+            model = self._role_attr(role, "model_path")
+            if not model:
+                continue
+            if not _is_dsv4_nvfp4_expert_model(
+                model,
+                architecture=self._architecture,
+                raw_config=self._raw_config,
+            ):
+                continue
+            system = self._role_attr(role, "system_name")
+            if not supports_fp4_mma(load_system_spec(system)):
+                raise ValueError(
+                    f"{model} uses NVFP4 routed-expert weights and is not supported on "
+                    f"a system without FP4 tensor-core support (system={system!r})."
+                )
 
     def _normalize_wideep_moe_backend(self) -> None:
         """Field-level compat mapping: ``enable_wideep`` still spells the
@@ -997,18 +1042,6 @@ class Task:
             raise ValueError(
                 f"moe_backend='megamoe' requires Blackwell-class systems (SM >= 100); non-Blackwell: {non_blackwell}."
             )
-
-    def _validate_deepseek_v4_hardware(self) -> None:
-        """Reject native DeepSeek-V4 FP4-expert checkpoints on Hopper (use the FP8 build)."""
-        roles = ["agg"] if self.serving_mode in ("agg", "afd") else ["prefill", "decode"]
-        for role in roles:
-            model = self._role_attr(role, "model_path")
-            replacement = _DEEPSEEK_V4_NATIVE_FP4_TO_FP8_MODEL.get(model)
-            if replacement and not supports_fp4_mma(load_system_spec(self._role_attr(role, "system_name"))):
-                raise ValueError(
-                    f"{model} uses native FP4 routed-expert weights and is not supported on "
-                    f"a system without FP4 tensor-core support. Use {replacement} instead."
-                )
 
     def _check_prefix_discipline(self) -> None:
         """In disagg mode, top-level worker-spec fields must be at their defaults.

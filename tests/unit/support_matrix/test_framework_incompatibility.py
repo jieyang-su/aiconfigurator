@@ -12,6 +12,7 @@ from tools.support_matrix.support_matrix import (
     STATUS_FRAMEWORK_INCOMPATIBLE,
     STATUS_HW_INCOMPATIBLE,
     STATUS_HYBRID_PASS,
+    STATUS_PASS,
     SupportMatrix,
     TestConstraints,
 )
@@ -169,14 +170,22 @@ def test_dsv4_vllm_024_plus_native_blackwell_gap_is_fail(monkeypatch, system, ve
         assert attempts == 4
 
 
-def test_dsv4_vllm_024_hopper_is_hardware_incompatible(monkeypatch):
-    def fake_run_mode(**_kwargs):
-        pytest.fail("hardware preflight should reject the native FP4 model")
+def test_dsv4_vllm_024_hopper_native_mxfp4_is_not_hardware_incompatible(monkeypatch):
+    """Native DSV4 MXFP4 is not a Hopper hardware rejection.
+
+    vLLM may still have a framework/data gap for this model, but that is
+    distinct from the explicit NVFP4 hardware gate.
+    """
+    calls = []
+
+    def fake_run_mode(**kwargs):
+        calls.append(kwargs)
+        return pd.DataFrame({"result": [1]})
 
     monkeypatch.setattr(SupportMatrix, "_run_mode", staticmethod(fake_run_mode))
     _patch_large_constraints(monkeypatch)
 
-    statuses, _errors = SupportMatrix.run_single_test(
+    statuses, errors = SupportMatrix.run_single_test(
         model="deepseek-ai/DeepSeek-V4-Flash",
         system="h200_sxm",
         backend="vllm",
@@ -184,7 +193,9 @@ def test_dsv4_vllm_024_hopper_is_hardware_incompatible(monkeypatch):
         system_spec=_system_spec("h200_sxm"),
     )
 
-    assert statuses == {"agg": STATUS_HW_INCOMPATIBLE, "disagg": STATUS_HW_INCOMPATIBLE}
+    assert len(calls) == 2
+    assert statuses == {"agg": STATUS_PASS, "disagg": STATUS_PASS}
+    assert errors == {"agg": None, "disagg": None}
 
 
 def test_dsv4_vllm_024_non_native_sm120_gap_remains_framework_incompatible(monkeypatch):

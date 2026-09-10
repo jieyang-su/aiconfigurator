@@ -851,8 +851,8 @@ def test_moe_backend_flows_into_model_config():
 def test_dsv4_native_sglang_moe_remap():
     """Native DeepSeek-V4 (Pro AND Flash) on sglang remaps MoE to the arch-specific
     kernel (v1 dsv4pro-moe-arch): Blackwell -> w4a8_mxfp4_mxfp8_trtllm; on Hopper
-    the native FP4-expert checkpoints are rejected outright. megamoe, non-sglang
-    backends, and the sgl-project FP8 requant artifacts are exempt.
+    the current H20/Marlin data lane is w4a16_mxfp4. megamoe, non-sglang backends,
+    and the sgl-project FP8 requant artifacts are exempt.
     """
     from aiconfigurator.sdk import common
 
@@ -867,9 +867,7 @@ def test_dsv4_native_sglang_moe_remap():
 
     for mp in ("deepseek-ai/DeepSeek-V4-Pro", "deepseek-ai/DeepSeek-V4-Flash"):
         assert moe("sglang", mp=mp) == common.MoEQuantMode.w4a8_mxfp4_mxfp8_trtllm
-        # Native FP4-expert checkpoints are rejected outright on Hopper.
-        with pytest.raises(ValueError, match="native FP4 routed-expert"):
-            moe("sglang", mp=mp, system="h200_sxm")
+        assert moe("sglang", mp=mp, system="h200_sxm") == common.MoEQuantMode.w4a16_mxfp4
         assert moe("trtllm", mp=mp) != common.MoEQuantMode.w4a8_mxfp4_mxfp8_trtllm
     # megamoe keys its own quant table (packaged data exists only for V4-Pro).
     assert moe("sglang", moe_backend="megamoe") != common.MoEQuantMode.w4a8_mxfp4_mxfp8_trtllm
@@ -914,38 +912,63 @@ def test_lightning_task_preserves_an_explicit_w4a16_moe_mode():
 
 
 @pytest.mark.parametrize(
-    ("model_path", "replacement"),
+    "model_path",
     [
-        ("nvidia/DeepSeek-V4-Flash-NVFP4", "sgl-project/DeepSeek-V4-Flash-FP8"),
-        ("nvidia/DeepSeek-V4-Pro-NVFP4", "sgl-project/DeepSeek-V4-Pro-FP8"),
+        "nvidia/DeepSeek-V4-Flash-NVFP4",
+        "nvidia/DeepSeek-V4-Pro-NVFP4",
     ],
 )
-def test_dsv4_nvfp4_exports_get_the_curated_hopper_rejection(model_path, replacement):
+def test_dsv4_nvfp4_exports_get_the_curated_hopper_rejection(model_path):
     """The ModelOpt NVFP4 exports carry the same native FP4 routed-expert
     weights as the deepseek-ai checkpoints, so Hopper tasks must get the
-    curated use-the-FP8-build redirect, not a downstream missing-data error
-    (AIC-1749 registration follow-through)."""
-    with pytest.raises(ValueError, match="native FP4 routed-expert") as exc:
+    before a downstream missing-data error."""
+    with pytest.raises(ValueError, match="NVFP4 routed-expert") as exc:
         Task(
             serving_mode="agg",
             model_path=model_path,
             system_name="h200_sxm",
             backend_name="sglang",
         )
-    assert replacement in str(exc.value)
+    assert "FP4 tensor-core support" in str(exc.value)
 
 
-def test_dsv4_third_party_fp4_sglang_moe_remap_on_hopper():
-    """Third-party FP4-expert DSV4 checkpoints (e.g. RedHatAI) get the sglang
-    MoE remap based on expert_dtype rather than hardcoded model paths.
-    Hopper -> w4a16_mxfp4_cutlass; Blackwell -> w4a8_mxfp4_mxfp8_trtllm."""
-    hopper = Task(
-        serving_mode="agg",
-        model_path="RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8",
-        system_name="h200_sxm",
-        backend_name="sglang",
-    )
-    assert hopper.moe_quant_mode == common.MoEQuantMode.w4a16_mxfp4_cutlass
+def test_dsv4_third_party_fp4_sglang_moe_remap_on_hopper(monkeypatch):
+    """Explicit third-party NVFP4 DSV4 checkpoints keep the FP4 gate.
+
+    Native ``deepseek-ai`` checkpoints are the MXFP4 exception on Hopper;
+    an explicit ``NVFP4`` artifact is still a native-FP4 workload and is
+    accepted only on a system with FP4 tensor-core support.
+    """
+    import copy
+    import aiconfigurator.sdk.task_v2 as task_module
+
+    native = task_module.get_model_config_from_model_path("deepseek-ai/DeepSeek-V4-Flash")
+
+    def fake_config(model_path):
+        config = copy.deepcopy(native)
+        raw_config = config.setdefault("raw_config", {})
+        if model_path.startswith("RedHatAI/"):
+            raw_config["expert_dtype"] = "fp4"
+        else:
+            raw_config.pop("expert_dtype", None)
+        return config
+
+    def fake_info(model_path):
+        info = dict(fake_config(model_path))
+        info["num_shared_experts"] = 1
+        info["num_moe_layers"] = 1
+        return info
+
+    monkeypatch.setattr(task_module, "get_model_config_from_model_path", fake_config)
+    monkeypatch.setattr(task_module, "_get_model_info", fake_info)
+    monkeypatch.setattr("aiconfigurator_core.sdk.models.helpers._get_model_info", fake_info)
+    with pytest.raises(ValueError, match="NVFP4 routed-expert"):
+        Task(
+            serving_mode="agg",
+            model_path="RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8",
+            system_name="h200_sxm",
+            backend_name="sglang",
+        )
     blackwell = Task(
         serving_mode="agg",
         model_path="RedHatAI/DeepSeek-V4-Flash-NVFP4-FP8",

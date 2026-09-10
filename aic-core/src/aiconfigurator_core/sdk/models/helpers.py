@@ -809,10 +809,14 @@ def resolve_dsv4_moe_arch_mode(
     """Arch-specific MoE quant mode for FP4-expert DeepSeek-V4 checkpoints on sglang.
 
     SGLang serves FP4-expert V4 checkpoints through arch-specific MoE kernels,
-    and the perf DB files those rows under dedicated quant modes (loader
-    routing in ``operations/moe.py``): Blackwell -> ``w4a8_mxfp4_mxfp8_trtllm``
+    and the perf DB files those rows under the execution mode represented by
+    the collected data: Blackwell -> ``w4a8_mxfp4_mxfp8_trtllm``
     (kernel_source ``sglang_mxfp4_flashinfer_trtllm_moe``), Hopper ->
-    ``w4a16_mxfp4_cutlass`` (``sglang_flashinfer_cutlass_moe``). Returns the
+    ``w4a16_mxfp4`` for the current Marlin lane. The Hopper mode is deliberately
+    the base MXFP4 mode: the 0.5.18 H20 table records the runtime as
+    ``sglang_marlin_moe``/``w4a16_mxfp4``. Older FlashInfer-Cutlass rows are
+    normalized to the dedicated ``w4a16_mxfp4_cutlass`` table key by the
+    database loader when that kernel source is actually present. Returns the
     remapped mode, or None when the rule does not apply (non-sglang backends,
     megamoe, FP8-only requant artifacts, other systems). An explicit user mode
     must win, so callers only apply this when moe_quant_mode was not explicitly
@@ -827,7 +831,7 @@ def resolve_dsv4_moe_arch_mode(
     if is_blackwell_system(system_name):
         return common.MoEQuantMode.w4a8_mxfp4_mxfp8_trtllm
     if is_hopper_system(system_name):
-        return common.MoEQuantMode.w4a16_mxfp4_cutlass
+        return common.MoEQuantMode.w4a16_mxfp4
     return None
 
 

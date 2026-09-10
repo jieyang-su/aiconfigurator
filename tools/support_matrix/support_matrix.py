@@ -370,7 +370,13 @@ def _required_datatypes_for_model(model: str, backend: str) -> tuple[str, ...]:
     expert_dtype = str(raw_config.get("expert_dtype") or "").lower()
 
     required: set[str] = set()
-    if quant_mode_names & _NATIVE_FP4_QUANT_MODE_NAMES or raw_quant_algo == "nvfp4" or expert_dtype == "fp4":
+    # ``expert_dtype=fp4`` describes the native DeepSeek-V4 MXFP4 checkpoint,
+    # which Hopper serves through a software/dequantized MXFP4 lane (for
+    # example SGLang Marlin on H20). It is not, by itself, a requirement for
+    # native FP4 tensor cores. Only an explicit NVFP4 execution mode requires
+    # FP4 hardware; the resolved quant mode and raw NVFP4 algorithm cover that
+    # case below.
+    if quant_mode_names & _NATIVE_FP4_QUANT_MODE_NAMES or raw_quant_algo == "nvfp4":
         required.add("FP4")
     if quant_mode_names & _FP8_QUANT_MODE_NAMES or raw_quant_algo in {"fp8", "fp8_block"}:
         required.add("FP8")
