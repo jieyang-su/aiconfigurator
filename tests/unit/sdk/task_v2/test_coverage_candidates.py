@@ -3,11 +3,13 @@
 
 """Coverage-driven large-EP candidate participation (spec sections 4.4.3 / 4.5 / 4.6).
 
-Large EP is no longer a flag: ``Task`` probes the perf database's coverage API
-for the model's MoE shape and lets every parallel tuple whose ``moe_ep`` is
-covered (with ``moe_tp == 1``) participate, resolving the per-phase comm
-backend for it. These tests drive that resolution against a SYNTHETIC systems
-root (parquets written here, parsed by the real PR 1 loaders) so the covered /
+By default, large EP remains coverage-driven: ``Task`` probes the perf
+database's coverage API for the model's MoE shape and lets every parallel tuple
+whose ``moe_ep`` is covered (with ``moe_tp == 1``) participate, resolving the
+per-phase comm backend for it. ``moe_comm_mode='fused'`` is the explicit escape
+hatch for systems/models without usable large-EP data. These tests drive that
+resolution against a SYNTHETIC systems root (parquets written here, parsed by
+the real PR 1 loaders) so the covered /
 uncovered split is controlled rather than inherited from shipped data, plus
 two shipped-data checks (trtllm nvlink, and the no-coverage control).
 """
@@ -262,6 +264,39 @@ def test_covered_tuple_resolves_per_phase_deepep_backends(synth_systems):
     }
 
 
+def test_fused_mode_disables_large_ep_resolution_even_with_coverage(synth_systems):
+    t = _synth_task(moe_comm_mode="fused")
+    assert t._large_ep_coverage("agg") == {}
+    assert t._resolve_moe_comm_backend("agg", _tuple(dp=16, moe_ep=16)) is None
+    model_config = t.build_model_config(role="agg", parallel=_tuple(dp=16, moe_ep=16))
+    assert model_config.moe_comm_backend is None
+    assert model_config.moe_comm_mode == "fused"
+
+
+def test_a2a_mode_rejects_family_without_large_ep_graph(monkeypatch):
+    import aiconfigurator.sdk.moe_comm_resolver as resolver
+
+    monkeypatch.setattr(resolver, "check_is_moe", lambda _model_path: True)
+    monkeypatch.setattr(
+        resolver,
+        "_get_model_info",
+        lambda _model_path: {"architecture": "KimiK3ForConditionalGeneration"},
+    )
+    model_config = ModelConfig(attention_dp_size=16, moe_tp_size=1, moe_ep_size=16)
+    with pytest.raises(ValueError, match="moe_comm_mode='a2a'.*not supported"):
+        resolver.resolve_model_config_moe_comm(
+            model_config,
+            model_path="moonshotai/Kimi-K3",
+            backend_name="sglang",
+            database=SimpleNamespace(
+                database_mode=common.DatabaseMode.SILICON,
+                system_spec={"node": {"num_gpus_per_node": 8}},
+            ),
+            required_phases=("context", "generation"),
+            moe_comm_mode="a2a",
+        )
+
+
 def test_sglang_node1_deepep_coverage_represents_multi_node_ep(synth_systems_node1_fallback):
     t = _synth_task()
     point = _tuple(dp=32, moe_ep=32)
@@ -426,6 +461,54 @@ def test_exact_config_allows_intra_node_fused_but_requires_deepep_cross_node(
     assert local.moe_comm_backend is None
     with pytest.raises(PerfDataNotAvailableError, match=rf"Cross-node EP.*moe_ep={cross_node_ep}"):
         t.build_model_config(role="agg", parallel=_tuple(dp=cross_node_ep, moe_ep=cross_node_ep))
+
+
+def test_analytical_cross_node_ep_keeps_legacy_fused_graph():
+    """Formula-only mode must not require table-backed MoE A2A coverage."""
+    database = SimpleNamespace(
+        database_mode=common.DatabaseMode.ANALYTICAL,
+        system_spec={"node": {"num_gpus_per_node": 8}},
+    )
+    model_config = ModelConfig(attention_dp_size=16, moe_tp_size=1, moe_ep_size=16)
+
+    resolved = resolve_model_config_moe_comm(
+        model_config,
+        model_path=SYNTH_MODEL,
+        backend_name="sglang",
+        database=database,
+        required_phases=("context", "generation"),
+    )
+
+    assert resolved is None
+    assert model_config.moe_comm_backend is None
+
+
+def test_fused_only_family_keeps_legacy_silicon_ep_path(monkeypatch):
+    """Kimi-K3-style families must not be forced onto the generic A2A graph."""
+    import aiconfigurator.sdk.moe_comm_resolver as resolver
+
+    monkeypatch.setattr(resolver, "check_is_moe", lambda _model_path: True)
+    monkeypatch.setattr(
+        resolver,
+        "_get_model_info",
+        lambda _model_path: {"architecture": "KimiK3ForConditionalGeneration"},
+    )
+    database = SimpleNamespace(
+        database_mode=common.DatabaseMode.SILICON,
+        system_spec={"node": {"num_gpus_per_node": 8}},
+    )
+    model_config = ModelConfig(attention_dp_size=16, moe_tp_size=1, moe_ep_size=16)
+
+    resolved = resolver.resolve_model_config_moe_comm(
+        model_config,
+        model_path="moonshotai/Kimi-K3",
+        backend_name="sglang",
+        database=database,
+        required_phases=("context", "generation"),
+    )
+
+    assert resolved is None
+    assert model_config.moe_comm_backend is None
 
 
 def test_trtllm_attention_dp_gate_falls_through_to_cross_node_data_error():

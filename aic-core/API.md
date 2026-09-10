@@ -109,15 +109,17 @@ QWEN3VL_MOE stays excluded until its `create()` forwards `backend_name`.
 ### Large-EP enablement is coverage-driven
 
 `ModelConfig.moe_comm_backend` (`dict[str, str] | None`) and
-`ModelConfig.num_gpus_per_node` (`int | None`) are internal, enumerator-owned
-fields — never user flags. The enumerator sets them together, per parallel
-tuple: `moe_comm_backend` maps each inference phase (`"context"` /
-`"generation"`) to the comm backend resolved for that phase, and
-`num_gpus_per_node` carries the system's node width — a hardware fact the
-large-EP ops need at construction to derive the comm node span. The fields
-must stay consistent: model classes raise `ValueError` when
-`moe_comm_backend` is set without `num_gpus_per_node`, because a defaulted
-node width would silently mis-price the cross-node all-to-all.
+`ModelConfig.num_gpus_per_node` (`int | None`) remain internal, enumerator-owned
+fields. The user-facing `Task.moe_comm_mode` / `--moe-comm-mode` policy controls
+whether the resolver may select the large-EP graph: `auto` uses compatible
+coverage, `fused` forces the legacy `MoEDispatch + MoE` graph, and `a2a`
+requires compatible all-to-all and expert-compute data. The resolved
+`moe_comm_backend` maps each inference phase (`"context"` / `"generation"`)
+to the backend selected for that phase, while `num_gpus_per_node` carries the
+system's node width — a hardware fact the large-EP ops need at construction to
+derive the comm node span. The fields must stay consistent: model classes raise
+`ValueError` when `moe_comm_backend` is set without `num_gpus_per_node`, because
+a defaulted node width would silently mis-price the cross-node all-to-all.
 
 Enumeration follows the coverage probes. A parallel tuple with `moe_tp == 1`
 and `moe_ep > 1` participates in the large-EP regime when

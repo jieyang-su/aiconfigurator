@@ -35,7 +35,7 @@ from aiconfigurator.sdk.models import (
     resolve_dsv4_moe_arch,
     resolve_nvfp4_for_system,
 )
-from aiconfigurator.sdk.moe_comm_resolver import resolve_model_config_moe_comm
+from aiconfigurator.sdk.moe_comm_resolver import MOE_COMM_MODE_CHOICES, resolve_model_config_moe_comm
 from aiconfigurator.sdk.performance_result import MoECommFallback, merge_moe_comm_fallbacks
 from aiconfigurator.sdk.rust_engine_step import validate_engine_step_backend
 from aiconfigurator.sdk.speculative import (
@@ -170,6 +170,7 @@ def cli_default(
     backend: str = "trtllm",
     backend_version: str | None = None,
     database_mode: str = "SILICON",
+    moe_comm_mode: str = "auto",
     pareto_algorithm: str = "v1",
     transfer_policy: str | list | None = None,
     analytical_level: str = "standard",
@@ -226,6 +227,9 @@ def cli_default(
         backend_version: Backend database version. Default is latest.
         database_mode: Database mode for performance estimation
             ('SILICON', 'HYBRID', 'EMPIRICAL', 'SOL'). Default is 'SILICON'.
+        moe_comm_mode: MoE communication graph policy: ``auto`` selects a
+            covered large-EP path, ``fused`` forces the legacy graph, and
+            ``a2a`` requires table-backed all-to-all coverage.
         analytical_communication_mode: Communication source when
             ``database_mode='ANALYTICAL'``: empirical formula or silicon table.
         isl: Input sequence length. Default is 4000.
@@ -326,6 +330,7 @@ def cli_default(
         backend=backend,
         backend_version=backend_version,
         database_mode=database_mode,
+        moe_comm_mode=moe_comm_mode,
         pareto_algorithm=pareto_algorithm,
         transfer_policy=transfer_policy,
         analytical_level=analytical_level,
@@ -435,6 +440,7 @@ def cli_recommend(
     backend: str = "trtllm",
     backend_version: str | None = None,
     database_mode: str = "HYBRID",
+    moe_comm_mode: str = "auto",
     pareto_algorithm: str = "v1",
     transfer_policy: str | list | None = None,
     analytical_level: str = "standard",
@@ -495,6 +501,9 @@ def cli_recommend(
         backend: Backend name ('trtllm', 'sglang', 'vllm', 'auto').
         backend_version: Backend database version. Default is latest.
         database_mode: Database mode ('SILICON', 'HYBRID', 'EMPIRICAL', 'SOL').
+        moe_comm_mode: MoE communication graph policy: ``auto`` selects a
+            covered large-EP path, ``fused`` forces the legacy graph, and
+            ``a2a`` requires table-backed all-to-all coverage.
         transfer_policy: Fine-grained HYBRID/EMPIRICAL transfer control.
         isl: Input sequence length. Default is 4000.
         osl: Output sequence length. Default is 1000.
@@ -582,6 +591,7 @@ def cli_recommend(
         backend=backend,
         backend_version=backend_version,
         database_mode=database_mode,
+        moe_comm_mode=moe_comm_mode,
         pareto_algorithm=pareto_algorithm,
         transfer_policy=transfer_policy,
         analytical_level=analytical_level,
@@ -1061,6 +1071,7 @@ def cli_estimate(
     backend_name: str = "trtllm",
     backend_version: str | None = None,
     database_mode: str = "SILICON",
+    moe_comm_mode: str = "auto",
     transfer_policy: str | list | None = None,
     analytical_level: str = "standard",
     analytical_fp8_gemm_recipe: str = "sglang",
@@ -1155,6 +1166,9 @@ def cli_estimate(
         backend_version: Backend database version. Default is latest.
         database_mode: Database mode for performance estimation
             ('SILICON', 'HYBRID', 'EMPIRICAL', 'SOL'). Default is 'SILICON'.
+        moe_comm_mode: MoE communication graph policy: ``auto`` selects a
+            covered large-EP path, ``fused`` forces the legacy graph, and
+            ``a2a`` requires table-backed all-to-all coverage.
         isl: Input sequence length. Default is 1024.
         osl: Output sequence length. Default is 1024.
         image_height: Image height in pixels for VL models. Default 0 disables encoder modeling.
@@ -1222,6 +1236,10 @@ def cli_estimate(
             (backend_name, value) pair raises. None (default) uses the
             framework default for the target system/backend version. Applied
             to agg, disagg, afd, and all static modes.
+        moe_comm_mode: MoE communication graph policy. ``auto`` selects a
+            covered large-EP path, ``fused`` forces the legacy graph, and
+            ``a2a`` requires table-backed all-to-all coverage. AFD's own
+            attention/FFN transfer model is unchanged by this option.
         prefix: (common) Prefix cache length (subset of ``isl`` already cached).
             Applied to agg, disagg, and all static modes. Default 0.
         nextn: (common) MTP draft length, or ``"auto"`` to use the checkpoint's
@@ -1284,6 +1302,11 @@ def cli_estimate(
         get_systems_paths,
         set_systems_paths,
     )
+
+    if moe_comm_mode not in MOE_COMM_MODE_CHOICES:
+        raise ValueError(
+            f"moe_comm_mode must be one of {sorted(MOE_COMM_MODE_CHOICES)}, got {moe_comm_mode!r}"
+        )
 
     # Validate at the public boundary because some AFD-only paths return
     # without constructing a Task.
@@ -1397,6 +1420,7 @@ def cli_estimate(
             get_backend=get_backend,
             get_model=get_model,
             attention_backend=attention_backend,
+            moe_comm_mode=moe_comm_mode,
         )
 
     if mode == "agg":
@@ -1433,6 +1457,7 @@ def cli_estimate(
             engine_step_backend=engine_step_backend,
             forward_model=forward_model,
             attention_backend=attention_backend,
+            moe_comm_mode=moe_comm_mode,
             prefix=prefix,
             nextn=nextn,
             nextn_accepted=nextn_accepted,
@@ -1507,6 +1532,7 @@ def cli_estimate(
             engine_step_backend=engine_step_backend,
             forward_model=forward_model,
             attention_backend=attention_backend,
+            moe_comm_mode=moe_comm_mode,
             prefix=prefix,
             nextn=nextn,
             nextn_accepted=nextn_accepted,
@@ -1617,6 +1643,7 @@ def cli_estimate(
             get_backend=get_backend,
             get_model=get_model,
             attention_backend=attention_backend,
+            moe_comm_mode=moe_comm_mode,
         )
         if static_result.summary is not None and static_result.summary.check_oom():
             phase_label = "decode" if static_mode == "static_gen" else "prefill"
@@ -1667,6 +1694,7 @@ def _run_agg_estimate(
     engine_step_backend=None,
     forward_model=None,
     attention_backend: str | None = None,
+    moe_comm_mode: str = "auto",
     # Common (also accepted by disagg / static)
     prefix: int = 0,
     nextn: int = 0,
@@ -1696,13 +1724,25 @@ def _run_agg_estimate(
         attention_backend=attention_backend,
         enable_encoder_dp=enable_encoder_dp,
         communication_placement=communication_placement,
+        moe_comm_mode=moe_comm_mode,
     )
     _apply_nextn(model_config, nextn)
+    database = load_database(system_name)
+    if check_is_moe(model_path):
+        resolve_model_config_moe_comm(
+            model_config,
+            model_path=model_path,
+            backend_name=backend_name,
+            database=database,
+            required_phases=("context", "generation"),
+            fmha_quant_mode_explicit=fmha_quant_mode is not None,
+            kvcache_quant_mode_explicit=kvcache_quant_mode is not None,
+            moe_comm_mode=moe_comm_mode,
+        )
     # Agg workers run context attention → resolve fmha against the perf data
     # before building the model (mirrors the sweep/task_v2 path).
-    resolve_context_fmha_by_data(
-        model_config, model_path, load_database(system_name), backend_name, is_context_role=True
-    )
+    if model_config.moe_comm_backend is None:
+        resolve_context_fmha_by_data(model_config, model_path, database, backend_name, is_context_role=True)
     resolve_dsv4_moe_arch(model_config, model_path, system_name=system_name, backend_name=backend_name)
     resolve_nvfp4_for_system(model_config, system_name, model_path, backend_name=backend_name)
     runtime_config = RuntimeConfig(
@@ -1717,7 +1757,6 @@ def _run_agg_estimate(
     )
 
     model = get_model(model_path, model_config, backend_name)
-    database = load_database(system_name)
     backend = get_backend(backend_name)
     session = InferenceSession(model, database, backend)
     speculative_profile = SpeculativeDecodingProfile.from_inputs(nextn, nextn_accepted)
@@ -1810,6 +1849,7 @@ def _run_static_estimate(
     get_model,
     forward_model=None,
     attention_backend: str | None = None,
+    moe_comm_mode: str = "auto",
     communication_placement: str = "independent",
 ) -> EstimateResult:
     """Run a single-pass static-batching estimation.
@@ -1844,6 +1884,7 @@ def _run_static_estimate(
         attention_backend=attention_backend,
         enable_encoder_dp=enable_encoder_dp,
         communication_placement=communication_placement,
+        moe_comm_mode=moe_comm_mode,
     )
     _apply_nextn(model_config, nextn)
     database = load_database(system_name)
@@ -1858,6 +1899,7 @@ def _run_static_estimate(
             required_phases=required_phases,
             fmha_quant_mode_explicit=fmha_quant_mode is not None,
             kvcache_quant_mode_explicit=kvcache_quant_mode is not None,
+            moe_comm_mode=moe_comm_mode,
         )
 
     # static / static_ctx run context attention; static_gen is generation-only
@@ -1978,6 +2020,7 @@ def _run_disagg_estimate(
     engine_step_backend=None,
     forward_model=None,
     attention_backend: str | None = None,
+    moe_comm_mode: str = "auto",
     # Common (also accepted by agg / static)
     prefix: int = 0,
     nextn: int = 0,
@@ -2020,6 +2063,7 @@ def _run_disagg_estimate(
         attention_backend=attention_backend,
         enable_encoder_dp=enable_encoder_dp,
         communication_placement=communication_placement,
+        moe_comm_mode=moe_comm_mode,
     )
     decode_model_config = _build_model_config(
         decode_tp_size,
@@ -2036,6 +2080,7 @@ def _run_disagg_estimate(
         attention_backend=attention_backend,
         enable_encoder_dp=enable_encoder_dp,
         communication_placement=communication_placement,
+        moe_comm_mode=moe_comm_mode,
     )
     # Apply common nextn/MTP overrides to *both* prefill and decode worker
     # configs so a single ``--nextn N`` reaches each side of the disagg pair.
@@ -2053,6 +2098,7 @@ def _run_disagg_estimate(
             required_phases=("context",),
             fmha_quant_mode_explicit=fmha_quant_mode is not None,
             kvcache_quant_mode_explicit=kvcache_quant_mode is not None,
+            moe_comm_mode=moe_comm_mode,
         )
         resolve_model_config_moe_comm(
             decode_model_config,
@@ -2062,6 +2108,7 @@ def _run_disagg_estimate(
             required_phases=("generation",),
             fmha_quant_mode_explicit=fmha_quant_mode is not None,
             kvcache_quant_mode_explicit=kvcache_quant_mode is not None,
+            moe_comm_mode=moe_comm_mode,
         )
 
     # Prefill runs context attention → resolve fmha against the perf data. Decode

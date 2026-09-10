@@ -54,6 +54,7 @@ from aiconfigurator.sdk.models.blocks.moe import LARGE_EP_READY_FAMILIES, MoEBlo
 from aiconfigurator.sdk.moe_comm_resolver import (
     a2a_covers_parallel,
     moe_compute_coverage,
+    MOE_COMM_MODE_CHOICES,
     resolve_model_config_moe_comm,
     select_moe_comm_backend,
 )
@@ -86,9 +87,10 @@ _LARGE_EP_EMPTY_COVERAGE_LOGGED: set[tuple[str, str, str, str | None]] = set()
 _LARGE_EP_ASYMMETRIC_COVERAGE_WARNED: set[tuple[str, str, str, str | None]] = set()
 
 # ---------------------------------------------------------------------------
-# Deprecated large-EP flags: accepted, warned once per key per process, ignored
-# (large-EP participation is coverage-driven per tuple — see
-# _resolve_moe_comm_backend). The parsed VALUES are kept: the resolved task /
+# Deprecated legacy large-EP flags: accepted, warned once per key per process,
+# ignored. The new ``moe_comm_mode`` policy selects the communication graph;
+# ``auto`` remains coverage-driven per tuple (see _resolve_moe_comm_backend).
+# The parsed VALUES are kept: the resolved task /
 # exp_config.yaml artifact still carries them, and enable_wideep still spells
 # moe_backend="deepep_moe" (_normalize_wideep_moe_backend), both deliberately
 # retained for artifact stability. Mirrors _warn_legacy_marker_once in
@@ -600,6 +602,10 @@ class Task:
     request_latency: float | None = None
     total_gpus: int | None = None
     database_mode: str | None = None
+    # MoE communication graph selection. ``auto`` uses available large-EP
+    # coverage; ``fused`` keeps the legacy MoEDispatch + MoE graph; ``a2a``
+    # requires the table-backed MoeAllToAll + MoeExpertCompute graph.
+    moe_comm_mode: Literal["auto", "fused", "a2a"] = "auto"
     analytical_level: str = "standard"
     analytical_fp8_gemm_recipe: str = "sglang"
     analytical_attention_algorithm: str = "fa2"
@@ -919,6 +925,11 @@ class Task:
     # =====================================================================
 
     def __post_init__(self) -> None:
+        if self.moe_comm_mode not in MOE_COMM_MODE_CHOICES:
+            raise ValueError(
+                f"moe_comm_mode must be one of {sorted(MOE_COMM_MODE_CHOICES)}, "
+                f"got {self.moe_comm_mode!r}"
+            )
         # Canonicalize at construction so downstream config and routing see
         # exactly one spelling for the only supported engine-step backend.
         self.engine_step_backend = validate_engine_step_backend(self.engine_step_backend)
@@ -1360,7 +1371,7 @@ class Task:
         return self._reachable_attention_op_keys(role)[-1]
 
     # =====================================================================
-    # Large-EP coverage (spec sections 4.4.3 / 4.5) -- no flag selects it
+    # Large-EP coverage (spec sections 4.4.3 / 4.5)
     # =====================================================================
 
     def _role_phases(self, role: str) -> tuple[str, ...]:
@@ -1406,9 +1417,10 @@ class Task:
         backends cover the same EP); the caller picks the first one covering
         the tuple's EP.
 
-        Missing data yields ``{}``; :meth:`build_model_config` permits the
-        fused path for intra-node tuples but rejects cross-node EP because
-        silently pricing it as fused omits A2A latency. A caller BUG still
+        In ``fused`` mode this probe is skipped. Otherwise missing data yields
+        ``{}``; :meth:`build_model_config` permits the fused path for
+        intra-node tuples but rejects cross-node EP because silently pricing
+        it as fused omits A2A latency. A caller BUG still
         raises: a str-typed ``moe_quant_mode`` is a
         ``TypeError``, not empty coverage (it would silently miss every
         enum-keyed compute row and disable large-EP exploration).
@@ -1421,6 +1433,8 @@ class Task:
         return coverage
 
     def _compute_large_ep_coverage(self, role: str) -> dict[str, dict[str, set[int]]]:
+        if self.moe_comm_mode == "fused":
+            return {}
         if not self._is_moe or self._model_family not in LARGE_EP_READY_FAMILIES:
             return {}
         model_path = self._role_attr(role, "model_path")
@@ -1536,6 +1550,8 @@ class Task:
         collected still resolves to that one.
         """
         _tp, _pp, _dp, moe_tp, moe_ep, _cp = tuple(parallel_tuple)
+        if self.moe_comm_mode == "fused":
+            return None
         if moe_tp != 1 or moe_ep <= 1:
             return None
         if _dp <= 1 and self._role_attr(role, "backend_name") == "trtllm":
@@ -2231,6 +2247,7 @@ class Task:
             # flashinfer), EPLB slot count, and explicit MoE token distribution.
             workload_distribution=self.workload_distribution,
             moe_backend=self.moe_backend,
+            moe_comm_mode=self.moe_comm_mode,
             # None means "unspecified" -> fall back to flashinfer (matches v1 and ModelConfig's default).
             attention_backend=self.attention_backend or "flashinfer",
             wideep_num_slots=self.wideep_num_slots,
@@ -2248,6 +2265,7 @@ class Task:
                 fmha_quant_mode_explicit=self._fmha_explicit.get(role, False),
                 kvcache_quant_mode_explicit=self._kvcache_explicit.get(role, False),
                 coverage_snapshot=self._large_ep_coverage(role),
+                moe_comm_mode=self.moe_comm_mode,
             )
         return model_config
 

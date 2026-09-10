@@ -124,13 +124,14 @@ fn query_custom_allreduce_table_with_preference(
 ) -> Result<PerformanceResult, AicError> {
     // GB200 NVL72 reroute — inside get_silicon only (Python
     // `communication.py:188-190`): custom AR is only collected up to tp4
-    // there, so (SILICON and HYBRID) queries reroute to the MODE-AWARE
+    // there, so table-backed queries reroute to the MODE-AWARE
     // `database.query_nccl` dispatch. Under HYBRID an NCCL silicon miss
     // therefore falls to the NCCL empirical (never the custom-AR
     // empirical), and a terminal NCCL EmpiricalNotImplemented propagates
     // (Python's outer catch only handles the missing-silicon-data class).
-    // EMPIRICAL and SOL modes never reach get_silicon, so they never
-    // reroute. Handled here rather than via the DB-internal reroute in
+    // SOL keeps its pure formula. EMPIRICAL reaches the same NCCL route only
+    // when the explicit preference is enabled. Handled here rather than via
+    // the DB-internal reroute in
     // `query_custom_allreduce_scaled`, which is silicon-only; in SILICON
     // mode both routes evaluate the identical `query_nccl_scaled` call.
     if db.system_spec.node.num_gpus_per_node == 72
@@ -145,13 +146,12 @@ fn query_custom_allreduce_table_with_preference(
     // The silicon path is the DB-level `_scaled` query (fan-out capping +
     // beyond-range bandwidth correction inside), mirroring Python
     // `_query_custom_allreduce_table.get_silicon`.
+    let nccl = |db: &PerfDatabase| query_nccl_table(db, quant, tp_size, "all_reduce", size);
     let silicon = |db: &PerfDatabase| {
         if prefer_nccl {
             // Compatibility path from the Python SDK: when enabled, use the
             // system-wide NCCL all_reduce curve instead of CustomAllReduce.
-            // Keep this inside the silicon closure so SOL and EMPIRICAL modes
-            // retain their original semantics.
-            return query_nccl_table(db, quant, tp_size, "all_reduce", size);
+            return nccl(db);
         }
         db.communication
             .query_custom_allreduce_scaled(&db.system_spec, quant, tp_size, size)
@@ -177,10 +177,19 @@ fn query_custom_allreduce_table_with_preference(
             Source::Sol,
         )
         .with_sol(SolComponents::new(0.0, 0.0))),
+        // When the runtime is explicitly configured to use NCCL for the
+        // fused communication path, EMPIRICAL must calibrate against the
+        // NCCL all_reduce curve as well. Otherwise it would still require a
+        // CustomAllReduce table that does not exist on H20.
+        DatabaseMode::Empirical if prefer_nccl => Ok(nccl(db)?),
         DatabaseMode::Empirical => Ok(PerformanceResult::new(
             custom_allreduce_empirical(db, quant, tp_size, size)?,
             Source::Empirical,
         )),
+        // query_nccl_table is mode-aware: in HYBRID it tries NCCL Silicon and
+        // falls back to NCCL EMPIRICAL, preserving the selected implementation
+        // when NCCL Silicon data is absent.
+        DatabaseMode::Hybrid if prefer_nccl => nccl(db),
         DatabaseMode::Hybrid => match silicon(db) {
             Ok(result) => Ok(result),
             Err(err) if err.is_missing_perf_data() => Ok(PerformanceResult::new(
@@ -626,6 +635,49 @@ mod tests {
         assert_eq!(result.source, Source::Silicon);
         assert_eq!(nccl.source, Source::Silicon);
         assert!((result.latency_ms - nccl.latency_ms).abs() < 1e-12);
+    }
+
+    #[test]
+    fn h20_empirical_prefer_nccl_uses_nccl_util_grid() {
+        let mut db = h20_sglang_db();
+        db.database_mode = DatabaseMode::Empirical;
+
+        // EMPIRICAL must calibrate from NCCL when the explicit compatibility
+        // switch selects NCCL for the fused communication path.
+        let result = query_custom_allreduce_table_with_preference(
+            &db,
+            CommQuantMode::Half,
+            8,
+            300_000.0,
+            true,
+        )
+        .expect("NCCL empirical substitute should answer");
+        let nccl = query_nccl_table(&db, CommQuantMode::Half, 8, "all_reduce", 300_000.0)
+            .expect("NCCL empirical query should answer");
+
+        assert!(result.latency_ms.is_finite() && result.latency_ms > 0.0);
+        assert_eq!(result.source, Source::Empirical);
+        assert_eq!(nccl.source, Source::Empirical);
+        assert!((result.latency_ms - nccl.latency_ms).abs() < 1e-12);
+    }
+
+    #[test]
+    fn h20_empirical_without_preference_keeps_custom_allreduce_gap() {
+        let mut db = h20_sglang_db();
+        db.database_mode = DatabaseMode::Empirical;
+
+        let result = query_custom_allreduce_table_with_preference(
+            &db,
+            CommQuantMode::Half,
+            8,
+            300_000.0,
+            false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(AicError::EmpiricalNotImplemented(_))
+        ));
     }
 
     /// Oracle values generated from the Python reference on the same data:

@@ -21,6 +21,7 @@ from aiconfigurator.sdk.operations.moe_comm import MOE_A2A_BACKENDS, nodes_for
 from aiconfigurator.sdk.perf_database import PerfDataNotAvailableError
 
 _DEEPEP_NODE1_FALLBACK_BACKENDS = frozenset(("deepep_ht", "deepep_ll", "trtllm_deepep_ht", "trtllm_deepep_ll"))
+MOE_COMM_MODE_CHOICES = frozenset(("auto", "fused", "a2a"))
 
 LargeEpCoverage = Mapping[str, Mapping[str, Set[int]]]
 
@@ -112,14 +113,65 @@ def resolve_model_config_moe_comm(
     fmha_quant_mode_explicit: bool = False,
     kvcache_quant_mode_explicit: bool = False,
     coverage_snapshot: LargeEpCoverage | None = None,
+    moe_comm_mode: str = "auto",
 ) -> dict[str, str] | None:
-    """Resolve DeepEP data, requiring it when EP spans physical nodes."""
+    """Resolve large-EP communication data for table-backed database modes.
+
+    Analytical mode is intentionally table-free.  Its Rust MoE, dispatch, and
+    collective operators already price the configured EP width with formulas,
+    so it must keep the legacy fused ``MoEDispatch + MoE`` graph instead of
+    being promoted to the table-backed ``MoeAllToAll + MoeExpertCompute``
+    graph.  In particular, an analytical cross-node EP must not require a
+    ``moe_a2a_perf.parquet`` file just to build the model config.
+
+    ``moe_comm_mode`` controls the route: ``"auto"`` uses coverage and family
+    capability, ``"fused"`` forces the legacy fused graph, and ``"a2a"``
+    explicitly requires the generic large-EP graph. An explicit ``"a2a"``
+    request does not silently fall back to fused when its tables are missing.
+    """
     if not check_is_moe(model_path):
         return None
+    if moe_comm_mode not in MOE_COMM_MODE_CHOICES:
+        raise ValueError(
+            f"moe_comm_mode must be one of {sorted(MOE_COMM_MODE_CHOICES)}, got {moe_comm_mode!r}"
+        )
+    # Keep the concrete config self-describing even when this resolver is
+    # called by a legacy direct-estimate path instead of Task.
+    model_config.moe_comm_mode = moe_comm_mode
 
+    if moe_comm_mode == "fused":
+        return None
+
+    # ``database`` is a configured PerfDatabase view in every production call
+    # site.  Keep the fallback attributes for lightweight test doubles and
+    # older SDK callers that expose only ``database_mode``.
+    database_mode = None
+    if database is not None:
+        get_mode = getattr(database, "get_default_database_mode", None)
+        database_mode = get_mode() if callable(get_mode) else getattr(database, "database_mode", None)
+    is_analytical = (
+        database_mode == common.DatabaseMode.ANALYTICAL
+        or getattr(database_mode, "name", None) == common.DatabaseMode.ANALYTICAL.name
+        or (isinstance(database_mode, str) and database_mode.upper() == common.DatabaseMode.ANALYTICAL.name)
+    )
+    if is_analytical and moe_comm_mode != "a2a":
+        return None
+
+    info = _get_model_info(model_path)
+    family = _architecture_to_model_family(info["architecture"])
     moe_tp_size = int(model_config.moe_tp_size or 1)
     moe_ep_size = int(model_config.moe_ep_size or 1)
     if moe_ep_size <= 1:
+        return None
+    # The generic large-EP graph is opt-in at the model-family level. The gate
+    # is evaluated only for an actual EP>1 request; EP1 does not need a
+    # communication graph regardless of the selected policy.
+    if family not in LARGE_EP_READY_FAMILIES:
+        if moe_comm_mode == "a2a":
+            raise ValueError(
+                f"moe_comm_mode='a2a' is not supported for model family {family!r}; "
+                "use moe_comm_mode='fused' or collect and wire a model-specific large-EP graph."
+            )
         return None
 
     gpus_per_node = 0
@@ -132,7 +184,7 @@ def resolve_model_config_moe_comm(
     model_config.num_gpus_per_node = gpus_per_node
 
     cross_node = moe_ep_size > gpus_per_node
-    if not cross_node and coverage_snapshot is None:
+    if not cross_node and coverage_snapshot is None and moe_comm_mode != "a2a":
         # Exact CLI estimates historically keep intra-node EP on the fused
         # path. Task supplies its cached coverage snapshot and can still
         # resolve an explicitly covered intra-node tuple.
@@ -145,7 +197,6 @@ def resolve_model_config_moe_comm(
             )
         return None
 
-    info = _get_model_info(model_path)
     _apply_model_quant_defaults(
         model_config,
         info.get("raw_config", {}),
@@ -153,7 +204,6 @@ def resolve_model_config_moe_comm(
         backend_name,
         worker_name=model_path,
     )
-    family = _architecture_to_model_family(info["architecture"])
     shape = MoEBlockShape.from_model_info(info)
     sm_version = (
         database.system_spec.get("gpu", {}).get("sm_version")
@@ -235,12 +285,16 @@ def resolve_model_config_moe_comm(
 
     missing = set(required_phases) - set(resolved)
     if missing:
-        if cross_node:
+        if cross_node or moe_comm_mode == "a2a":
             system_name = getattr(database, "system", "") if database is not None else ""
             version = getattr(database, "version", "") if database is not None else ""
+            reason = (
+                "Cross-node EP requires DeepEP A2A data"
+                if cross_node
+                else "moe_comm_mode='a2a' requires compatible A2A data"
+            )
             raise PerfDataNotAvailableError(
-                "Cross-node EP requires DeepEP A2A data, but no compatible exact or supported node-1 coverage "
-                "was found for "
+                f"{reason}, but no compatible exact or supported node-1 coverage was found for "
                 f"model={model_path!r}, system={system_name!r}, backend={backend_name!r}, version={version!r}, "
                 f"moe_ep={moe_ep_size}, gpus_per_node={gpus_per_node}, "
                 f"phase(s)={','.join(sorted(missing))}."

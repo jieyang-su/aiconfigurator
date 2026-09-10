@@ -77,6 +77,10 @@ class ModelConfig:
     moe_comm_backend: dict[str, str] | None = None
     # Physical node width used when resolving large-EP communication paths.
     num_gpus_per_node: int | None = None
+    # Requested MoE communication graph policy. The CLI/task resolver owns
+    # the decision; this field preserves it in the concrete model config.
+    # Kept at the end to preserve positional ModelConfig compatibility.
+    moe_comm_mode: str = "auto"
 
     def resolve_moe_parallelism(self) -> tuple[int, int]:
         """Resolve and validate MoE parallelism dimensions in-place.

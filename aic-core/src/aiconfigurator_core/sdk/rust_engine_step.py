@@ -1010,6 +1010,7 @@ def _engine_config_json(model: Any, database: Any) -> str:
                         # these must not share one cached handle.
                         "moe_comm_backend": getattr(model_config, "moe_comm_backend", None),
                         "num_gpus_per_node": getattr(model_config, "num_gpus_per_node", None),
+                        "moe_comm_mode": getattr(model_config, "moe_comm_mode", "auto"),
                     },
                     # Data-resolution policy. `build_engine_spec_json` bakes
                     # these flags into the compiled handle and the engine

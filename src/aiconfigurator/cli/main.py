@@ -351,6 +351,17 @@ def _add_attention_backend_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_moe_comm_mode_argument(parser: argparse.ArgumentParser, *, default: str | None = "auto") -> None:
+    """Add the MoE communication-graph policy shared by simulation modes."""
+    parser.add_argument(
+        "--moe-comm-mode",
+        choices=["auto", "fused", "a2a"],
+        default=default,
+        help="MoE communication graph: auto (coverage-driven), fused (legacy MoEDispatch + MoE), "
+        "or a2a (require table-backed all-to-all data).",
+    )
+
+
 def _add_default_mode_arguments(parser):
     _add_analytical_arguments(parser)
     parser.add_argument(
@@ -627,6 +638,7 @@ def _add_default_mode_arguments(parser):
         help="Explicit SGLang MoE backend. Use 'megamoe' to model DeepSeek-V4 MegaMoE on Blackwell. "
         "'deepep_moe' is deprecated and ignored (large-EP is explored automatically from data coverage).",
     )
+    _add_moe_comm_mode_argument(parser)
     _add_attention_backend_argument(parser)
 
 
@@ -803,6 +815,7 @@ def _add_recommend_mode_arguments(parser):
         help="Explicit SGLang MoE backend. Use 'megamoe' to model DeepSeek-V4 MegaMoE on Blackwell. "
         "'deepep_moe' is deprecated and ignored (large-EP is explored automatically from data coverage).",
     )
+    _add_moe_comm_mode_argument(parser)
     _add_attention_backend_argument(parser)
 
 
@@ -813,6 +826,9 @@ def _add_experiments_mode_arguments(parser):
         required=True,
         help="Path to a YAML file containing experiment definitions.",
     )
+    # A YAML experiment can set ``moe_comm_mode`` per task. This optional
+    # command-line value provides a global override for all entries.
+    _add_moe_comm_mode_argument(parser, default=None)
     parser.add_argument(
         "--inclusive-tpot",
         action="store_true",
@@ -863,6 +879,7 @@ def _add_generate_mode_arguments(parser):
 def _add_estimate_mode_arguments(parser):
     """Add arguments for the estimate mode (single-point TTFT/TPOT/power estimation)."""
     _add_analytical_arguments(parser)
+    _add_moe_comm_mode_argument(parser)
     parser.add_argument(
         "--model-path",
         "--model",
@@ -1655,6 +1672,7 @@ def build_default_tasks(
     backend: str = "trtllm",
     backend_version: str | None = None,
     database_mode: str = "SILICON",
+    moe_comm_mode: str = "auto",
     pareto_algorithm: str = "v1",
     transfer_policy: str | list | None = None,
     analytical_level: str = "standard",
@@ -1707,6 +1725,9 @@ def build_default_tasks(
             Use 'auto' to sweep across all backends.
         backend_version: Backend database version. Default is latest.
         database_mode: Database mode for performance estimation.
+        moe_comm_mode: MoE communication graph policy: ``auto`` selects a
+            covered large-EP path, ``fused`` forces the legacy graph, and
+            ``a2a`` requires table-backed all-to-all coverage.
         isl: Input sequence length.
         osl: Output sequence length.
         ttft: Time to first token target in ms.
@@ -1879,6 +1900,7 @@ def build_default_tasks(
         "request_latency": request_latency,
         "total_gpus": total_gpus,
         "database_mode": database_mode,
+        "moe_comm_mode": moe_comm_mode,
         "transfer_policy": transfer_policy,
         "analytical_level": analytical_level,
         "analytical_fp8_gemm_recipe": analytical_fp8_gemm_recipe,
@@ -2027,6 +2049,7 @@ def build_experiment_tasks(
     engine_step_backend: str | None = None,
     forward_model: str | None = None,
     attention_backend: str | None = None,
+    moe_comm_mode: str | None = None,
 ) -> dict[str, Task]:
     """Build task configs from YAML file or config dict.
 
@@ -2039,6 +2062,8 @@ def build_experiment_tasks(
             unset defaults to the compiled Rust engine.
         forward_model: Optional global forward-pass modeling mode ("op_level"/"fpm").
             Per-experiment ``forward_model`` entries take precedence.
+        moe_comm_mode: Optional global MoE communication graph override. Per-
+            experiment ``moe_comm_mode`` entries take precedence.
 
     Returns:
         Dict mapping experiment names to Task objects.
@@ -2139,6 +2164,8 @@ def build_experiment_tasks(
             overrides["forward_model"] = forward_model
         if attention_backend is not None and "attention_backend" not in exp_config:
             overrides["attention_backend"] = attention_backend
+        if moe_comm_mode is not None and "moe_comm_mode" not in exp_config:
+            overrides["moe_comm_mode"] = moe_comm_mode
 
         try:
             task_config = {**exp_config, "database_mode": database_mode}
@@ -2664,6 +2691,7 @@ def _run_estimate_epd(args, estimate_mode: str) -> None:
         enable_epd=True,
         backend_version=args.backend_version,
         database_mode=args.database_mode,
+        moe_comm_mode=getattr(args, "moe_comm_mode", "auto"),
         transfer_policy=args.transfer_policy,
         isl=args.isl,
         osl=args.osl,
@@ -2828,6 +2856,7 @@ def _run_estimate_mode(args):
         backend_name=args.backend,
         backend_version=args.backend_version,
         database_mode=args.database_mode,
+        moe_comm_mode=getattr(args, "moe_comm_mode", "auto"),
         transfer_policy=args.transfer_policy,
         analytical_level=args.analytical_level,
         analytical_fp8_gemm_recipe=args.analytical_fp8_gemm_recipe,
@@ -3152,6 +3181,7 @@ def _run_recommend(args) -> None:
             backend=args.backend,
             backend_version=args.backend_version,
             database_mode=args.database_mode,
+            moe_comm_mode=getattr(args, "moe_comm_mode", "auto"),
             pareto_algorithm=getattr(args, "pareto_algorithm", "v1"),
             transfer_policy=args.transfer_policy,
             analytical_level=getattr(args, "analytical_level", "standard"),
@@ -3330,6 +3360,7 @@ def main(args):
             backend=args.backend,
             backend_version=args.backend_version,
             database_mode=args.database_mode,
+            moe_comm_mode=getattr(args, "moe_comm_mode", "auto"),
             pareto_algorithm=getattr(args, "pareto_algorithm", "v1"),
             transfer_policy=args.transfer_policy,
             analytical_level=getattr(args, "analytical_level", "standard"),
@@ -3380,6 +3411,8 @@ def main(args):
                 build_kwargs["forward_model"] = args.forward_model
             if getattr(args, "attention_backend", None) is not None:
                 build_kwargs["attention_backend"] = args.attention_backend
+            if getattr(args, "moe_comm_mode", None) is not None:
+                build_kwargs["moe_comm_mode"] = args.moe_comm_mode
             tasks = build_experiment_tasks(**build_kwargs)
         except (ValueError, TypeError) as exc:
             logger.exception("Failed to build experiment task configs")

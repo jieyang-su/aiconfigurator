@@ -38,6 +38,7 @@ def build_model_config(
     attention_backend: str | None = None,
     enable_encoder_dp: bool = True,
     communication_placement: str = "independent",
+    moe_comm_mode: str = "auto",
 ) -> ModelConfig:
     """Build a ModelConfig with optional quant mode overrides."""
     return ModelConfig(
@@ -55,6 +56,7 @@ def build_model_config(
         attention_backend=attention_backend,
         enable_encoder_dp=enable_encoder_dp,
         communication_placement=communication_placement,
+        moe_comm_mode=moe_comm_mode,
     )
 
 
